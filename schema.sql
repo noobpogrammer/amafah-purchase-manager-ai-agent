@@ -15,7 +15,7 @@ create extension if not exists "pgcrypto"; -- for gen_random_uuid()
 create table clients (
     id                  uuid primary key default gen_random_uuid(),
     name                text not null,
-    whatsapp_instance   text not null unique,   -- Evolution API instance name
+    whatsapp_instance   text not null unique,
     timezone            text not null default 'Asia/Dubai',
     is_active           boolean not null default true,
     created_at          timestamptz not null default now()
@@ -26,15 +26,17 @@ create table clients (
 -- A supplier belongs to exactly one client. Phone is stored
 -- normalized (E.164-ish, "+971 50 1234567" style) so matching
 -- incoming WhatsApp messages is a simple lookup, not fuzzy logic.
+-- category is an array because one supplier can serve multiple
+-- categories, e.g. Electronics + Hardware.
 -- ------------------------------------------------------------
 create table suppliers (
     id                  uuid primary key default gen_random_uuid(),
     client_id           uuid not null references clients(id) on delete cascade,
     name                text not null,
-    phone_number        text not null,          -- normalized, e.g. "+971501234567"
-    category            text[],                  -- array of categories, e.g. {'Electronics', 'Hardware'}
+    phone_number        text not null,
+    category            text[],
     notes               text,
-    is_active           boolean not null default true,
+    is_active            boolean not null default true,
     created_at          timestamptz not null default now(),
 
     unique (client_id, phone_number)
@@ -45,12 +47,14 @@ create index idx_suppliers_phone on suppliers(phone_number);
 
 -- ------------------------------------------------------------
 -- RFQS (Request for Quote)
--- One RFQ = one product ask that may go out to multiple suppliers.
+-- One RFQ = one product ask that may go out to all active suppliers
+-- belonging to the selected category.
 -- ------------------------------------------------------------
 create table rfqs (
     id                  uuid primary key default gen_random_uuid(),
     client_id           uuid not null references clients(id) on delete cascade,
     product_name        text not null,
+    category            text not null,
     specs               text,
     quantity            integer,
     status              text not null default 'active'
@@ -62,6 +66,7 @@ create table rfqs (
 
 create index idx_rfqs_client on rfqs(client_id);
 create index idx_rfqs_status on rfqs(status);
+create index idx_rfqs_category on rfqs(category);
 
 -- ------------------------------------------------------------
 -- RFQ_SUPPLIERS (join table)
@@ -88,9 +93,7 @@ create index idx_rfq_suppliers_status on rfq_suppliers(status);
 
 -- ------------------------------------------------------------
 -- QUOTES
--- One row per supplier's actual quote for an RFQ. Unlike the old
--- Sheet, a supplier can have a clean, structured quote history —
--- no cramming multiple values into a single cell.
+-- One row per supplier's actual quote for an RFQ.
 -- ------------------------------------------------------------
 create table quotes (
     id                  uuid primary key default gen_random_uuid(),
@@ -99,7 +102,7 @@ create table quotes (
     price               numeric(12, 2),
     delivery_time       text,
     quality_notes       text,
-    raw_message         text,                    -- original WhatsApp text, for auditing/debugging
+    raw_message         text,
     confidence          text check (confidence in ('high', 'low')),
     created_at          timestamptz not null default now()
 );
@@ -117,7 +120,7 @@ create table pending_clarifications (
     id                  uuid primary key default gen_random_uuid(),
     client_id           uuid not null references clients(id) on delete cascade,
     supplier_id         uuid not null references suppliers(id) on delete cascade,
-    pending_rfq_ids     uuid[] not null,          -- the candidate RFQs it could be
+    pending_rfq_ids     uuid[] not null,
     raw_message         text not null,
     extracted_price     numeric(12, 2),
     extracted_delivery  text,
@@ -152,15 +155,14 @@ create index idx_message_log_supplier on message_log(supplier_id);
 
 -- ------------------------------------------------------------
 -- RFQ_RANKINGS
--- Stores the AI-generated comparison report per RFQ, so it's
--- retrievable later without re-running the LLM.
+-- Stores the AI-generated comparison report per RFQ.
 -- ------------------------------------------------------------
 create table rfq_rankings (
     id                  uuid primary key default gen_random_uuid(),
     rfq_id              uuid not null references rfqs(id) on delete cascade,
     best_supplier_id    uuid references suppliers(id),
     reasoning           text,
-    ranking_json        jsonb not null,           -- full ranked list, structured
+    ranking_json        jsonb not null,
     created_at          timestamptz not null default now()
 );
 
