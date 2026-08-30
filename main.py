@@ -40,7 +40,16 @@ async def whatsapp_webhook(request: Request):
     payload = await request.json()
 
     # Evolution API payload shape — adjust field paths to match your actual webhook format
-    key_data = payload.get("data", {}).get("key", {})
+    data = payload.get("data", {})
+
+    # Evolution API occasionally sends "data" as a list (batched events)
+    # instead of a single dict. Take the first item if so; skip if empty.
+    if isinstance(data, list):
+        if not data:
+            return {"status": "ignored", "reason": "empty batched event"}
+        data = data[0]
+
+    key_data = data.get("key", {})
 
     # Ignore outgoing messages sent by ourselves (e.g., our own outgoing RFQs)
     if key_data.get("fromMe", False):
@@ -48,7 +57,7 @@ async def whatsapp_webhook(request: Request):
 
     raw_remote_jid = key_data.get("remoteJid", "")
     sender_phone = normalize_phone(raw_remote_jid)
-    message_text = payload.get("data", {}).get("message", {}).get("conversation", "")
+    message_text = data.get("message", {}).get("conversation", "")
 
     # Non-text message types (like audioMessage, imageMessage, etc.) have an empty conversation field
     # and are intentionally skipped since the agent doesn't process media/audio content yet.

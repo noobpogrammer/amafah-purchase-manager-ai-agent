@@ -33,8 +33,8 @@ TOOLS = [
                 "properties": {
                     "rfq_id": {"type": "string", "description": "The matched RFQ's ID"},
                     "price": {"type": "number", "description": "Quoted price per piece"},
-                    "delivery_time": {"type": "string", "description": "Stated delivery time, if given"},
-                    "quality_notes": {"type": "string", "description": "Any warranty/quality notes mentioned"},
+                    "delivery_time": {"type": ["string", "null"], "description": "Stated delivery time, if given"},
+                    "quality_notes": {"type": ["string", "null"], "description": "Any warranty/quality notes mentioned"},
                 },
                 "required": ["rfq_id", "price"],
             },
