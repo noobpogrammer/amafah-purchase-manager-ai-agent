@@ -15,6 +15,13 @@ app = FastAPI()
 DEMO_CLIENT_ID = "d88c52ad-3d0b-42e9-86f1-b9f70018856b"
 
 
+def normalize_phone(remote_jid: str) -> str:
+    """Strips everything from '@' onward to normalize WhatsApp remoteJid to plain digits."""
+    if not remote_jid:
+        return ""
+    return remote_jid.split("@")[0]
+
+
 def format_rfq_context(open_rfqs: list) -> str:
     if not open_rfqs:
         return "No open RFQs for this supplier."
@@ -33,9 +40,18 @@ async def whatsapp_webhook(request: Request):
     payload = await request.json()
 
     # Evolution API payload shape — adjust field paths to match your actual webhook format
-    sender_phone = payload.get("data", {}).get("key", {}).get("remoteJid", "")
+    key_data = payload.get("data", {}).get("key", {})
+
+    # Ignore outgoing messages sent by ourselves (e.g., our own outgoing RFQs)
+    if key_data.get("fromMe", False):
+        return {"status": "ignored", "reason": "outgoing message (fromMe)"}
+
+    raw_remote_jid = key_data.get("remoteJid", "")
+    sender_phone = normalize_phone(raw_remote_jid)
     message_text = payload.get("data", {}).get("message", {}).get("conversation", "")
 
+    # Non-text message types (like audioMessage, imageMessage, etc.) have an empty conversation field
+    # and are intentionally skipped since the agent doesn't process media/audio content yet.
     if not sender_phone or not message_text:
         return {"status": "ignored", "reason": "no message content"}
 
