@@ -25,6 +25,33 @@ def get_supplier_by_phone(client_id: str, phone_number: str):
     return res.data[0] if res.data else None
 
 
+def create_supplier(client_id: str, name: str, phone_number: str, categories: list[str] = None, notes: str = None):
+    """Creates a new supplier. categories accepts a list of strings (e.g. ['Electronics', 'Hardware'])."""
+    return supabase.table("suppliers").insert({
+        "client_id": client_id,
+        "name": name,
+        "phone_number": phone_number,
+        "category": categories or [],
+        "notes": notes,
+    }).execute().data
+
+
+def update_supplier_categories(supplier_id: str, categories: list[str]):
+    """Updates a supplier's categories list in Supabase."""
+    return supabase.table("suppliers").update({
+        "category": categories or []
+    }).eq("id", supplier_id).execute().data
+
+
+def format_supplier_categories(categories) -> str:
+    """Formats a supplier's category array/list into a readable comma-separated string."""
+    if not categories:
+        return ""
+    if isinstance(categories, list):
+        return ", ".join(categories)
+    return str(categories)
+
+
 def get_open_rfqs_for_supplier(supplier_id: str):
     """All active RFQs currently sent to this supplier, awaiting a reply."""
     res = (
@@ -68,6 +95,46 @@ def create_pending_clarification(client_id: str, supplier_id: str,
         supabase.table("rfq_suppliers").update({"status": "clarifying"}).eq(
             "rfq_id", rfq_id
         ).eq("supplier_id", supplier_id).execute()
+
+
+def get_pending_clarification_for_supplier(supplier_id: str):
+    """Queries pending_clarifications for an unresolved ('awaiting_reply') row."""
+    res = (
+        supabase.table("pending_clarifications")
+        .select("*")
+        .eq("supplier_id", supplier_id)
+        .eq("status", "awaiting_reply")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def resolve_pending_clarification(clarification_id: str):
+    from datetime import datetime, timezone
+    supabase.table("pending_clarifications").update({
+        "status": "resolved",
+        "resolved_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", clarification_id).execute()
+
+
+def abandon_pending_clarification(clarification_id: str):
+    supabase.table("pending_clarifications").update({
+        "status": "abandoned"
+    }).eq("id", clarification_id).execute()
+
+
+def get_rfqs_by_ids(rfq_ids: list):
+    if not rfq_ids:
+        return []
+    res = (
+        supabase.table("rfqs")
+        .select("*")
+        .in_("id", rfq_ids)
+        .execute()
+    )
+    return [{"rfqs": rfq} for rfq in res.data]
 
 
 def log_message(client_id: str, supplier_id: str, direction: str,

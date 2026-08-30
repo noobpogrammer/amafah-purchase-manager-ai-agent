@@ -32,7 +32,7 @@ create table suppliers (
     client_id           uuid not null references clients(id) on delete cascade,
     name                text not null,
     phone_number        text not null,          -- normalized, e.g. "+971501234567"
-    category            text,                    -- e.g. "Electronics", "Bathroom Accessories"
+    category            text[],                  -- array of categories, e.g. {'Electronics', 'Hardware'}
     notes               text,
     is_active           boolean not null default true,
     created_at          timestamptz not null default now(),

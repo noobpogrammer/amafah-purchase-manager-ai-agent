@@ -4,6 +4,8 @@ Evolution API posts incoming supplier messages here. This replaces the
 old n8n branching logic with a single agent decision + tool execution.
 """
 
+import os
+import requests
 from fastapi import FastAPI, Request
 import db
 import groq_client
@@ -13,6 +15,29 @@ app = FastAPI()
 # For the demo: one client hardcoded. Once multi-tenant onboarding exists,
 # this would be looked up from the Evolution API instance name in the webhook payload.
 DEMO_CLIENT_ID = "d88c52ad-3d0b-42e9-86f1-b9f70018856b"
+
+
+def send_evolution_message(phone_number: str, message: str) -> dict:
+    """Sends a WhatsApp text message to a supplier via Evolution API."""
+    url = os.environ.get("EVOLUTION_API_URL", "").rstrip("/")
+    api_key = os.environ.get("EVOLUTION_API_KEY", "")
+    instance = os.environ.get("EVOLUTION_INSTANCE", "default")
+    if not url:
+        print("EVOLUTION_API_URL not configured, skipping outbound send")
+        return {"status": "skipped", "reason": "EVOLUTION_API_URL missing"}
+
+    endpoint = f"{url}/message/sendText/{instance}"
+    headers = {
+        "apikey": api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {"number": phone_number, "text": message}
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"Error sending Evolution API message: {e}")
+        return {"status": "error", "error": str(e)}
 
 
 def normalize_phone(remote_jid: str) -> str:
@@ -70,9 +95,56 @@ async def whatsapp_webhook(request: Request):
 
     db.log_message(DEMO_CLIENT_ID, supplier["id"], "inbound", message_text)
 
-    open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"])
-    rfq_context = format_rfq_context(open_rfqs)
+    # Check for unresolved pending clarification (status = 'awaiting_reply') for this supplier
+    pending = db.get_pending_clarification_for_supplier(supplier["id"])
+    if pending:
+        candidate_rfq_ids = pending.get("pending_rfq_ids", [])
+        candidate_rfqs = db.get_rfqs_by_ids(candidate_rfq_ids)
+        rfq_context = format_rfq_context(candidate_rfqs)
 
+        decision = groq_client.route_supplier_message(message_text, rfq_context)
+
+        if decision["tool_name"] == "record_quote":
+            args = decision["arguments"]
+            db.record_quote(
+                rfq_id=args["rfq_id"],
+                supplier_id=supplier["id"],
+                price=args["price"],
+                delivery_time=args.get("delivery_time"),
+                quality_notes=args.get("quality_notes"),
+                raw_message=message_text,
+            )
+            db.resolve_pending_clarification(pending["id"])
+            return {
+                "status": "recorded_from_clarification",
+                "rfq_id": args["rfq_id"],
+                "clarification_id": pending["id"],
+            }
+        elif decision["tool_name"] == "request_clarification":
+            args = decision["arguments"]
+            db.create_pending_clarification(
+                client_id=DEMO_CLIENT_ID,
+                supplier_id=supplier["id"],
+                candidate_rfq_ids=args["candidate_rfq_ids"],
+                raw_message=message_text,
+            )
+            db.abandon_pending_clarification(pending["id"])
+            question = args["clarifying_question"]
+            db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", question)
+            send_evolution_message(supplier["phone_number"], question)
+            return {"status": "clarification_needed", "question": question}
+
+    # Standard flow for active open RFQs
+    open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"])
+
+    # Fix 1: Skip Groq tool forcing if there are no open RFQs
+    if not open_rfqs:
+        return {
+            "status": "no_open_rfq",
+            "note": "message received but no active RFQ to match",
+        }
+
+    rfq_context = format_rfq_context(open_rfqs)
     decision = groq_client.route_supplier_message(message_text, rfq_context)
 
     if decision["tool_name"] == "record_quote":
@@ -95,8 +167,10 @@ async def whatsapp_webhook(request: Request):
             candidate_rfq_ids=args["candidate_rfq_ids"],
             raw_message=message_text,
         )
-        # TODO: actually send args["clarifying_question"] back via Evolution API
-        return {"status": "clarification_needed", "question": args["clarifying_question"]}
+        question = args["clarifying_question"]
+        db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", question)
+        send_evolution_message(supplier["phone_number"], question)
+        return {"status": "clarification_needed", "question": question}
 
     return {"status": "unhandled", "decision": decision}
 
