@@ -48,7 +48,8 @@ TOOLS = [
                 "Use this when the supplier's reply is ambiguous — for example, "
                 "the supplier has multiple open RFQs and it's unclear which product "
                 "the reply refers to, or the message doesn't clearly state a price. "
-                "This asks the supplier a clarifying follow-up question instead of guessing."
+                "This asks the supplier a clarifying follow-up question focused specifically on "
+                "Price, Quality/Warranty, or Delivery Time."
             ),
             "parameters": {
                 "type": "object",
@@ -60,7 +61,7 @@ TOOLS = [
                     },
                     "clarifying_question": {
                         "type": "string",
-                        "description": "The question to send back to the supplier",
+                        "description": "The question to send back to the supplier, focusing on price, quality/warranty, or delivery time",
                     },
                 },
                 "required": ["candidate_rfq_ids", "clarifying_question"],
@@ -85,6 +86,8 @@ TOOLS = [
 
 SYSTEM_PROMPT = """You are a procurement assistant for a hardware retail business.
 You receive WhatsApp replies from suppliers who were sent RFQs (requests for quotes).
+
+Clarifications should focus specifically on Price, Product Quality/Warranty, and Delivery Time — these are the main fields needed from suppliers. Specs and quantity are already fixed by the RFQ.
 
 Your job: read the supplier's message plus the context of their currently open RFQ(s),
 and decide the right action by calling exactly one tool:
@@ -118,6 +121,37 @@ def route_supplier_message(message_text: str, open_rfqs_context: str) -> dict:
         tool_choice="required",  # force it to pick a tool, no free-text drift
     )
 
+    tool_call = response.choices[0].message.tool_calls[0]
+    return {
+        "tool_name": tool_call.function.name,
+        "arguments": json.loads(tool_call.function.arguments),
+    }
+
+
+def resolve_clarification(message_text: str, candidate_rfqs_context: str, previous_message: str) -> dict:
+    """
+    Matches a supplier's follow-up reply against candidate RFQs to resolve a pending clarification.
+    """
+    prompt = (
+        f"Candidate RFQs context:\n{candidate_rfqs_context}\n\n"
+        f"Previous supplier message / context:\n{previous_message}\n\n"
+        f"Supplier's new follow-up message:\n{message_text}"
+    )
+    system_msg = (
+        "You are a procurement assistant resolving an ambiguous supplier reply. "
+        "Focus specifically on extracting Price, Quality/Warranty notes, and Delivery Time. "
+        "Call record_quote if the message clarifies which candidate RFQ it refers to along with a price. "
+        "Call request_clarification if essential details (like price) are still missing or ambiguous."
+    )
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt},
+        ],
+        tools=TOOLS,
+        tool_choice="required",
+    )
     tool_call = response.choices[0].message.tool_calls[0]
     return {
         "tool_name": tool_call.function.name,

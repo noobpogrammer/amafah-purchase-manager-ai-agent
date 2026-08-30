@@ -111,6 +111,18 @@ def get_pending_clarification_for_supplier(supplier_id: str):
     return res.data[0] if res.data else None
 
 
+def count_clarification_rounds(supplier_id: str, client_id: str) -> int:
+    """Counts how many pending_clarifications entries exist for this supplier."""
+    res = (
+        supabase.table("pending_clarifications")
+        .select("id", count="exact")
+        .eq("supplier_id", supplier_id)
+        .eq("client_id", client_id)
+        .execute()
+    )
+    return res.count or 0
+
+
 def resolve_pending_clarification(clarification_id: str):
     from datetime import datetime, timezone
     supabase.table("pending_clarifications").update({
@@ -135,6 +147,48 @@ def get_rfqs_by_ids(rfq_ids: list):
         .execute()
     )
     return [{"rfqs": rfq} for rfq in res.data]
+
+
+def get_active_rfq_suppliers_with_deadlines():
+    """Gets all rfq_suppliers with status 'sent' joined with rfq & supplier details."""
+    res = (
+        supabase.table("rfq_suppliers")
+        .select("*, rfqs(*), suppliers(*)")
+        .eq("status", "sent")
+        .execute()
+    )
+    return res.data
+
+
+def update_rfq_supplier_reminder(rfq_supplier_id: str, reminder_count: int):
+    from datetime import datetime, timezone
+    supabase.table("rfq_suppliers").update({
+        "reminder_count": reminder_count,
+        "last_reminder_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", rfq_supplier_id).execute()
+
+
+def mark_rfq_supplier_no_response(rfq_supplier_id: str):
+    supabase.table("rfq_suppliers").update({
+        "status": "no_response"
+    }).eq("id", rfq_supplier_id).execute()
+
+
+def is_rfq_fully_processed(rfq_id: str) -> bool:
+    """Returns True if no suppliers for this RFQ remain in 'sent' or 'clarifying' status."""
+    res = (
+        supabase.table("rfq_suppliers")
+        .select("id", count="exact")
+        .eq("rfq_id", rfq_id)
+        .in_("status", ["sent", "clarifying"])
+        .execute()
+    )
+    return (res.count or 0) == 0
+
+
+def ranking_exists(rfq_id: str) -> bool:
+    res = supabase.table("rfq_rankings").select("id").eq("rfq_id", rfq_id).execute()
+    return len(res.data) > 0
 
 
 def log_message(client_id: str, supplier_id: str, direction: str,
