@@ -127,11 +127,11 @@ Clarifications should focus specifically on Price, Product Quality/Warranty, and
 
 Your job: read the supplier's message plus the context of their currently open RFQ(s) and prior quotes, and decide the right action by calling exactly one tool:
 
-1. Call record_quote: if the reply clearly and unambiguously gives a price for ONE specific open RFQ.
-2. Call request_clarification: if the reply is ambiguous (e.g., multiple open RFQs and unclear which one, or missing key info like price/delivery).
+1. Call record_quote: if the reply clearly and unambiguously gives a price for ONE specific open RFQ (matching by product name/description).
+2. Call request_clarification: if the reply is ambiguous (e.g., multiple open RFQs and unclear which product, or missing key info like price/delivery). If a product name is partially mentioned (e.g., 'cement' matching both 'Cement 5kg' and 'Cement 10kg'), ask a narrowed clarifying question naming the exact options (e.g. 'Is this quote for 5kg or 10kg cement?').
 3. Call escalate_to_human: DO NOT request clarification or guess. Call escalate_to_human when:
    - requires_business_knowledge: The message asks for custom credit terms, payment schedules, or business decisions only a human manager knows (e.g., "Can we pay 50% upfront via bank transfer?" or "Can we exchange goods after 30 days?").
-   - unclear_intent: The message is gibberish, irrelevant, or intent cannot be safely determined even after reviewing context.
+   - unclear_intent: The message is gibberish, irrelevant, or intent cannot be safely determined even after reviewing context. (Note: mentioning a product name or stem is valid intent, do NOT escalate for product name mentions).
    - contradictory_information: The supplier gives a contradictory quote or term change vs a prior quote for the same RFQ.
 
 CONTRADICTION & PRICE VARIANCE THRESHOLD RULES:
@@ -181,17 +181,42 @@ def resolve_clarification(message_text: str, candidate_rfqs_context: str, previo
     )
 
     system_msg = (
-        "You are a procurement assistant resolving an ambiguous supplier reply. "
-        "Focus specifically on extracting Price, Quality/Warranty notes, and Delivery Time.\n\n"
-        "1. Call record_quote if the message clarifies which candidate RFQ it refers to along with a price.\n"
-        "2. Call request_clarification if essential details (like price) are still missing or ambiguous.\n"
-        "3. Call escalate_to_human if the message requires client business knowledge (e.g. credit/payment terms), "
-        "if intent is still unclear/gibberish, or if the supplier provides contradictory information vs prior quotes.\n\n"
+        "You are a procurement assistant resolving an ambiguous supplier reply.\n\n"
+        "PRODUCT NAME MATCHING RULES:\n"
+        "- Suppliers match candidate RFQs by PRODUCT NAME / DESCRIPTION, not internal RFQ IDs (suppliers never know RFQ IDs).\n"
+        "- If the supplier's message clearly names or closely describes one of the candidate products (e.g. 'cement 5kg'), "
+        "resolve to that candidate's RFQ ID and call record_quote along with the price/delivery details.\n"
+        "- Do NOT call escalate_to_human when a product name match or stem match is present.\n\n"
+        "PARTIAL / AMBIGUOUS MATCH & NARROWING RULES:\n"
+        "- If the message matches a product stem/category (e.g. 'cement') but is not specific enough to pick one exact candidate "
+        "when 2+ candidates share that stem (e.g. 'Cement 5kg' vs 'Cement 10kg'), do NOT treat as a full match, and do NOT escalate.\n"
+        "- Call request_clarification with a NARROWED, SPECIFIC question naming the exact remaining options "
+        "(e.g. 'Just to confirm — is this quote for the 5kg or 10kg cement order?').\n"
+        "- Never send a clarifying question that is substantively identical to the previous clarifying question asked in the conversation. "
+        "Narrow it based on what the supplier's latest message clarified.\n\n"
+        "WORKED EXAMPLES:\n"
+        "Example 1 (Full Product Match):\n"
+        "  Candidate RFQs: [RFQ A (ID: 24b060bb-e275-48e0-807b-81b0d03990c0): Cement 5kg], [RFQ B (ID: a123): LED Panel 60W]\n"
+        "  Previous msg: '10 aed 5 days' -> Asked which RFQ\n"
+        "  Supplier follow-up: 'cement 5kg'\n"
+        "  -> Matches RFQ A by product name -> call record_quote(rfq_id='24b060bb-e275-48e0-807b-81b0d03990c0', price=10, delivery_time='5 days')\n\n"
+        "Example 2 (Partial Match - Narrowed Question):\n"
+        "  Candidate RFQs: [RFQ A (ID: rfq-101): Cement 5kg], [RFQ B (ID: rfq-102): Cement 10kg]\n"
+        "  Previous msg: '10 aed 5 days' -> Asked which RFQ\n"
+        "  Supplier follow-up: 'cement'\n"
+        "  -> Matches both A and B by stem 'cement' -> call request_clarification(candidate_rfq_ids=['rfq-101', 'rfq-102'], "
+        "clarifying_question='Just to confirm — is this quote for the 5kg or 10kg cement order?')\n\n"
         "CONTRADICTION & PRICE VARIANCE THRESHOLD RULES:\n"
-        "- Small price variance (<= 10%): Price differences of 10% or less from a prior quote for the same RFQ (e.g., previously quoted $50, now states $52 — a 4% change) are treated as minor rounding or currency adjustments — DO NOT escalate; call record_quote with the new price if clear.\n"
-        "- Large price variance (> 10%) or unexplainable term conflict: Price changes > 10% without explanation (e.g., previously quoted $50, now states $85 without explanation), or delivery/warranty terms that conflict with prior statements, are genuine contradictions — call escalate_to_human with category 'contradictory_information'.\n"
-        "- Explicitly explained changes: If the supplier explicitly explains a price/term change (e.g., 'Price is now $85 due to raw material cost increase'), it is NOT a contradiction — call record_quote with the new price ($85)."
+        "- Small price variance (<= 10%): Treat as minor rounding/currency adjustment — DO NOT escalate; call record_quote with the new price.\n"
+        "- Large price variance (> 10%) without explanation or unexplainable term conflict -> call escalate_to_human with category 'contradictory_information'.\n"
+        "- Explicitly explained changes -> call record_quote with the new price."
     )
+
+    print(f"\n--- [resolve_clarification LOG] ---")
+    print(f"Candidate RFQs:\n{candidate_rfqs_context}")
+    print(f"Previous Context:\n{previous_message}")
+    print(f"Supplier Follow-up:\n{message_text}")
+
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
@@ -202,10 +227,15 @@ def resolve_clarification(message_text: str, candidate_rfqs_context: str, previo
         tool_choice="required",
     )
     tool_call = response.choices[0].message.tool_calls[0]
-    return {
+    decision = {
         "tool_name": tool_call.function.name,
         "arguments": json.loads(tool_call.function.arguments),
     }
+
+    print(f"Decision: tool='{decision['tool_name']}', args={decision['arguments']}")
+    print(f"--- [END LOG] ---\n")
+
+    return decision
 
 
 def rank_quotes(rfq_details: str, quotes_summary: str) -> dict:
