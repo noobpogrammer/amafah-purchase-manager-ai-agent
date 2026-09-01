@@ -329,8 +329,23 @@ def get_pending_flags(client_id: str):
         supabase.table("flagged_for_review")
         .select("*, suppliers(name, phone_number), rfqs(product_name)")
         .eq("client_id", client_id)
-        .eq("status", "pending")
         .order("created_at", desc=True)
         .execute()
     )
     return res.data
+
+
+def resolve_flag(flag_id: str):
+    """Marks a flagged_for_review item as resolved."""
+    from datetime import datetime, timezone
+
+    res = (
+        supabase.table("flagged_for_review")
+        .update({
+            "status": "resolved",
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        })
+        .eq("id", flag_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None

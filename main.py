@@ -454,12 +454,13 @@ async def create_rfq_endpoint(req: RFQCreateRequest):
         }
 
     rfq_msg = (
-        f"Hello! New Request for Quote:\n"
-        f"- Product: {req.product_name}\n"
-        f"- Specs: {req.specs or 'Standard'}\n"
-        f"- Quantity: {req.quantity or 'N/A'}\n"
-        f"- Deadline: {req.deadline_hours} hours\n\n"
-        f"Please reply with your price per unit and estimated delivery time."
+        f"Hi! This is Amafha Hardware Store.\n"
+        f"We're requesting a quote for the following item:\n\n"
+        f"• Product: {req.product_name}\n"
+        f"• Specs: {req.specs or 'Standard'}\n"
+        f"• Quantity: {req.quantity or 'N/A'}\n"
+        f"• Required Within: {req.deadline_hours} hours\n\n"
+        f"Please reply directly to this message with your price per unit (AED) and estimated delivery time. Thanks!"
     )
 
     for supplier in matched_suppliers:
@@ -476,8 +477,15 @@ async def create_rfq_endpoint(req: RFQCreateRequest):
 
 @app.get("/flags")
 async def get_flags_endpoint(client_id: str = DEMO_CLIENT_ID):
-    """Lists pending human review escalations for a client."""
+    """Lists human review escalations for a client."""
     return db.get_pending_flags(client_id)
+
+
+@app.post("/flags/{flag_id}/resolve")
+async def resolve_flag_endpoint(flag_id: str):
+    """Marks a human escalation flag as resolved."""
+    result = db.resolve_flag(flag_id)
+    return {"status": "resolved", "flag": result}
 
 
 @app.post("/rfq/{rfq_id}/rank")

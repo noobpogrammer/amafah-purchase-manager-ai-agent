@@ -255,7 +255,7 @@ export default function RFQDetailView({
                       <div key={q.id} className="quote-summary-card">
                         <div className="quote-header">
                           <strong>{q.suppliers?.name || 'Supplier'}</strong>
-                          <span className="price-tag">${q.price}</span>
+                          <span className="price-tag">AED {q.price}</span>
                         </div>
                         <div className="quote-body">
                           <p><strong>Delivery:</strong> {q.delivery_time || '-'}</p>

@@ -148,14 +148,12 @@ export async function fetchFlags() {
 }
 
 export async function resolveFlag(flagId) {
-  const { data, error } = await supabase
-    .from('flagged_for_review')
-    .update({
-      status: 'resolved',
-      resolved_at: new Date().toISOString(),
-    })
-    .eq('id', flagId)
-    .select();
-  if (error) throw error;
-  return data[0];
+  const response = await fetch(`${API_URL}/flags/${flagId}/resolve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to resolve flag: ${response.statusText}`);
+  }
+  return await response.json();
 }

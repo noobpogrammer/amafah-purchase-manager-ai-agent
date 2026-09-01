@@ -5,4 +5,5 @@ supabase
 python-dotenv
 requests
 apscheduler
-
+pytest
+pytest-asyncio

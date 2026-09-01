@@ -181,7 +181,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                           )}
                         </td>
                         <td>
-                          <span className="price-tag-large">${q.price}</span>
+                          <span className="price-tag-large">AED {q.price}</span>
                         </td>
                         <td>{q.delivery_time || 'Not specified'}</td>
                         <td>{q.quality_notes || 'Standard'}</td>
