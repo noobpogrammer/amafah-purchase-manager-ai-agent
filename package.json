@@ -1,0 +1,9 @@
+{
+  "name": "amafah-purchase-manager-ai-agent",
+  "version": "1.0.0",
+  "description": "Amafha WhatsApp RFQ Procurement Agent with Frontend MVP",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build"
+  }
+}
