@@ -7,16 +7,42 @@ old n8n branching logic with a single agent decision + tool execution.
 import os
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+
+import requests
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 import db
 import groq_client
-from evolution_client import send_whatsapp_message
 
 scheduler = AsyncIOScheduler()
 
 DEMO_CLIENT_ID = "d88c52ad-3d0b-42e9-86f1-b9f70018856b"
 THANK_YOU_MSG = "Thanks for the quote! We'll be in touch if we move forward."
+
+EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
+EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
+
+
+def send_whatsapp_message(phone_number: str, message: str) -> dict:
+    """Send a text message through the configured Evolution API instance."""
+    if not EVOLUTION_API_URL or not EVOLUTION_API_KEY or not EVOLUTION_INSTANCE:
+        raise RuntimeError("Evolution API configuration is missing")
+
+    url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE}"
+    headers = {
+        "Content-Type": "application/json",
+        "apikey": EVOLUTION_API_KEY,
+    }
+    payload = {
+        "number": phone_number,
+        "text": message,
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
 def normalize_phone(remote_jid: str) -> str:
@@ -184,11 +210,9 @@ async def whatsapp_webhook(request: Request):
             )
             db.resolve_pending_clarification(pending["id"])
 
-            # Send thank-you message
             db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", THANK_YOU_MSG)
             send_whatsapp_message(supplier["phone_number"], THANK_YOU_MSG)
 
-            # Check if all quotes are in for auto-ranking
             check_and_auto_rank(args["rfq_id"])
 
             return {
@@ -210,10 +234,8 @@ async def whatsapp_webhook(request: Request):
             send_whatsapp_message(supplier["phone_number"], question)
             return {"status": "clarification_needed", "question": question}
 
-    # Standard flow for active open RFQs
     open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"])
 
-    # Fix 1: Skip Groq tool forcing if there are no open RFQs
     if not open_rfqs:
         return {
             "status": "no_open_rfq",
@@ -234,11 +256,9 @@ async def whatsapp_webhook(request: Request):
             raw_message=message_text,
         )
 
-        # Send thank-you message
         db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", THANK_YOU_MSG)
         send_whatsapp_message(supplier["phone_number"], THANK_YOU_MSG)
 
-        # Check if all quotes are in for auto-ranking
         check_and_auto_rank(args["rfq_id"])
 
         return {"status": "recorded", "rfq_id": args["rfq_id"]}
