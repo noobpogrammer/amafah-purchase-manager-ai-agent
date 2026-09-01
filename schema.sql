@@ -167,3 +167,24 @@ create table rfq_rankings (
 );
 
 create index idx_rfq_rankings_rfq on rfq_rankings(rfq_id);
+
+-- ------------------------------------------------------------
+-- FLAGGED_FOR_REVIEW
+-- Stores conversations flagged for human procurement manager review.
+-- ------------------------------------------------------------
+create table flagged_for_review (
+    id                  uuid primary key default gen_random_uuid(),
+    client_id           uuid not null references clients(id) on delete cascade,
+    supplier_id         uuid not null references suppliers(id) on delete cascade,
+    rfq_id              uuid references rfqs(id) on delete set null,
+    reason              text not null,
+    category            text not null check (category in ('requires_business_knowledge', 'unclear_intent', 'contradictory_information', 'other')),
+    raw_message         text not null,
+    status              text not null default 'pending' check (status in ('pending', 'resolved')),
+    created_at          timestamptz not null default now(),
+    resolved_at         timestamptz
+);
+
+create index idx_flagged_client on flagged_for_review(client_id);
+create index idx_flagged_supplier on flagged_for_review(supplier_id);
+create index idx_flagged_status on flagged_for_review(status);

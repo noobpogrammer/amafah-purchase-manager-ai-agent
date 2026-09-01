@@ -216,3 +216,95 @@ def save_ranking(rfq_id: str, best_supplier_id: str, reasoning: str, ranking_jso
         "reasoning": reasoning,
         "ranking_json": ranking_json,
     }).execute()
+
+
+def get_suppliers_by_category(client_id: str, category: str) -> list:
+    """Finds active suppliers whose category array contains the specified category for a client."""
+    res = (
+        supabase.table("suppliers")
+        .select("*")
+        .eq("client_id", client_id)
+        .eq("is_active", True)
+        .contains("category", [category])
+        .execute()
+    )
+    return res.data
+
+
+def create_rfq_and_match_suppliers(client_id: str, product_name: str, category: str,
+                                   deadline_hours: int = 24, specs: str = None,
+                                   quantity: int = None):
+    """Creates a new RFQ row, queries matching active suppliers by category, and creates rfq_suppliers join records."""
+    rfq_res = supabase.table("rfqs").insert({
+        "client_id": client_id,
+        "product_name": product_name,
+        "category": category,
+        "specs": specs,
+        "quantity": quantity,
+        "deadline_hours": deadline_hours,
+        "status": "active",
+    }).execute()
+
+    rfq = rfq_res.data[0]
+
+    matching_suppliers = get_suppliers_by_category(client_id, category)
+
+    # Deduplicate matched suppliers by id
+    unique_suppliers = []
+    seen_ids = set()
+    for s in matching_suppliers:
+        if s["id"] not in seen_ids:
+            seen_ids.add(s["id"])
+            unique_suppliers.append(s)
+
+    if unique_suppliers:
+        rfq_suppliers_payload = [
+            {
+                "rfq_id": rfq["id"],
+                "supplier_id": s["id"],
+                "status": "sent",
+            }
+            for s in unique_suppliers
+        ]
+        supabase.table("rfq_suppliers").insert(rfq_suppliers_payload).execute()
+
+    return rfq, unique_suppliers
+
+
+def get_supplier_prior_quotes(supplier_id: str, rfq_ids: list = None):
+    """Fetches past quote(s) for a supplier to serve as prior context for Groq contradiction detection."""
+    query = supabase.table("quotes").select("*, rfqs(product_name)").eq("supplier_id", supplier_id)
+    if rfq_ids:
+        query = query.in_("rfq_id", rfq_ids)
+    res = query.order("created_at", desc=True).limit(5).execute()
+    return res.data
+
+
+def flag_for_human_review(client_id: str, supplier_id: str, rfq_id: str = None,
+                         reason: str = "", category: str = "other", raw_message: str = ""):
+    """Inserts a new human review escalation into flagged_for_review table."""
+    payload = {
+        "client_id": client_id,
+        "supplier_id": supplier_id,
+        "reason": reason,
+        "category": category,
+        "raw_message": raw_message,
+        "status": "pending",
+    }
+    if rfq_id:
+        payload["rfq_id"] = rfq_id
+
+    return supabase.table("flagged_for_review").insert(payload).execute().data
+
+
+def get_pending_flags(client_id: str):
+    """Returns all pending human escalation items for a client, joined with supplier and rfq info."""
+    res = (
+        supabase.table("flagged_for_review")
+        .select("*, suppliers(name, phone_number), rfqs(product_name)")
+        .eq("client_id", client_id)
+        .eq("status", "pending")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return res.data

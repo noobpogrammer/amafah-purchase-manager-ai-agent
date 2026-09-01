@@ -82,6 +82,42 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "escalate_to_human",
+            "description": (
+                "Escalate the conversation to a human procurement manager when the message requires "
+                "client-specific business knowledge, when supplier intent remains ambiguous/unclear, "
+                "or when the supplier gives contradictory information (e.g., quoting a different "
+                "price or conflicting details than previously stated for the same RFQ)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rfq_id": {
+                        "type": ["string", "null"],
+                        "description": "The matched RFQ ID if known, or candidate RFQ ID",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Detailed explanation of why human intervention is required",
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "requires_business_knowledge",
+                            "unclear_intent",
+                            "contradictory_information",
+                            "other",
+                        ],
+                        "description": "Category of human escalation",
+                    },
+                },
+                "required": ["reason", "category"],
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = """You are a procurement assistant for a hardware retail business.
@@ -89,33 +125,32 @@ You receive WhatsApp replies from suppliers who were sent RFQs (requests for quo
 
 Clarifications should focus specifically on Price, Product Quality/Warranty, and Delivery Time — these are the main fields needed from suppliers. Specs and quantity are already fixed by the RFQ.
 
-Your job: read the supplier's message plus the context of their currently open RFQ(s),
-and decide the right action by calling exactly one tool:
+Your job: read the supplier's message plus the context of their currently open RFQ(s) and prior quotes, and decide the right action by calling exactly one tool:
 
-- If the reply clearly and unambiguously gives a price for ONE specific open RFQ, call record_quote.
-- If the reply is ambiguous (multiple open RFQs and unclear which one, or missing key
-  info like price), call request_clarification instead of guessing.
-- Never fabricate a price or RFQ match you are not confident about — clarification is
-  always safer than a wrong guess.
+1. Call record_quote: if the reply clearly and unambiguously gives a price for ONE specific open RFQ.
+2. Call request_clarification: if the reply is ambiguous (e.g., multiple open RFQs and unclear which one, or missing key info like price/delivery).
+3. Call escalate_to_human: DO NOT request clarification or guess. Call escalate_to_human when:
+   - requires_business_knowledge: The message asks for custom credit terms, payment schedules, or business decisions only a human manager knows (e.g., "Can we pay 50% upfront via bank transfer?" or "Can we exchange goods after 30 days?").
+   - unclear_intent: The message is gibberish, irrelevant, or intent cannot be safely determined even after reviewing context.
+   - contradictory_information: The supplier quotes a different price or contradictory details than what they previously quoted for the exact same RFQ (e.g., previously quoted $50 for RFQ 101, but now states $85 for RFQ 101 without explanation).
 """
 
 
-def route_supplier_message(message_text: str, open_rfqs_context: str) -> dict:
+def route_supplier_message(message_text: str, open_rfqs_context: str, prior_quotes_context: str = "") -> dict:
     """
-    Sends the supplier's message + their open RFQ context to Groq, gets back
+    Sends the supplier's message + their open RFQ context + prior quotes to Groq, gets back
     a tool call decision. Returns the tool name + parsed arguments.
     """
+    user_content = f"Supplier's open RFQs:\n{open_rfqs_context}\n\n"
+    if prior_quotes_context:
+        user_content += f"Supplier's prior quotes for reference:\n{prior_quotes_context}\n\n"
+    user_content += f"Supplier's WhatsApp message:\n{message_text}"
+
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Supplier's open RFQs:\n{open_rfqs_context}\n\n"
-                    f"Supplier's WhatsApp message:\n{message_text}"
-                ),
-            },
+            {"role": "user", "content": user_content},
         ],
         tools=TOOLS,
         tool_choice="required",  # force it to pick a tool, no free-text drift
@@ -128,20 +163,25 @@ def route_supplier_message(message_text: str, open_rfqs_context: str) -> dict:
     }
 
 
-def resolve_clarification(message_text: str, candidate_rfqs_context: str, previous_message: str) -> dict:
+def resolve_clarification(message_text: str, candidate_rfqs_context: str, previous_message: str, prior_quotes_context: str = "") -> dict:
     """
     Matches a supplier's follow-up reply against candidate RFQs to resolve a pending clarification.
     """
-    prompt = (
-        f"Candidate RFQs context:\n{candidate_rfqs_context}\n\n"
+    prompt = f"Candidate RFQs context:\n{candidate_rfqs_context}\n\n"
+    if prior_quotes_context:
+        prompt += f"Supplier's prior quotes for reference:\n{prior_quotes_context}\n\n"
+    prompt += (
         f"Previous supplier message / context:\n{previous_message}\n\n"
         f"Supplier's new follow-up message:\n{message_text}"
     )
+
     system_msg = (
         "You are a procurement assistant resolving an ambiguous supplier reply. "
-        "Focus specifically on extracting Price, Quality/Warranty notes, and Delivery Time. "
-        "Call record_quote if the message clarifies which candidate RFQ it refers to along with a price. "
-        "Call request_clarification if essential details (like price) are still missing or ambiguous."
+        "Focus specifically on extracting Price, Quality/Warranty notes, and Delivery Time.\n\n"
+        "- Call record_quote if the message clarifies which candidate RFQ it refers to along with a price.\n"
+        "- Call request_clarification if essential details (like price) are still missing or ambiguous.\n"
+        "- Call escalate_to_human if the message requires client business knowledge (e.g. credit/payment terms), "
+        "if intent is still unclear/gibberish, or if the supplier provides contradictory information vs prior quotes."
     )
     response = client.chat.completions.create(
         model=MODEL,
