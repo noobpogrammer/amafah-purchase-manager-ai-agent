@@ -191,8 +191,26 @@ async def check_deadlines_and_reminders():
             db.update_rfq_supplier_reminder(item["id"], 1)
 
 
+REQUIRED_ENV_VARS = [
+    "GROQ_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "EVOLUTION_API_URL",
+    "EVOLUTION_API_KEY",
+    "EVOLUTION_INSTANCE",
+]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup validation: verify all required backend env vars exist and are non-empty
+    missing = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+    if missing:
+        raise RuntimeError(
+            f"Backend configuration error: Missing required environment variable(s): {', '.join(missing)}. "
+            f"Please check your root .env file."
+        )
+
     worker_task = asyncio.create_task(outbound_worker())
     scheduler.add_job(check_deadlines_and_reminders, "interval", minutes=15)
     scheduler.start()
