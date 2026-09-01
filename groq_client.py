@@ -132,7 +132,12 @@ Your job: read the supplier's message plus the context of their currently open R
 3. Call escalate_to_human: DO NOT request clarification or guess. Call escalate_to_human when:
    - requires_business_knowledge: The message asks for custom credit terms, payment schedules, or business decisions only a human manager knows (e.g., "Can we pay 50% upfront via bank transfer?" or "Can we exchange goods after 30 days?").
    - unclear_intent: The message is gibberish, irrelevant, or intent cannot be safely determined even after reviewing context.
-   - contradictory_information: The supplier quotes a different price or contradictory details than what they previously quoted for the exact same RFQ (e.g., previously quoted $50 for RFQ 101, but now states $85 for RFQ 101 without explanation).
+   - contradictory_information: The supplier gives a contradictory quote or term change vs a prior quote for the same RFQ.
+
+CONTRADICTION & PRICE VARIANCE THRESHOLD RULES:
+- Small price variance (<= 10%): Price differences of 10% or less from a prior quote for the same RFQ (e.g., previously quoted $50, now states $52 — a 4% change) are treated as minor rounding or currency adjustments — DO NOT escalate. Call record_quote with the new price if clear, or request_clarification if otherwise ambiguous.
+- Large price variance (> 10%) or unexplainable term conflict: Price changes > 10% without explanation (e.g., previously quoted $50, now states $85 without explanation), or delivery/warranty terms that conflict with prior statements, are genuine contradictions — call escalate_to_human with category "contradictory_information".
+- Explicitly explained changes: If the supplier explicitly explains a price increase or term change (e.g., "Price is now $85 due to raw material cost increase"), it is NOT a contradiction — call record_quote with the new price ($85).
 """
 
 
@@ -178,10 +183,14 @@ def resolve_clarification(message_text: str, candidate_rfqs_context: str, previo
     system_msg = (
         "You are a procurement assistant resolving an ambiguous supplier reply. "
         "Focus specifically on extracting Price, Quality/Warranty notes, and Delivery Time.\n\n"
-        "- Call record_quote if the message clarifies which candidate RFQ it refers to along with a price.\n"
-        "- Call request_clarification if essential details (like price) are still missing or ambiguous.\n"
-        "- Call escalate_to_human if the message requires client business knowledge (e.g. credit/payment terms), "
-        "if intent is still unclear/gibberish, or if the supplier provides contradictory information vs prior quotes."
+        "1. Call record_quote if the message clarifies which candidate RFQ it refers to along with a price.\n"
+        "2. Call request_clarification if essential details (like price) are still missing or ambiguous.\n"
+        "3. Call escalate_to_human if the message requires client business knowledge (e.g. credit/payment terms), "
+        "if intent is still unclear/gibberish, or if the supplier provides contradictory information vs prior quotes.\n\n"
+        "CONTRADICTION & PRICE VARIANCE THRESHOLD RULES:\n"
+        "- Small price variance (<= 10%): Price differences of 10% or less from a prior quote for the same RFQ (e.g., previously quoted $50, now states $52 — a 4% change) are treated as minor rounding or currency adjustments — DO NOT escalate; call record_quote with the new price if clear.\n"
+        "- Large price variance (> 10%) or unexplainable term conflict: Price changes > 10% without explanation (e.g., previously quoted $50, now states $85 without explanation), or delivery/warranty terms that conflict with prior statements, are genuine contradictions — call escalate_to_human with category 'contradictory_information'.\n"
+        "- Explicitly explained changes: If the supplier explicitly explains a price/term change (e.g., 'Price is now $85 due to raw material cost increase'), it is NOT a contradiction — call record_quote with the new price ($85)."
     )
     response = client.chat.completions.create(
         model=MODEL,
