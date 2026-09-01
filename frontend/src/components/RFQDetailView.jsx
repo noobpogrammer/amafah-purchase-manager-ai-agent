@@ -167,21 +167,21 @@ export default function RFQDetailView({
         <div className="rfq-sidebar card">
           <div className="card-header flex-between">
             <h3 className="card-title">All RFQs</h3>
-            <div className="filter-chips flex-items gap-1">
+            <div className="segmented-control">
               <button
-                className={`chip ${filterTab === 'all' ? 'active' : ''}`}
+                className={`segmented-btn ${filterTab === 'all' ? 'active' : ''}`}
                 onClick={() => setFilterTab('all')}
               >
                 All
               </button>
               <button
-                className={`chip ${filterTab === 'active' ? 'active' : ''}`}
+                className={`segmented-btn ${filterTab === 'active' ? 'active' : ''}`}
                 onClick={() => setFilterTab('active')}
               >
                 Active
               </button>
               <button
-                className={`chip ${filterTab === 'closed' ? 'active' : ''}`}
+                className={`segmented-btn ${filterTab === 'closed' ? 'active' : ''}`}
                 onClick={() => setFilterTab('closed')}
               >
                 Closed
