@@ -14,7 +14,18 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+def clean_phone(phone: str) -> str:
+    """Strips all non-digit characters from a phone number string."""
+    if not phone:
+        return ""
+    return "".join(c for c in phone if c.isdigit())
+
+
 def get_supplier_by_phone(client_id: str, phone_number: str):
+    target_digits = clean_phone(phone_number)
+    if not target_digits:
+        return None
+
     res = (
         supabase.table("suppliers")
         .select("*")
@@ -22,7 +33,22 @@ def get_supplier_by_phone(client_id: str, phone_number: str):
         .eq("phone_number", phone_number)
         .execute()
     )
-    return res.data[0] if res.data else None
+    if res.data:
+        return res.data[0]
+
+    # Fallback: match by cleaned digits if stored with spaces, +, or dashes
+    all_suppliers = (
+        supabase.table("suppliers")
+        .select("*")
+        .eq("client_id", client_id)
+        .execute()
+        .data
+    )
+    for s in all_suppliers:
+        if clean_phone(s.get("phone_number")) == target_digits:
+            return s
+
+    return None
 
 
 def create_supplier(client_id: str, name: str, phone_number: str, categories: list[str] = None, notes: str = None):
