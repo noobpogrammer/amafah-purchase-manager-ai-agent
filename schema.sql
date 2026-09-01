@@ -188,3 +188,54 @@ create table flagged_for_review (
 create index idx_flagged_client on flagged_for_review(client_id);
 create index idx_flagged_supplier on flagged_for_review(supplier_id);
 create index idx_flagged_status on flagged_for_review(status);
+
+-- ------------------------------------------------------------
+-- ROW LEVEL SECURITY (RLS) & DEMO-SCOPED POLICIES
+-- Enable RLS across all business tables and add permissive-but-scoped
+-- policies for the public 'anon' role restricted to DEMO_CLIENT_ID.
+-- NOTE: Replace with auth.uid() token checks prior to production launch.
+-- ------------------------------------------------------------
+
+alter table clients enable row level security;
+alter table suppliers enable row level security;
+alter table rfqs enable row level security;
+alter table rfq_suppliers enable row level security;
+alter table quotes enable row level security;
+alter table pending_clarifications enable row level security;
+alter table message_log enable row level security;
+alter table rfq_rankings enable row level security;
+alter table flagged_for_review enable row level security;
+
+-- Demo client policies for tables with direct client_id column
+create policy demo_anon_clients on clients for all to anon
+  using (id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b');
+
+create policy demo_anon_suppliers on suppliers for all to anon
+  using (client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b')
+  with check (client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b');
+
+create policy demo_anon_rfqs on rfqs for all to anon
+  using (client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b')
+  with check (client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b');
+
+create policy demo_anon_pending_clarifications on pending_clarifications for all to anon
+  using (client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b')
+  with check (client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b');
+
+create policy demo_anon_message_log on message_log for all to anon
+  using (client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b')
+  with check (client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b');
+
+create policy demo_anon_flagged_for_review on flagged_for_review for all to anon
+  using (client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b')
+  with check (client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b');
+
+-- Subquery policies for child tables without direct client_id column
+create policy demo_anon_rfq_suppliers on rfq_suppliers for all to anon
+  using (exists (select 1 from rfqs where rfqs.id = rfq_suppliers.rfq_id and rfqs.client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b'));
+
+create policy demo_anon_quotes on quotes for all to anon
+  using (exists (select 1 from rfqs where rfqs.id = quotes.rfq_id and rfqs.client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b'));
+
+create policy demo_anon_rfq_rankings on rfq_rankings for all to anon
+  using (exists (select 1 from rfqs where rfqs.id = rfq_rankings.rfq_id and rfqs.client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b'));
