@@ -108,6 +108,33 @@ class TestFlagForHumanReviewAndResolve:
         assert result["id"] == "flag-123"
         mock_supabase.table.assert_called_with("flagged_for_review")
 
+    def test_update_rfq_status(self, mock_supabase):
+        mock_table = MagicMock()
+        mock_table.update.return_value.eq.return_value.execute.return_value = MagicMock(
+            data=[{"id": "rfq-100", "status": "closed"}]
+        )
+        mock_supabase.table.return_value = mock_table
+
+        result = db.update_rfq_status("rfq-100", "closed")
+        assert result["status"] == "closed"
+        mock_supabase.table.assert_called_with("rfqs")
+
+    def test_closed_rfqs_filtered_out(self, mock_supabase):
+        mock_data = [
+            {"id": "rs-1", "rfqs": {"id": "rfq-1", "status": "active"}},
+            {"id": "rs-2", "rfqs": {"id": "rfq-2", "status": "closed"}},
+        ]
+        mock_query = MagicMock()
+        mock_query.select.return_value = mock_query
+        mock_query.eq.return_value = mock_query
+        mock_query.in_.return_value = mock_query
+        mock_query.execute.return_value = MagicMock(data=mock_data)
+        mock_supabase.table.return_value = mock_query
+
+        open_rfqs = db.get_open_rfqs_for_supplier("supp-1")
+        assert len(open_rfqs) == 1
+        assert open_rfqs[0]["rfqs"]["id"] == "rfq-1"
+
 
 class TestClarificationRoundsCap:
     def test_count_clarification_rounds(self, mock_supabase):

@@ -492,3 +492,12 @@ async def resolve_flag_endpoint(flag_id: str):
 async def rank_rfq_endpoint(rfq_id: str):
     """Trigger the final comparison/ranking step for a closed or reviewable RFQ."""
     return generate_ranking(rfq_id)
+
+
+@app.post("/rfq/{rfq_id}/close")
+async def close_rfq_endpoint(rfq_id: str, status: str = "closed"):
+    """Closes or cancels an RFQ."""
+    if status not in ("closed", "cancelled"):
+        return {"error": "Invalid status. Must be 'closed' or 'cancelled'."}
+    result = db.update_rfq_status(rfq_id, status)
+    return {"status": status, "rfq": result}

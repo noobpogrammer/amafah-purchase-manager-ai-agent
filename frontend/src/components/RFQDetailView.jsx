@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { fetchRFQs, fetchRFQDetail, triggerAIRanking } from '../api';
+import { fetchRFQs, fetchRFQDetail, triggerAIRanking, closeRFQ } from '../api';
 import {
   FileText,
   Clock,
@@ -10,7 +10,10 @@ import {
   BarChart2,
   MessageSquare,
   ChevronRight,
-  Sparkles
+  Sparkles,
+  XCircle,
+  Check,
+  X
 } from 'lucide-react';
 
 export default function RFQDetailView({
@@ -25,13 +28,16 @@ export default function RFQDetailView({
   const [detailLoading, setDetailLoading] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [rankingLoading, setRankingLoading] = useState(false);
+  const [confirmClose, setConfirmClose] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [filterTab, setFilterTab] = useState('all'); // 'all', 'active', 'closed'
 
   // Load RFQ list
   const loadRFQs = async () => {
     try {
       const data = await fetchRFQs();
-      setRfqs(data);
-      if (!selectedRfqId && data.length > 0) {
+      setRfqs(data || []);
+      if (!selectedRfqId && data && data.length > 0) {
         setSelectedRfqId(data[0].id);
       }
     } catch (err) {
@@ -61,6 +67,7 @@ export default function RFQDetailView({
 
   useEffect(() => {
     if (selectedRfqId) {
+      setConfirmClose(false);
       loadRFQDetail(selectedRfqId);
     }
   }, [selectedRfqId]);
@@ -89,7 +96,23 @@ export default function RFQDetailView({
     }
   };
 
-  const getStatusBadge = (status) => {
+  const handleCloseRFQ = async (status = 'closed') => {
+    if (!selectedRfqId) return;
+    setClosing(true);
+    try {
+      await closeRFQ(selectedRfqId, status);
+      setConfirmClose(false);
+      await loadRFQs();
+      await loadRFQDetail(selectedRfqId);
+    } catch (err) {
+      console.error(err);
+      alert('Error closing RFQ: ' + err.message);
+    } finally {
+      setClosing(false);
+    }
+  };
+
+  const getSupplierStatusBadge = (status) => {
     switch (status) {
       case 'responded':
         return <span className="badge badge-status responded"><CheckCircle size={12} /> Responded</span>;
@@ -101,6 +124,23 @@ export default function RFQDetailView({
         return <span className="badge badge-status sent"><Clock size={12} /> Sent / Waiting</span>;
     }
   };
+
+  const getRfqStatusBadge = (status) => {
+    switch (status) {
+      case 'closed':
+        return <span className="badge badge-status no_response"><XCircle size={12} /> Closed</span>;
+      case 'cancelled':
+        return <span className="badge badge-status contradiction"><XCircle size={12} /> Cancelled</span>;
+      default:
+        return <span className="badge badge-status responded"><CheckCircle size={12} /> Active</span>;
+    }
+  };
+
+  const filteredRfqs = rfqs.filter((r) => {
+    if (filterTab === 'active') return r.status === 'active';
+    if (filterTab === 'closed') return r.status === 'closed' || r.status === 'cancelled';
+    return true;
+  });
 
   return (
     <div className="view-container">
@@ -125,29 +165,54 @@ export default function RFQDetailView({
       <div className="split-view-layout">
         {/* Left List of RFQs */}
         <div className="rfq-sidebar card">
-          <div className="card-header">
+          <div className="card-header flex-between">
             <h3 className="card-title">All RFQs</h3>
+            <div className="filter-chips flex-items gap-1">
+              <button
+                className={`chip ${filterTab === 'all' ? 'active' : ''}`}
+                onClick={() => setFilterTab('all')}
+              >
+                All
+              </button>
+              <button
+                className={`chip ${filterTab === 'active' ? 'active' : ''}`}
+                onClick={() => setFilterTab('active')}
+              >
+                Active
+              </button>
+              <button
+                className={`chip ${filterTab === 'closed' ? 'active' : ''}`}
+                onClick={() => setFilterTab('closed')}
+              >
+                Closed
+              </button>
+            </div>
           </div>
+
           {loading ? (
             <div className="loading-state">Loading RFQs...</div>
-          ) : rfqs.length === 0 ? (
-            <div className="empty-state">No RFQs found.</div>
+          ) : filteredRfqs.length === 0 ? (
+            <div className="empty-state">No {filterTab !== 'all' ? filterTab : ''} RFQs found.</div>
           ) : (
             <div className="rfq-list">
-              {rfqs.map((rfq) => {
+              {filteredRfqs.map((rfq) => {
                 const isSelected = rfq.id === selectedRfqId;
                 const totalMatched = rfq.rfq_suppliers?.length || 0;
                 const quotesCount = rfq.quotes?.length || 0;
+                const isClosed = rfq.status === 'closed' || rfq.status === 'cancelled';
 
                 return (
                   <div
                     key={rfq.id}
-                    className={`rfq-item-card ${isSelected ? 'selected' : ''}`}
+                    className={`rfq-item-card ${isSelected ? 'selected' : ''} ${isClosed ? 'dimmed' : ''}`}
                     onClick={() => setSelectedRfqId(rfq.id)}
                   >
-                    <div className="rfq-item-header">
+                    <div className="rfq-item-header flex-between">
                       <strong>{rfq.product_name}</strong>
-                      <span className="badge badge-category">{rfq.category}</span>
+                      <div className="flex-items gap-1">
+                        {getRfqStatusBadge(rfq.status)}
+                        <span className="badge badge-category">{rfq.category}</span>
+                      </div>
                     </div>
                     <div className="rfq-item-meta">
                       <span>Qty: {rfq.quantity || 'N/A'}</span>
@@ -178,28 +243,61 @@ export default function RFQDetailView({
               <div className="card">
                 <div className="rfq-detail-header">
                   <div>
-                    <span className="badge badge-category">{detailData.rfq.category}</span>
+                    <div className="flex-items gap-2 mb-1">
+                      {getRfqStatusBadge(detailData.rfq.status)}
+                      <span className="badge badge-category">{detailData.rfq.category}</span>
+                    </div>
                     <h3 className="rfq-product-title">{detailData.rfq.product_name}</h3>
                     <p className="rfq-specs-text">
                       Specs: <strong>{detailData.rfq.specs || 'Standard'}</strong> | Quantity: <strong>{detailData.rfq.quantity || 'N/A'}</strong> | Deadline: <strong>{detailData.rfq.deadline_hours || 24} hours</strong>
                     </p>
                   </div>
 
-                  <div className="rfq-header-actions">
+                  <div className="rfq-header-actions flex-items gap-2">
                     <button
                       className="btn btn-secondary btn-sm"
                       onClick={() => setActiveTab('quotes_report')}
                     >
                       <BarChart2 size={16} /> Quotes Report
                     </button>
+
                     <button
                       className="btn btn-primary btn-sm"
                       onClick={handleRankClick}
-                      disabled={rankingLoading || detailData.quotes.length === 0}
+                      disabled={rankingLoading || detailData.quotes.length === 0 || detailData.rfq.status !== 'active'}
                     >
                       <Sparkles size={16} />
                       {rankingLoading ? 'Ranking...' : 'Trigger AI Ranking'}
                     </button>
+
+                    {detailData.rfq.status === 'active' && (
+                      !confirmClose ? (
+                        <button
+                          className="btn btn-danger btn-sm"
+                          onClick={() => setConfirmClose(true)}
+                        >
+                          <XCircle size={16} /> Close RFQ
+                        </button>
+                      ) : (
+                        <div className="flex-items gap-1 confirm-close-box">
+                          <span className="confirm-text">Close RFQ?</span>
+                          <button
+                            className="btn btn-danger btn-sm"
+                            onClick={() => handleCloseRFQ('closed')}
+                            disabled={closing}
+                          >
+                            <Check size={14} /> {closing ? 'Closing...' : 'Yes, Close'}
+                          </button>
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => setConfirmClose(false)}
+                            disabled={closing}
+                          >
+                            <X size={14} /> Cancel
+                          </button>
+                        </div>
+                      )
+                    )}
                   </div>
                 </div>
               </div>
@@ -231,7 +329,7 @@ export default function RFQDetailView({
                           <tr key={item.id}>
                             <td><strong>{supp?.name || 'Supplier'}</strong></td>
                             <td>{supp?.phone_number}</td>
-                            <td>{getStatusBadge(item.status)}</td>
+                            <td>{getSupplierStatusBadge(item.status)}</td>
                             <td>{new Date(item.sent_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td>
                             <td>{item.reminder_count} reminders</td>
                           </tr>

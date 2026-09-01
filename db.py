@@ -87,7 +87,8 @@ def get_open_rfqs_for_supplier(supplier_id: str):
         .in_("status", ["sent", "clarifying"])
         .execute()
     )
-    return res.data
+    # Strictly filter only entries where the underlying RFQ is active
+    return [entry for entry in res.data if entry.get("rfqs", {}).get("status") == "active"]
 
 
 def record_quote(rfq_id: str, supplier_id: str, price: float,
@@ -183,7 +184,8 @@ def get_active_rfq_suppliers_with_deadlines():
         .eq("status", "sent")
         .execute()
     )
-    return res.data
+    # Strictly filter only entries where the underlying RFQ is active
+    return [item for item in res.data if item.get("rfqs", {}).get("status") == "active"]
 
 
 def update_rfq_supplier_reminder(rfq_supplier_id: str, reminder_count: int):
@@ -348,4 +350,10 @@ def resolve_flag(flag_id: str):
         .eq("id", flag_id)
         .execute()
     )
+    return res.data[0] if res.data else None
+
+
+def update_rfq_status(rfq_id: str, status: str):
+    """Updates the status of an RFQ ('active', 'closed', 'cancelled')."""
+    res = supabase.table("rfqs").update({"status": status}).eq("id", rfq_id).execute()
     return res.data[0] if res.data else None

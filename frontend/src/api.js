@@ -157,3 +157,14 @@ export async function resolveFlag(flagId) {
   }
   return await response.json();
 }
+
+export async function closeRFQ(rfqId, status = 'closed') {
+  const response = await fetch(`${API_URL}/rfq/${rfqId}/close?status=${status}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to close RFQ: ${response.statusText}`);
+  }
+  return await response.json();
+}
