@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import pytest
 import asyncio
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -11,6 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 # Import target functions
 import db
 import main
+import groq_client
 
 
 @pytest.fixture
@@ -117,6 +119,29 @@ class TestClarificationRoundsCap:
 
         count = db.count_clarification_rounds("supp-1", "client-1")
         assert count == 2
+
+
+class TestAntiUUIDClarificationRule:
+    """Verifies that clarifying questions never contain internal UUID strings."""
+
+    def test_clarifying_question_contains_no_uuids(self):
+        rfq_context_stem = (
+            "- RFQ ID: c8cc719d-19c0-422b-8a46-13e89cbd28bb | Product: Cement 5kg | Specs: Standard | Qty: 50\n"
+            "- RFQ ID: 57656d76-d822-4a99-8ad5-75c97139e7ed | Product: Cement 10kg | Specs: Premium | Qty: 30"
+        )
+
+        res = groq_client.resolve_clarification(
+            message_text="cement 10 aed",
+            candidate_rfqs_context=rfq_context_stem,
+            previous_message="Initial reply: 10 aed 5 days"
+        )
+
+        assert res["tool_name"] == "request_clarification"
+        question = res["arguments"]["clarifying_question"]
+
+        # Regex for standard 36-char UUID format (8-4-4-4-12 hex chars)
+        uuid_pattern = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+        assert not uuid_pattern.search(question), f"Clarifying question contained raw UUID: '{question}'"
 
 
 class TestReminderSystemAudit:

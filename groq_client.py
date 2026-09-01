@@ -61,7 +61,10 @@ TOOLS = [
                     },
                     "clarifying_question": {
                         "type": "string",
-                        "description": "The question to send back to the supplier, focusing on price, quality/warranty, or delivery time",
+                        "description": (
+                            "The question to send to the supplier. NEVER include internal RFQ IDs, UUIDs, or database keys in this string. "
+                            "Refer to candidate products ONLY by product name, specs, or quantity (e.g. 'the 5kg cement order' or 'the 60W LED panel')."
+                        ),
                     },
                 },
                 "required": ["candidate_rfq_ids", "clarifying_question"],
@@ -128,7 +131,10 @@ Clarifications should focus specifically on Price, Product Quality/Warranty, and
 Your job: read the supplier's message plus the context of their currently open RFQ(s) and prior quotes, and decide the right action by calling exactly one tool:
 
 1. Call record_quote: if the reply clearly and unambiguously gives a price for ONE specific open RFQ (matching by product name/description).
-2. Call request_clarification: if the reply is ambiguous (e.g., multiple open RFQs and unclear which product, or missing key info like price/delivery). If a product name is partially mentioned (e.g., 'cement' matching both 'Cement 5kg' and 'Cement 10kg'), ask a narrowed clarifying question naming the exact options (e.g. 'Is this quote for 5kg or 10kg cement?').
+2. Call request_clarification: if the reply is ambiguous (e.g., multiple open RFQs and unclear which product, or missing key info like price/delivery).
+   CRITICAL NO-UUID RULE FOR CLARIFYING QUESTIONS:
+   - NEVER include internal RFQ IDs, UUIDs, or database identifiers in the clarifying_question text sent to the supplier (e.g. NEVER write 'which RFQ (c8cc719d-19c0... or 57656d76...)' ).
+   - Refer to candidate RFQs ONLY by product name, specs, or quantity — the way a human would describe them in conversation (e.g., 'the 5kg cement order' vs 'the 10kg cement order'), NEVER by ID.
 3. Call escalate_to_human: DO NOT request clarification or guess. Call escalate_to_human when:
    - requires_business_knowledge: The message asks for custom credit terms, payment schedules, or business decisions only a human manager knows (e.g., "Can we pay 50% upfront via bank transfer?" or "Can we exchange goods after 30 days?").
    - unclear_intent: The message is gibberish, irrelevant, or intent cannot be safely determined even after reviewing context. (Note: mentioning a product name or stem is valid intent, do NOT escalate for product name mentions).
@@ -194,13 +200,16 @@ def resolve_clarification(message_text: str, candidate_rfqs_context: str, previo
         "(e.g. 'Just to confirm — is this quote for the 5kg or 10kg cement order?').\n"
         "- Never send a clarifying question that is substantively identical to the previous clarifying question asked in the conversation. "
         "Narrow it based on what the supplier's latest message clarified.\n\n"
+        "CRITICAL NO-UUID RULE:\n"
+        "- NEVER include internal RFQ IDs, UUIDs, or database identifiers in the clarifying_question text (e.g. NEVER write 'which RFQ (c8cc719d-19c0... or 57656d76...)' ).\n"
+        "- Refer to candidate RFQs ONLY by product name, specs, or quantity (e.g. 'the 5kg cement order'), NEVER by ID.\n\n"
         "WORKED EXAMPLES:\n"
         "Example 1 (Full Product Match):\n"
         "  Candidate RFQs: [RFQ A (ID: 24b060bb-e275-48e0-807b-81b0d03990c0): Cement 5kg], [RFQ B (ID: a123): LED Panel 60W]\n"
         "  Previous msg: '10 aed 5 days' -> Asked which RFQ\n"
         "  Supplier follow-up: 'cement 5kg'\n"
         "  -> Matches RFQ A by product name -> call record_quote(rfq_id='24b060bb-e275-48e0-807b-81b0d03990c0', price=10, delivery_time='5 days')\n\n"
-        "Example 2 (Partial Match - Narrowed Question):\n"
+        "Example 2 (Partial Match - Narrowed Question without UUIDs):\n"
         "  Candidate RFQs: [RFQ A (ID: rfq-101): Cement 5kg], [RFQ B (ID: rfq-102): Cement 10kg]\n"
         "  Previous msg: '10 aed 5 days' -> Asked which RFQ\n"
         "  Supplier follow-up: 'cement'\n"
