@@ -109,15 +109,61 @@ class TestFlagForHumanReviewAndResolve:
         mock_supabase.table.assert_called_with("flagged_for_review")
 
     def test_update_rfq_status(self, mock_supabase):
-        mock_table = MagicMock()
-        mock_table.update.return_value.eq.return_value.execute.return_value = MagicMock(
+        mock_rfq_table = MagicMock()
+        mock_rfq_table.update.return_value.eq.return_value.execute.return_value = MagicMock(
             data=[{"id": "rfq-100", "status": "closed"}]
         )
-        mock_supabase.table.return_value = mock_table
+        mock_supp_table = MagicMock()
+        mock_supp_table.update.return_value.eq.return_value.in_.return_value.execute.return_value = MagicMock(data=[])
+        mock_pending_table = MagicMock()
+        mock_pending_table.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+
+        def table_router(t):
+            if t == "rfqs":
+                return mock_rfq_table
+            elif t == "rfq_suppliers":
+                return mock_supp_table
+            elif t == "pending_clarifications":
+                return mock_pending_table
+            return MagicMock()
+
+        mock_supabase.table.side_effect = table_router
 
         result = db.update_rfq_status("rfq-100", "closed")
         assert result["status"] == "closed"
-        mock_supabase.table.assert_called_with("rfqs")
+        mock_rfq_table.update.assert_called_with({"status": "closed"})
+
+    def test_close_rfq_cascades_status_updates(self, mock_supabase):
+        mock_rfq_table = MagicMock()
+        mock_rfq_table.update.return_value.eq.return_value.execute.return_value = MagicMock(
+            data=[{"id": "rfq-100", "status": "closed"}]
+        )
+        mock_supp_table = MagicMock()
+        mock_supp_table.update.return_value.eq.return_value.in_.return_value.execute.return_value = MagicMock(data=[])
+        
+        mock_pending_table = MagicMock()
+        mock_pending_table.select.return_value.eq.return_value.execute.return_value = MagicMock(
+            data=[{"id": "p-1", "pending_rfq_ids": ["rfq-100", "rfq-200"], "status": "awaiting_reply"}]
+        )
+        mock_pending_table.update.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+
+        def table_router(t):
+            if t == "rfqs":
+                return mock_rfq_table
+            elif t == "rfq_suppliers":
+                return mock_supp_table
+            elif t == "pending_clarifications":
+                return mock_pending_table
+            return MagicMock()
+
+        mock_supabase.table.side_effect = table_router
+
+        result = db.close_rfq("rfq-100", "closed")
+        assert result["id"] == "rfq-100"
+        # Assert rfq_suppliers updated sent/clarifying to no_response
+        mock_supp_table.update.assert_called_with({"status": "no_response"})
+        # Assert pending_clarification abandoned
+        mock_pending_table.update.assert_called_with({"status": "abandoned"})
 
     def test_closed_rfqs_filtered_out(self, mock_supabase):
         mock_data = [
@@ -301,7 +347,7 @@ class TestReminderSystemAudit:
 
         with patch.object(db, "get_active_rfq_suppliers_with_deadlines", return_value=[mock_active_item]), \
              patch.object(db, "log_message"), \
-             patch.object(db, "mark_rfq_supplier_no_response") as mock_no_resp, \
+             patch.object(db, "close_rfq") as mock_close_rfq, \
              patch.object(main, "check_and_auto_rank") as mock_auto_rank, \
              patch.object(main, "enqueue_message", new_callable=AsyncMock) as mock_enqueue:
 
@@ -309,7 +355,7 @@ class TestReminderSystemAudit:
 
             mock_enqueue.assert_called_once()
             assert "closed as the deadline has passed" in mock_enqueue.call_args[0][1].lower()
-            mock_no_resp.assert_called_once_with("rfq-supp-1")
+            mock_close_rfq.assert_called_once_with("rfq-100", "closed")
             mock_auto_rank.assert_called_once_with("rfq-100")
 
     @pytest.mark.asyncio

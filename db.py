@@ -353,7 +353,44 @@ def resolve_flag(flag_id: str):
     return res.data[0] if res.data else None
 
 
+def close_rfq(rfq_id: str, target_status: str = "closed"):
+    """
+    Closes or cancels an RFQ and ensures all child records are resolved cleanly:
+    1. Updates rfqs.status to target_status ('closed' or 'cancelled').
+    2. Updates any rfq_suppliers for this RFQ in ('sent', 'clarifying') to 'no_response'.
+    3. Abandons any pending_clarifications for this RFQ currently in 'awaiting_reply' status.
+    """
+    # 1. Update RFQ status
+    rfq_res = (
+        supabase.table("rfqs")
+        .update({"status": target_status})
+        .eq("id", rfq_id)
+        .execute()
+    )
+
+    # 2. Update hanging suppliers in 'sent' or 'clarifying' to 'no_response'
+    supabase.table("rfq_suppliers").update({"status": "no_response"}).eq(
+        "rfq_id", rfq_id
+    ).in_("status", ["sent", "clarifying"]).execute()
+
+    # 3. Abandon any pending clarifications involving this rfq_id
+    all_pending = (
+        supabase.table("pending_clarifications")
+        .select("*")
+        .eq("status", "awaiting_reply")
+        .execute()
+        .data
+    )
+    for p in all_pending:
+        p_rfq_ids = p.get("pending_rfq_ids") or []
+        if rfq_id in p_rfq_ids:
+            supabase.table("pending_clarifications").update(
+                {"status": "abandoned"}
+            ).eq("id", p["id"]).execute()
+
+    return rfq_res.data[0] if rfq_res.data else None
+
+
 def update_rfq_status(rfq_id: str, status: str):
-    """Updates the status of an RFQ ('active', 'closed', 'cancelled')."""
-    res = supabase.table("rfqs").update({"status": status}).eq("id", rfq_id).execute()
-    return res.data[0] if res.data else None
+    """Alias wrapping close_rfq for backward compatibility."""
+    return close_rfq(rfq_id, status)

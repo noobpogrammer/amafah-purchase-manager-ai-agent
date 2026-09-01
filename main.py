@@ -172,7 +172,7 @@ async def check_deadlines_and_reminders():
             msg = f"RFQ for '{prod}' is now closed as the deadline has passed. Thank you!"
             db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", msg)
             await enqueue_message(phone, msg)
-            db.mark_rfq_supplier_no_response(item["id"])
+            db.close_rfq(rfq["id"], "closed")
             check_and_auto_rank(rfq["id"])
         elif percentage >= 90 and reminder_count == 2:
             msg = f"Final reminder — closing the RFQ for '{prod}' soon! Please reply with your quote if available."
