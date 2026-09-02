@@ -402,3 +402,15 @@ def close_rfq(rfq_id: str, target_status: str = "closed"):
 def update_rfq_status(rfq_id: str, status: str):
     """Alias wrapping close_rfq for backward compatibility."""
     return close_rfq(rfq_id, status)
+
+
+def log_webhook_error(error_message: str, traceback_str: str, raw_payload: dict = None):
+    """Persists an unhandled webhook or Groq exception to the webhook_errors table."""
+    try:
+        supabase.table("webhook_errors").insert({
+            "error_message": str(error_message),
+            "traceback": traceback_str,
+            "raw_payload": raw_payload,
+        }).execute()
+    except Exception as ex:
+        print(f"Failed to log webhook error to db: {ex}")

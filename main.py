@@ -242,74 +242,189 @@ app.add_middleware(
 
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
-    payload = await request.json()
+    payload = {}
+    try:
+        payload = await request.json()
+    except Exception:
+        pass
 
-    # Evolution API payload shape — adjust field paths to match your actual webhook format
-    data = payload.get("data", {})
+    try:
+        # Evolution API payload shape — adjust field paths to match your actual webhook format
+        data = payload.get("data", {})
 
-    # Evolution API occasionally sends "data" as a list (batched events)
-    # instead of a single dict. Take the first item if so; skip if empty.
-    if isinstance(data, list):
-        if not data:
-            return {"status": "ignored", "reason": "empty batched event"}
-        data = data[0]
+        # Evolution API occasionally sends "data" as a list (batched events)
+        # instead of a single dict. Take the first item if so; skip if empty.
+        if isinstance(data, list):
+            if not data:
+                return {"status": "ignored", "reason": "empty batched event"}
+            data = data[0]
 
-    key_data = data.get("key", {})
+        key_data = data.get("key", {})
 
-    # Ignore outgoing messages sent by ourselves (e.g., our own outgoing RFQs)
-    if key_data.get("fromMe", False):
-        return {"status": "ignored", "reason": "outgoing message (fromMe)"}
+        # Ignore outgoing messages sent by ourselves (e.g., our own outgoing RFQs)
+        if key_data.get("fromMe", False):
+            return {"status": "ignored", "reason": "outgoing message (fromMe)"}
 
-    raw_remote_jid = key_data.get("remoteJid", "")
-    sender_phone = normalize_phone(raw_remote_jid)
-    message_text = data.get("message", {}).get("conversation", "")
+        raw_remote_jid = key_data.get("remoteJid", "")
+        sender_phone = normalize_phone(raw_remote_jid)
+        message_text = data.get("message", {}).get("conversation", "")
 
-    # Non-text message types (like audioMessage, imageMessage, etc.) have an empty conversation field
-    # and are intentionally skipped since the agent doesn't process media/audio content yet.
-    if not sender_phone or not message_text:
-        return {"status": "ignored", "reason": "no message content"}
+        # Non-text message types (like audioMessage, imageMessage, etc.) have an empty conversation field
+        # and are intentionally skipped since the agent doesn't process media/audio content yet.
+        if not sender_phone or not message_text:
+            return {"status": "ignored", "reason": "no message content"}
 
-    supplier = db.get_supplier_by_phone(DEMO_CLIENT_ID, sender_phone)
-    if not supplier:
-        return {"status": "ignored", "reason": "unknown supplier"}
+        supplier = db.get_supplier_by_phone(DEMO_CLIENT_ID, sender_phone)
+        if not supplier:
+            return {"status": "ignored", "reason": "unknown supplier"}
 
-    db.log_message(DEMO_CLIENT_ID, supplier["id"], "inbound", message_text)
+        db.log_message(DEMO_CLIENT_ID, supplier["id"], "inbound", message_text)
 
-    # Check for unresolved pending clarification (status = 'awaiting_reply') for this supplier
-    pending = db.get_pending_clarification_for_supplier(supplier["id"])
-    if pending:
-        # Check clarification rounds cap directly on thread's round_number (max 2 rounds allowed)
-        current_round = pending.get("round_number", 1)
-        if current_round >= 2:
-            db.abandon_pending_clarification(pending["id"])
-            reason = "Maximum clarification rounds (2) exceeded for supplier."
+        # Check for unresolved pending clarification (status = 'awaiting_reply') for this supplier
+        pending = db.get_pending_clarification_for_supplier(supplier["id"])
+        if pending:
+            # Check clarification rounds cap directly on thread's round_number (max 2 rounds allowed)
+            current_round = pending.get("round_number", 1)
+            if current_round >= 2:
+                db.abandon_pending_clarification(pending["id"])
+                reason = "Maximum clarification rounds (2) exceeded for supplier."
+                db.flag_for_human_review(
+                    client_id=DEMO_CLIENT_ID,
+                    supplier_id=supplier["id"],
+                    rfq_id=None,
+                    reason=reason,
+                    category="unclear_intent",
+                    raw_message=message_text,
+                )
+                ack_msg = "Thanks! We will have a team member follow up with you directly."
+                db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", ack_msg)
+                await enqueue_message(supplier["phone_number"], ack_msg)
+                return {"status": "escalated", "reason": reason, "category": "unclear_intent"}
+
+            candidate_rfq_ids = pending.get("pending_rfq_ids", [])
+            candidate_rfqs = db.get_rfqs_by_ids(candidate_rfq_ids)
+            rfq_context = format_rfq_context(candidate_rfqs)
+
+            # Fetch prior quotes context for contradiction detection
+            prior_quotes = db.get_supplier_prior_quotes(supplier["id"], candidate_rfq_ids)
+            prior_quotes_context = format_prior_quotes_context(prior_quotes)
+
+            try:
+                decision = groq_client.resolve_clarification(
+                    message_text=message_text,
+                    candidate_rfqs_context=rfq_context,
+                    previous_message=pending.get("raw_message", ""),
+                    prior_quotes_context=prior_quotes_context,
+                )
+            except Exception as groq_err:
+                tb_str = traceback.format_exc()
+                print(f"\n=== GROQ ERROR (resolve_clarification) ===\n{tb_str}\n=====================================\n")
+                db.log_webhook_error(f"Groq resolve_clarification error: {groq_err}", tb_str, payload)
+                reason = f"Groq AI service error during clarification resolution: {str(groq_err)}"
+                db.flag_for_human_review(
+                    client_id=DEMO_CLIENT_ID,
+                    supplier_id=supplier["id"],
+                    rfq_id=None,
+                    reason=reason,
+                    category="other",
+                    raw_message=message_text,
+                )
+                db.abandon_pending_clarification(pending["id"])
+                db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", HUMAN_ACK_MSG)
+                await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG)
+                return {"status": "escalated_due_to_groq_error", "reason": reason}
+
+            if decision["tool_name"] == "record_quote":
+                args = decision["arguments"]
+                db.record_quote(
+                    rfq_id=args["rfq_id"],
+                    supplier_id=supplier["id"],
+                    price=args["price"],
+                    delivery_time=args.get("delivery_time"),
+                    quality_notes=args.get("quality_notes"),
+                    raw_message=message_text,
+                )
+                db.resolve_pending_clarification(pending["id"])
+
+                db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", THANK_YOU_MSG)
+                await enqueue_message(supplier["phone_number"], THANK_YOU_MSG)
+
+                check_and_auto_rank(args["rfq_id"])
+
+                return {
+                    "status": "recorded_from_clarification",
+                    "rfq_id": args["rfq_id"],
+                    "clarification_id": pending["id"],
+                }
+            elif decision["tool_name"] == "request_clarification":
+                args = decision["arguments"]
+                next_round = current_round + 1
+                db.create_pending_clarification(
+                    client_id=DEMO_CLIENT_ID,
+                    supplier_id=supplier["id"],
+                    candidate_rfq_ids=args["candidate_rfq_ids"],
+                    raw_message=message_text,
+                    extracted_price=args.get("extracted_price"),
+                    extracted_delivery=args.get("extracted_delivery"),
+                    extracted_notes=args.get("extracted_notes"),
+                    round_number=next_round,
+                )
+                db.abandon_pending_clarification(pending["id"])
+                question = args["clarifying_question"]
+                db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", question)
+                await enqueue_message(supplier["phone_number"], question)
+                return {"status": "clarification_needed", "question": question}
+
+            elif decision["tool_name"] == "escalate_to_human":
+                args = decision["arguments"]
+                db.flag_for_human_review(
+                    client_id=DEMO_CLIENT_ID,
+                    supplier_id=supplier["id"],
+                    rfq_id=args.get("rfq_id"),
+                    reason=args.get("reason", "Human review requested by agent"),
+                    category=args.get("category", "other"),
+                    raw_message=message_text,
+                )
+                db.abandon_pending_clarification(pending["id"])
+                db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", HUMAN_ACK_MSG)
+                await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG)
+                return {
+                    "status": "escalated",
+                    "reason": args.get("reason"),
+                    "category": args.get("category"),
+                }
+
+        open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"])
+
+        if not open_rfqs:
+            return {
+                "status": "no_open_rfq",
+                "note": "message received but no active RFQ to match",
+            }
+
+        rfq_context = format_rfq_context(open_rfqs)
+        open_rfq_ids = [entry["rfqs"]["id"] for entry in open_rfqs]
+        prior_quotes = db.get_supplier_prior_quotes(supplier["id"], open_rfq_ids)
+        prior_quotes_context = format_prior_quotes_context(prior_quotes)
+
+        try:
+            decision = groq_client.route_supplier_message(message_text, rfq_context, prior_quotes_context)
+        except Exception as groq_err:
+            tb_str = traceback.format_exc()
+            print(f"\n=== GROQ ERROR (route_supplier_message) ===\n{tb_str}\n===========================================\n")
+            db.log_webhook_error(f"Groq route_supplier_message error: {groq_err}", tb_str, payload)
+            reason = f"Groq AI service error during message routing: {str(groq_err)}"
             db.flag_for_human_review(
                 client_id=DEMO_CLIENT_ID,
                 supplier_id=supplier["id"],
                 rfq_id=None,
                 reason=reason,
-                category="unclear_intent",
+                category="other",
                 raw_message=message_text,
             )
-            ack_msg = "Thanks! We will have a team member follow up with you directly."
-            db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", ack_msg)
-            await enqueue_message(supplier["phone_number"], ack_msg)
-            return {"status": "escalated", "reason": reason, "category": "unclear_intent"}
-
-        candidate_rfq_ids = pending.get("pending_rfq_ids", [])
-        candidate_rfqs = db.get_rfqs_by_ids(candidate_rfq_ids)
-        rfq_context = format_rfq_context(candidate_rfqs)
-
-        # Fetch prior quotes context for contradiction detection
-        prior_quotes = db.get_supplier_prior_quotes(supplier["id"], candidate_rfq_ids)
-        prior_quotes_context = format_prior_quotes_context(prior_quotes)
-
-        decision = groq_client.resolve_clarification(
-            message_text=message_text,
-            candidate_rfqs_context=rfq_context,
-            previous_message=pending.get("raw_message", ""),
-            prior_quotes_context=prior_quotes_context,
-        )
+            db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", HUMAN_ACK_MSG)
+            await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG)
+            return {"status": "escalated_due_to_groq_error", "reason": reason}
 
         if decision["tool_name"] == "record_quote":
             args = decision["arguments"]
@@ -321,21 +436,16 @@ async def whatsapp_webhook(request: Request):
                 quality_notes=args.get("quality_notes"),
                 raw_message=message_text,
             )
-            db.resolve_pending_clarification(pending["id"])
 
             db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", THANK_YOU_MSG)
             await enqueue_message(supplier["phone_number"], THANK_YOU_MSG)
 
             check_and_auto_rank(args["rfq_id"])
 
-            return {
-                "status": "recorded_from_clarification",
-                "rfq_id": args["rfq_id"],
-                "clarification_id": pending["id"],
-            }
+            return {"status": "recorded", "rfq_id": args["rfq_id"]}
+
         elif decision["tool_name"] == "request_clarification":
             args = decision["arguments"]
-            next_round = current_round + 1
             db.create_pending_clarification(
                 client_id=DEMO_CLIENT_ID,
                 supplier_id=supplier["id"],
@@ -344,13 +454,12 @@ async def whatsapp_webhook(request: Request):
                 extracted_price=args.get("extracted_price"),
                 extracted_delivery=args.get("extracted_delivery"),
                 extracted_notes=args.get("extracted_notes"),
-                round_number=next_round,
             )
-            db.abandon_pending_clarification(pending["id"])
             question = args["clarifying_question"]
             db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", question)
             await enqueue_message(supplier["phone_number"], question)
             return {"status": "clarification_needed", "question": question}
+
 
         elif decision["tool_name"] == "escalate_to_human":
             args = decision["arguments"]
@@ -362,7 +471,6 @@ async def whatsapp_webhook(request: Request):
                 category=args.get("category", "other"),
                 raw_message=message_text,
             )
-            db.abandon_pending_clarification(pending["id"])
             db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", HUMAN_ACK_MSG)
             await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG)
             return {
@@ -371,75 +479,13 @@ async def whatsapp_webhook(request: Request):
                 "category": args.get("category"),
             }
 
-    open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"])
+        return {"status": "unhandled", "decision": decision}
 
-    if not open_rfqs:
-        return {
-            "status": "no_open_rfq",
-            "note": "message received but no active RFQ to match",
-        }
-
-    rfq_context = format_rfq_context(open_rfqs)
-    open_rfq_ids = [entry["rfqs"]["id"] for entry in open_rfqs]
-    prior_quotes = db.get_supplier_prior_quotes(supplier["id"], open_rfq_ids)
-    prior_quotes_context = format_prior_quotes_context(prior_quotes)
-
-    decision = groq_client.route_supplier_message(message_text, rfq_context, prior_quotes_context)
-
-    if decision["tool_name"] == "record_quote":
-        args = decision["arguments"]
-        db.record_quote(
-            rfq_id=args["rfq_id"],
-            supplier_id=supplier["id"],
-            price=args["price"],
-            delivery_time=args.get("delivery_time"),
-            quality_notes=args.get("quality_notes"),
-            raw_message=message_text,
-        )
-
-        db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", THANK_YOU_MSG)
-        await enqueue_message(supplier["phone_number"], THANK_YOU_MSG)
-
-        check_and_auto_rank(args["rfq_id"])
-
-        return {"status": "recorded", "rfq_id": args["rfq_id"]}
-
-    elif decision["tool_name"] == "request_clarification":
-        args = decision["arguments"]
-        db.create_pending_clarification(
-            client_id=DEMO_CLIENT_ID,
-            supplier_id=supplier["id"],
-            candidate_rfq_ids=args["candidate_rfq_ids"],
-            raw_message=message_text,
-            extracted_price=args.get("extracted_price"),
-            extracted_delivery=args.get("extracted_delivery"),
-            extracted_notes=args.get("extracted_notes"),
-        )
-        question = args["clarifying_question"]
-        db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", question)
-        await enqueue_message(supplier["phone_number"], question)
-        return {"status": "clarification_needed", "question": question}
-
-
-    elif decision["tool_name"] == "escalate_to_human":
-        args = decision["arguments"]
-        db.flag_for_human_review(
-            client_id=DEMO_CLIENT_ID,
-            supplier_id=supplier["id"],
-            rfq_id=args.get("rfq_id"),
-            reason=args.get("reason", "Human review requested by agent"),
-            category=args.get("category", "other"),
-            raw_message=message_text,
-        )
-        db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", HUMAN_ACK_MSG)
-        await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG)
-        return {
-            "status": "escalated",
-            "reason": args.get("reason"),
-            "category": args.get("category"),
-        }
-
-    return {"status": "unhandled", "decision": decision}
+    except Exception as e:
+        tb_str = traceback.format_exc()
+        print(f"\n=== WEBHOOK ERROR ===\n{tb_str}\n=====================\n")
+        db.log_webhook_error(str(e), tb_str, payload)
+        return {"status": "error_logged", "note": "internal error, logged for review"}
 
 
 @app.post("/rfq/create")

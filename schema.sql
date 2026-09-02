@@ -240,3 +240,21 @@ create policy demo_anon_quotes on quotes for all to anon
 
 create policy demo_anon_rfq_rankings on rfq_rankings for all to anon
   using (exists (select 1 from rfqs where rfqs.id = rfq_rankings.rfq_id and rfqs.client_id = 'd88c52ad-3d0b-42e9-86f1-b9f70018856b'));
+
+-- ------------------------------------------------------------
+-- Webhook Errors: Persistent traceback storage for unhandled exceptions
+-- ------------------------------------------------------------
+create table webhook_errors (
+    id          uuid primary key default gen_random_uuid(),
+    error_message text,
+    traceback   text,
+    raw_payload jsonb,
+    created_at  timestamptz not null default now()
+);
+
+alter table webhook_errors enable row level security;
+
+create policy demo_anon_webhook_errors on webhook_errors for all to anon
+  using (true)
+  with check (true);
+

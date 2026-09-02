@@ -108,6 +108,20 @@ class TestFlagForHumanReviewAndResolve:
         assert result["id"] == "flag-123"
         mock_supabase.table.assert_called_with("flagged_for_review")
 
+    def test_log_webhook_error(self, mock_supabase):
+        mock_table = MagicMock()
+        mock_table.insert.return_value.execute.return_value = MagicMock(data=[{"id": "err-1"}])
+        mock_supabase.table.return_value = mock_table
+
+        db.log_webhook_error("Simulated Error", "Traceback details...", {"key": "val"})
+        mock_supabase.table.assert_called_with("webhook_errors")
+        mock_table.insert.assert_called_once_with({
+            "error_message": "Simulated Error",
+            "traceback": "Traceback details...",
+            "raw_payload": {"key": "val"},
+        })
+
+
     def test_update_rfq_status(self, mock_supabase):
         mock_rfq_table = MagicMock()
         mock_rfq_table.update.return_value.eq.return_value.execute.return_value = MagicMock(
