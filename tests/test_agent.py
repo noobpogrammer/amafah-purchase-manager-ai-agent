@@ -193,6 +193,41 @@ class TestClarificationRoundsCap:
         count = db.count_clarification_rounds("supp-1", "client-1")
         assert count == 2
 
+    def test_create_pending_clarification_with_extracted_fields(self, mock_supabase):
+        mock_pending_table = MagicMock()
+        mock_pending_table.insert.return_value.execute.return_value = MagicMock(data=[])
+        mock_rfq_supp_table = MagicMock()
+        mock_rfq_supp_table.update.return_value.eq.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+
+        def table_router(t):
+            if t == "pending_clarifications":
+                return mock_pending_table
+            elif t == "rfq_suppliers":
+                return mock_rfq_supp_table
+            return MagicMock()
+
+        mock_supabase.table.side_effect = table_router
+
+        db.create_pending_clarification(
+            client_id="client-1",
+            supplier_id="supp-1",
+            candidate_rfq_ids=["rfq-1"],
+            raw_message="10 aed 5 days",
+            extracted_price=10.0,
+            extracted_delivery="5 days",
+            extracted_notes="warranty included"
+        )
+
+        mock_pending_table.insert.assert_called_once_with({
+            "client_id": "client-1",
+            "supplier_id": "supp-1",
+            "pending_rfq_ids": ["rfq-1"],
+            "raw_message": "10 aed 5 days",
+            "extracted_price": 10.0,
+            "extracted_delivery": "5 days",
+            "extracted_notes": "warranty included",
+        })
+
 
 class TestAntiUUIDClarificationRule:
     """Verifies that clarifying questions never contain internal UUID strings."""

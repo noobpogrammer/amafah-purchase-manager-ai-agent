@@ -340,6 +340,9 @@ async def whatsapp_webhook(request: Request):
                 supplier_id=supplier["id"],
                 candidate_rfq_ids=args["candidate_rfq_ids"],
                 raw_message=message_text,
+                extracted_price=args.get("extracted_price"),
+                extracted_delivery=args.get("extracted_delivery"),
+                extracted_notes=args.get("extracted_notes"),
             )
             db.abandon_pending_clarification(pending["id"])
             question = args["clarifying_question"]
@@ -406,11 +409,15 @@ async def whatsapp_webhook(request: Request):
             supplier_id=supplier["id"],
             candidate_rfq_ids=args["candidate_rfq_ids"],
             raw_message=message_text,
+            extracted_price=args.get("extracted_price"),
+            extracted_delivery=args.get("extracted_delivery"),
+            extracted_notes=args.get("extracted_notes"),
         )
         question = args["clarifying_question"]
         db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", question)
         await enqueue_message(supplier["phone_number"], question)
         return {"status": "clarification_needed", "question": question}
+
 
     elif decision["tool_name"] == "escalate_to_human":
         args = decision["arguments"]

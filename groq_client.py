@@ -66,6 +66,18 @@ TOOLS = [
                             "Refer to candidate products ONLY by product name, specs, or quantity (e.g. 'the 5kg cement order' or 'the 60W LED panel')."
                         ),
                     },
+                    "extracted_price": {
+                        "type": ["number", "null"],
+                        "description": "Any price value stated in the supplier message (if present), or null",
+                    },
+                    "extracted_delivery": {
+                        "type": ["string", "null"],
+                        "description": "Any delivery timeline stated in the supplier message (if present), or null",
+                    },
+                    "extracted_notes": {
+                        "type": ["string", "null"],
+                        "description": "Any spec, quality, or warranty notes stated in the supplier message (if present), or null",
+                    },
                 },
                 "required": ["candidate_rfq_ids", "clarifying_question"],
             },

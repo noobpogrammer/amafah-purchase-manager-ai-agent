@@ -110,12 +110,18 @@ def record_quote(rfq_id: str, supplier_id: str, price: float,
 
 
 def create_pending_clarification(client_id: str, supplier_id: str,
-                                  candidate_rfq_ids: list, raw_message: str):
+                                  candidate_rfq_ids: list, raw_message: str,
+                                  extracted_price: float = None,
+                                  extracted_delivery: str = None,
+                                  extracted_notes: str = None):
     supabase.table("pending_clarifications").insert({
         "client_id": client_id,
         "supplier_id": supplier_id,
         "pending_rfq_ids": candidate_rfq_ids,
         "raw_message": raw_message,
+        "extracted_price": extracted_price,
+        "extracted_delivery": extracted_delivery,
+        "extracted_notes": extracted_notes,
     }).execute()
 
     for rfq_id in candidate_rfq_ids:
