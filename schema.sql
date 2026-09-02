@@ -125,6 +125,7 @@ create table pending_clarifications (
     extracted_price     numeric(12, 2),
     extracted_delivery  text,
     extracted_notes     text,
+    round_number        integer not null default 1,
     status              text not null default 'awaiting_reply'
                             check (status in ('awaiting_reply', 'resolved', 'abandoned')),
     created_at          timestamptz not null default now(),

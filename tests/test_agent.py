@@ -215,7 +215,8 @@ class TestClarificationRoundsCap:
             raw_message="10 aed 5 days",
             extracted_price=10.0,
             extracted_delivery="5 days",
-            extracted_notes="warranty included"
+            extracted_notes="warranty included",
+            round_number=2,
         )
 
         mock_pending_table.insert.assert_called_once_with({
@@ -226,7 +227,9 @@ class TestClarificationRoundsCap:
             "extracted_price": 10.0,
             "extracted_delivery": "5 days",
             "extracted_notes": "warranty included",
+            "round_number": 2,
         })
+
 
 
 class TestAntiUUIDClarificationRule:

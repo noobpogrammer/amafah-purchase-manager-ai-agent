@@ -278,9 +278,9 @@ async def whatsapp_webhook(request: Request):
     # Check for unresolved pending clarification (status = 'awaiting_reply') for this supplier
     pending = db.get_pending_clarification_for_supplier(supplier["id"])
     if pending:
-        # Check clarification rounds cap (max 2 rounds allowed per supplier-pair)
-        rounds_count = db.count_clarification_rounds(supplier["id"], DEMO_CLIENT_ID)
-        if rounds_count >= 2:
+        # Check clarification rounds cap directly on thread's round_number (max 2 rounds allowed)
+        current_round = pending.get("round_number", 1)
+        if current_round >= 2:
             db.abandon_pending_clarification(pending["id"])
             reason = "Maximum clarification rounds (2) exceeded for supplier."
             db.flag_for_human_review(
@@ -335,6 +335,7 @@ async def whatsapp_webhook(request: Request):
             }
         elif decision["tool_name"] == "request_clarification":
             args = decision["arguments"]
+            next_round = current_round + 1
             db.create_pending_clarification(
                 client_id=DEMO_CLIENT_ID,
                 supplier_id=supplier["id"],
@@ -343,6 +344,7 @@ async def whatsapp_webhook(request: Request):
                 extracted_price=args.get("extracted_price"),
                 extracted_delivery=args.get("extracted_delivery"),
                 extracted_notes=args.get("extracted_notes"),
+                round_number=next_round,
             )
             db.abandon_pending_clarification(pending["id"])
             question = args["clarifying_question"]
