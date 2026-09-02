@@ -61,8 +61,22 @@ Start the FastAPI server:
 uvicorn main:app --reload
 ```
 
-The service will run on `http://localhost:8000`. Set your Evolution API webhook URL to point to `http://<your-domain>/webhook`.
+### 4. Database Schema & Migrations
+
+> **CRITICAL RULE:** Never edit `schema.sql` directly as the source of truth. All schema changes MUST go through `supabase migration new <descriptive_name>` + `supabase db push`. After creating a migration, verify it applied successfully by querying the live schema before considering the task done.
+
+To create and apply a schema change:
+1. Create a new migration file:
+   ```bash
+   supabase migration new <descriptive_name>
+   ```
+2. Put the SQL changes in `supabase/migrations/<timestamp>_<descriptive_name>.sql`.
+3. Apply to live database:
+   ```bash
+   supabase db push
+   ```
 
 ## License
 
 MIT
+
