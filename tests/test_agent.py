@@ -421,3 +421,103 @@ class TestReminderSystemAudit:
         items = db.get_active_rfq_suppliers_with_deadlines()
         assert len(items) == 0
         mock_query.eq.assert_called_with("status", "sent")
+
+
+class TestQuotedMessageMatching:
+    def test_update_and_get_rfq_supplier_by_sent_message_id(self, mock_supabase):
+        mock_table = MagicMock()
+        mock_table.update.return_value.eq.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+        mock_supabase.table.return_value = mock_table
+
+        db.update_rfq_supplier_sent_message_id("rfq-1", "supp-1", "3EB012345")
+        mock_supabase.table.assert_called_with("rfq_suppliers")
+
+        mock_query = MagicMock()
+        mock_query.select.return_value = mock_query
+        mock_query.eq.return_value = mock_query
+        mock_query.in_.return_value = mock_query
+        mock_query.execute.return_value = MagicMock(data=[
+            {"id": "rfq-supp-1", "rfq_id": "rfq-1", "supplier_id": "supp-1", "sent_message_id": "3EB012345", "rfqs": {"id": "rfq-1", "status": "active", "product_name": "30W Panel"}}
+        ])
+        mock_supabase.table.return_value = mock_query
+
+        res = db.get_rfq_supplier_by_sent_message_id("supp-1", "3EB012345")
+        assert res is not None
+        assert res["rfq_id"] == "rfq-1"
+        assert res["rfqs"]["product_name"] == "30W Panel"
+
+    def test_get_rfq_supplier_by_quoted_text(self, mock_supabase):
+        open_rfqs = [
+            {"id": "rs-1", "rfqs": {"id": "rfq-30w", "product_name": "led panel", "specs": "30 w", "status": "active"}},
+            {"id": "rs-2", "rfqs": {"id": "rfq-60w", "product_name": "led panel", "specs": "60 w", "status": "active"}},
+        ]
+        with patch.object(db, "get_open_rfqs_for_supplier", return_value=open_rfqs):
+            quoted_text = "Hi! Requesting quote for Product: led panel, Specs: 60 w"
+            matched = db.get_rfq_supplier_by_quoted_text("supp-1", quoted_text)
+            assert matched is not None
+            assert matched["rfqs"]["id"] == "rfq-60w"
+
+    def test_revert_unresolved_candidates(self, mock_supabase):
+        mock_query = MagicMock()
+        mock_query.update.return_value.eq.return_value.in_.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+        mock_supabase.table.return_value = mock_query
+
+        db.revert_unresolved_candidates(supplier_id="supp-1", resolved_rfq_id="rfq-1", candidate_rfq_ids=["rfq-1", "rfq-2", "rfq-3"])
+        mock_supabase.table.assert_called_with("rfq_suppliers")
+        mock_query.update.assert_called_with({"status": "sent"})
+
+    @pytest.mark.asyncio
+    async def test_webhook_quoted_message_direct_match(self, mock_supabase):
+        payload = {
+            "data": {
+                "key": {"remoteJid": "923362853198@s.whatsapp.net", "fromMe": False, "id": "msg-incoming"},
+                "message": {
+                    "extendedTextMessage": {
+                        "text": "100 aed for 30w",
+                        "contextInfo": {
+                            "stanzaId": "3EB0123456"
+                        }
+                    }
+                }
+            }
+        }
+
+        mock_supplier = {"id": "supp-1", "name": "Test Supplier", "phone_number": "923362853198"}
+        mock_rfq_supp = {
+            "id": "rfq-supp-1",
+            "rfq_id": "rfq-30w",
+            "supplier_id": "supp-1",
+            "sent_message_id": "3EB0123456",
+            "rfqs": {"id": "rfq-30w", "product_name": "30W LED Panel", "status": "active"}
+        }
+
+        request = MagicMock()
+        request.json = AsyncMock(return_value=payload)
+
+        with patch.object(db, "get_supplier_by_phone", return_value=mock_supplier), \
+             patch.object(db, "get_rfq_supplier_by_sent_message_id", return_value=mock_rfq_supp) as mock_get_by_stanza, \
+             patch.object(db, "log_message"), \
+             patch.object(db, "get_supplier_prior_quotes", return_value=[]), \
+             patch.object(groq_client, "route_supplier_message", return_value={
+                 "tool_name": "record_quote",
+                 "arguments": {"rfq_id": "rfq-30w", "price": 100}
+             }), \
+             patch.object(db, "record_quote") as mock_record_quote, \
+             patch.object(db, "get_pending_clarification_for_supplier", return_value=None), \
+             patch.object(main, "check_and_auto_rank"), \
+             patch.object(main, "enqueue_message", new_callable=AsyncMock):
+
+            response = await main.whatsapp_webhook(request)
+
+            mock_get_by_stanza.assert_called_once_with("supp-1", "3EB0123456")
+            mock_record_quote.assert_called_once_with(
+                rfq_id="rfq-30w",
+                supplier_id="supp-1",
+                price=100,
+                delivery_time=None,
+                quality_notes=None,
+                raw_message="100 aed for 30w"
+            )
+            assert response["status"] == "recorded_via_quoted_message"
+            assert response["rfq_id"] == "rfq-30w"
+

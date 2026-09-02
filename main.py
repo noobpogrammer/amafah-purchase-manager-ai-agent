@@ -45,18 +45,28 @@ class RFQCreateRequest(BaseModel):
     deadline_hours: int = 24
 
 
-async def enqueue_message(phone_number: str, message: str):
+async def enqueue_message(phone_number: str, message: str, rfq_id: str = None, supplier_id: str = None):
     """Pushes an outbound message onto the asyncio queue for paced sending."""
-    await outbound_queue.put((phone_number, message))
+    await outbound_queue.put((phone_number, message, rfq_id, supplier_id))
 
 
 async def outbound_worker():
     """Background worker that processes outbound WhatsApp messages one by one with randomized delay."""
     while True:
         try:
-            phone_number, message = await outbound_queue.get()
+            item = await outbound_queue.get()
+            if len(item) == 4:
+                phone_number, message, rfq_id, supplier_id = item
+            else:
+                phone_number, message = item
+                rfq_id, supplier_id = None, None
+
             try:
-                await run_in_threadpool(send_whatsapp_message, phone_number, message)
+                resp = await run_in_threadpool(send_whatsapp_message, phone_number, message)
+                if resp and isinstance(resp, dict) and rfq_id and supplier_id:
+                    msg_id = resp.get("key", {}).get("id") or resp.get("id")
+                    if msg_id:
+                        db.update_rfq_supplier_sent_message_id(rfq_id, supplier_id, msg_id)
             except Exception as e:
                 print(f"[Outbound Worker] Error sending WhatsApp message to {phone_number}: {e}")
             finally:
@@ -177,17 +187,17 @@ async def check_deadlines_and_reminders():
         elif percentage >= 90 and reminder_count == 2:
             msg = f"Final reminder — closing the RFQ for '{prod}' soon! Please reply with your quote if available."
             db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", msg)
-            await enqueue_message(phone, msg)
+            await enqueue_message(phone, msg, rfq_id=rfq["id"], supplier_id=supplier["id"])
             db.update_rfq_supplier_reminder(item["id"], 3)
         elif percentage >= 70 and reminder_count == 1:
             msg = f"Reminder regarding RFQ for '{prod}'. Please send your quote when ready."
             db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", msg)
-            await enqueue_message(phone, msg)
+            await enqueue_message(phone, msg, rfq_id=rfq["id"], supplier_id=supplier["id"])
             db.update_rfq_supplier_reminder(item["id"], 2)
         elif percentage >= 50 and reminder_count == 0:
             msg = f"Hi! Just checking in on the RFQ for '{prod}'."
             db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", msg)
-            await enqueue_message(phone, msg)
+            await enqueue_message(phone, msg, rfq_id=rfq["id"], supplier_id=supplier["id"])
             db.update_rfq_supplier_reminder(item["id"], 1)
 
 
@@ -267,10 +277,21 @@ async def whatsapp_webhook(request: Request):
 
         raw_remote_jid = key_data.get("remoteJid", "")
         sender_phone = normalize_phone(raw_remote_jid)
-        message_text = data.get("message", {}).get("conversation", "")
+        message_text = (
+            data.get("message", {}).get("conversation", "")
+            or data.get("message", {}).get("extendedTextMessage", {}).get("text", "")
+        )
+        quoted_stanza_id = (
+            data.get("contextInfo", {}).get("stanzaId")
+            or data.get("message", {}).get("extendedTextMessage", {}).get("contextInfo", {}).get("stanzaId")
+            or data.get("message", {}).get("contextInfo", {}).get("stanzaId")
+        )
+        quoted_text = (
+            data.get("contextInfo", {}).get("quotedMessage", {}).get("conversation", "")
+            or data.get("message", {}).get("extendedTextMessage", {}).get("contextInfo", {}).get("quotedMessage", {}).get("conversation", "")
+            or data.get("message", {}).get("contextInfo", {}).get("quotedMessage", {}).get("conversation", "")
+        )
 
-        # Non-text message types (like audioMessage, imageMessage, etc.) have an empty conversation field
-        # and are intentionally skipped since the agent doesn't process media/audio content yet.
         if not sender_phone or not message_text:
             return {"status": "ignored", "reason": "no message content"}
 
@@ -279,6 +300,103 @@ async def whatsapp_webhook(request: Request):
             return {"status": "ignored", "reason": "unknown supplier"}
 
         db.log_message(DEMO_CLIENT_ID, supplier["id"], "inbound", message_text)
+
+        # Fix 1: Check if the message is a quoted reply (reply-to) matching a sent RFQ message
+        matched_rfq_supplier = None
+        if quoted_stanza_id:
+            matched_rfq_supplier = db.get_rfq_supplier_by_sent_message_id(supplier["id"], quoted_stanza_id)
+        if not matched_rfq_supplier and quoted_text:
+            matched_rfq_supplier = db.get_rfq_supplier_by_quoted_text(supplier["id"], quoted_text)
+
+        if matched_rfq_supplier and matched_rfq_supplier.get("rfqs"):
+                matched_rfq = matched_rfq_supplier["rfqs"]
+                print(f"[Webhook] Direct match via quoted message (stanzaId: {quoted_stanza_id}) -> RFQ ID: {matched_rfq['id']} ({matched_rfq['product_name']})")
+
+                # Single RFQ context — bypasses multi-RFQ ambiguity resolution entirely!
+                rfq_context = format_rfq_context([matched_rfq_supplier])
+                prior_quotes = db.get_supplier_prior_quotes(supplier["id"], [matched_rfq["id"]])
+                prior_quotes_context = format_prior_quotes_context(prior_quotes)
+
+                try:
+                    decision = groq_client.route_supplier_message(message_text, rfq_context, prior_quotes_context)
+                except Exception as groq_err:
+                    import traceback
+                    tb_str = traceback.format_exc()
+                    print(f"\n=== GROQ ERROR (quoted message route) ===\n{tb_str}\n===========================================\n")
+                    db.log_webhook_error(f"Groq quoted route error: {groq_err}", tb_str, payload)
+                    reason = f"Groq AI service error during message routing: {str(groq_err)}"
+                    db.flag_for_human_review(
+                        client_id=DEMO_CLIENT_ID,
+                        supplier_id=supplier["id"],
+                        rfq_id=matched_rfq["id"],
+                        reason=reason,
+                        category="other",
+                        raw_message=message_text,
+                    )
+                    db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", HUMAN_ACK_MSG)
+                    await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG)
+                    return {"status": "escalated_due_to_groq_error", "reason": reason}
+
+                if decision["tool_name"] == "record_quote":
+                    args = decision["arguments"]
+                    target_rfq_id = args.get("rfq_id") or matched_rfq["id"]
+                    db.record_quote(
+                        rfq_id=target_rfq_id,
+                        supplier_id=supplier["id"],
+                        price=args["price"],
+                        delivery_time=args.get("delivery_time"),
+                        quality_notes=args.get("quality_notes"),
+                        raw_message=message_text,
+                    )
+
+                    # Check for pending clarification for supplier and revert unresolved candidates
+                    pending_clarif = db.get_pending_clarification_for_supplier(supplier["id"])
+                    if pending_clarif:
+                        db.resolve_pending_clarification(pending_clarif["id"])
+                        db.revert_unresolved_candidates(
+                            supplier_id=supplier["id"],
+                            resolved_rfq_id=target_rfq_id,
+                            candidate_rfq_ids=pending_clarif.get("pending_rfq_ids", []),
+                        )
+
+                    db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", THANK_YOU_MSG)
+                    await enqueue_message(supplier["phone_number"], THANK_YOU_MSG)
+                    check_and_auto_rank(target_rfq_id)
+                    return {"status": "recorded_via_quoted_message", "rfq_id": target_rfq_id}
+
+                elif decision["tool_name"] == "request_clarification":
+                    args = decision["arguments"]
+                    db.create_pending_clarification(
+                        client_id=DEMO_CLIENT_ID,
+                        supplier_id=supplier["id"],
+                        candidate_rfq_ids=args.get("candidate_rfq_ids", [matched_rfq["id"]]),
+                        raw_message=message_text,
+                        extracted_price=args.get("extracted_price"),
+                        extracted_delivery=args.get("extracted_delivery"),
+                        extracted_notes=args.get("extracted_notes"),
+                    )
+                    question = args["clarifying_question"]
+                    db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", question)
+                    await enqueue_message(supplier["phone_number"], question)
+                    return {"status": "clarification_needed", "question": question}
+
+                elif decision["tool_name"] == "escalate_to_human":
+                    args = decision["arguments"]
+                    db.flag_for_human_review(
+                        client_id=DEMO_CLIENT_ID,
+                        supplier_id=supplier["id"],
+                        rfq_id=args.get("rfq_id") or matched_rfq["id"],
+                        reason=args.get("reason", "Human review requested by agent"),
+                        category=args.get("category", "other"),
+                        raw_message=message_text,
+                    )
+                    db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", HUMAN_ACK_MSG)
+                    await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG)
+                    return {
+                        "status": "escalated",
+                        "reason": args.get("reason"),
+                        "category": args.get("category"),
+                    }
 
         # Check for unresolved pending clarification (status = 'awaiting_reply') for this supplier
         pending = db.get_pending_clarification_for_supplier(supplier["id"])
@@ -345,6 +463,11 @@ async def whatsapp_webhook(request: Request):
                     raw_message=message_text,
                 )
                 db.resolve_pending_clarification(pending["id"])
+                db.revert_unresolved_candidates(
+                    supplier_id=supplier["id"],
+                    resolved_rfq_id=args["rfq_id"],
+                    candidate_rfq_ids=candidate_rfq_ids,
+                )
 
                 db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", THANK_YOU_MSG)
                 await enqueue_message(supplier["phone_number"], THANK_YOU_MSG)
@@ -520,7 +643,7 @@ async def create_rfq_endpoint(req: RFQCreateRequest):
 
     for supplier in matched_suppliers:
         db.log_message(req.client_id, supplier["id"], "outbound", rfq_msg, related_rfq_id=rfq["id"])
-        await enqueue_message(supplier["phone_number"], rfq_msg)
+        await enqueue_message(supplier["phone_number"], rfq_msg, rfq_id=rfq["id"], supplier_id=supplier["id"])
 
     return {
         "status": "success",

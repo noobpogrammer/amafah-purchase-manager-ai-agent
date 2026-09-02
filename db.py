@@ -210,6 +210,81 @@ def mark_rfq_supplier_no_response(rfq_supplier_id: str):
     }).eq("id", rfq_supplier_id).execute()
 
 
+def update_rfq_supplier_sent_message_id(rfq_id: str, supplier_id: str, sent_message_id: str):
+    """Saves the Evolution API outgoing message ID to rfq_suppliers.sent_message_id."""
+    return supabase.table("rfq_suppliers").update({
+        "sent_message_id": sent_message_id
+    }).eq("rfq_id", rfq_id).eq("supplier_id", supplier_id).execute()
+
+
+def get_rfq_supplier_by_sent_message_id(supplier_id: str, sent_message_id: str):
+    """
+    Looks up an active rfq_suppliers record for a supplier that matches sent_message_id.
+    Returns the entry joined with rfqs(*) if the underlying RFQ is active and supplier status in ('sent', 'clarifying').
+    """
+    if not supplier_id or not sent_message_id:
+        return None
+    res = (
+        supabase.table("rfq_suppliers")
+        .select("*, rfqs(*)")
+        .eq("supplier_id", supplier_id)
+        .eq("sent_message_id", sent_message_id)
+        .in_("status", ["sent", "clarifying"])
+        .execute()
+    )
+    active_entries = [entry for entry in res.data if entry.get("rfqs", {}).get("status") == "active"]
+    return active_entries[0] if active_entries else None
+
+
+def get_rfq_supplier_by_quoted_text(supplier_id: str, quoted_text: str):
+    """
+    Fallback for legacy RFQs: matches quoted message text against active open RFQs for a supplier
+    by checking product name and specs match inside the quoted text body.
+    """
+    if not supplier_id or not quoted_text:
+        return None
+    open_rfqs = get_open_rfqs_for_supplier(supplier_id)
+    if not open_rfqs:
+        return None
+
+    q_lower = quoted_text.lower()
+    best_match = None
+    best_score = 0
+
+    for entry in open_rfqs:
+        rfq = entry.get("rfqs", {})
+        product_name = (rfq.get("product_name") or "").strip().lower()
+        specs = (rfq.get("specs") or "").strip().lower()
+        score = 0
+        if product_name and product_name in q_lower:
+            score += 2
+        if specs and specs in q_lower:
+            score += 1
+        if score > best_score:
+            best_score = score
+            best_match = entry
+
+    return best_match if best_score > 0 else None
+
+
+
+def revert_unresolved_candidates(supplier_id: str, resolved_rfq_id: str, candidate_rfq_ids: list):
+    """
+    When one candidate RFQ is resolved, resets any remaining candidate RFQs for this supplier
+    that are currently in 'clarifying' status back to 'sent'.
+    """
+    if not candidate_rfq_ids:
+        return
+    remaining_rfq_ids = [rfq_id for rfq_id in candidate_rfq_ids if rfq_id != resolved_rfq_id]
+    if not remaining_rfq_ids:
+        return
+
+    supabase.table("rfq_suppliers").update({"status": "sent"}).eq(
+        "supplier_id", supplier_id
+    ).in_("rfq_id", remaining_rfq_ids).eq("status", "clarifying").execute()
+
+
+
 def is_rfq_fully_processed(rfq_id: str) -> bool:
     """Returns True if no suppliers for this RFQ remain in 'sent' or 'clarifying' status."""
     res = (
