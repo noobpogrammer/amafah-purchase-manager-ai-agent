@@ -5,25 +5,35 @@ old n8n branching logic with a single agent decision + tool execution.
 """
 
 import asyncio
+import csv
+import io
+import json
 import os
 import random
+import re
+import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 import requests
 from starlette.concurrency import run_in_threadpool
 
 import db
 import groq_client
+import guardrails
+
+
 
 scheduler = AsyncIOScheduler()
 
 DEMO_CLIENT_ID = "d88c52ad-3d0b-42e9-86f1-b9f70018856b"
 THANK_YOU_MSG = "Thanks for the quote! We'll be in touch if we move forward."
 HUMAN_ACK_MSG = "Thanks! We'll review your response and get back to you shortly."
+PROCESSED_MESSAGE_IDS: set = set()
 
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
@@ -39,10 +49,130 @@ outbound_queue: asyncio.Queue = asyncio.Queue()
 class RFQCreateRequest(BaseModel):
     client_id: str = DEMO_CLIENT_ID
     product_name: str
-    category: str
-    specs: str | None = None
-    quantity: int | None = None
-    deadline_hours: int = 24
+    category: str = Field(..., min_length=1)
+    specs: str
+    quantity: Optional[int] = None
+    last_quote: Optional[float] = None
+    deadline_hours: int = Field(..., gt=0)
+
+    @field_validator("product_name", "category", "specs")
+    @classmethod
+    def validate_non_empty(cls, v: str, info: ValidationInfo) -> str:
+        if v is None or not str(v).strip():
+            raise ValueError(f"'{info.field_name}' cannot be empty or blank")
+        return str(v).strip()
+
+    @field_validator("deadline_hours")
+    @classmethod
+    def validate_deadline_hours(cls, v: int) -> int:
+        if v is None or v <= 0:
+            raise ValueError("'deadline_hours' must be a positive integer")
+        return int(v)
+
+
+def normalize_bulk_description(value: str) -> str:
+    text = (value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+\d+\s*(pcs|pc|nos|bag|pkt)\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*[,;]\s*$", "", text)
+    return text.strip()
+
+
+def extract_bulk_specs(description: str) -> Optional[str]:
+    text = (description or "").strip()
+    if not text:
+        return None
+
+    patterns = [
+        r"\d+\s*X\s*\d+",
+        r"\d+(?:\.\d+)?\s*(?:MM|CM|M|W|KW|V|A)",
+        r"\d+(?:\.\d+)?\s*(?:x|X)\s*\d+(?:\.\d+)?",
+    ]
+    matches = []
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            matches.append(match.group(0).strip())
+
+    if not matches:
+        return None
+
+    cleaned = []
+    for item in matches:
+        normalized = re.sub(r"\s+", "", item)
+        if normalized not in cleaned:
+            cleaned.append(normalized)
+    return "/".join(cleaned)
+
+
+def normalize_csv_key(value: Optional[str]) -> str:
+    text = (value or "").lower().strip()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def extract_row_value(row: dict, aliases: list[str]):
+    for raw_key, raw_value in row.items():
+        normalized = normalize_csv_key(raw_key)
+        if normalized in aliases:
+            return raw_value
+    return None
+
+
+def normalize_requisition_row(row: dict, row_index: int) -> Optional[dict]:
+    if not row:
+        return None
+
+    description = extract_row_value(row, ["description", "item description"])
+    if description is None or not str(description).strip():
+        return None
+
+    description = str(description).strip()
+    clean_description = normalize_bulk_description(description)
+    qty_raw = extract_row_value(row, ["qty", "quantity"])
+    last_quote_raw = extract_row_value(row, ["last cost", "last quote", "last qoute", "last quotation"])
+
+    try:
+        quantity = int(float(str(qty_raw).replace(",", "")))
+    except (TypeError, ValueError):
+        quantity = None
+
+    try:
+        last_quote = float(str(last_quote_raw).replace(",", "")) if last_quote_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        last_quote = None
+
+    product_name = clean_description if clean_description else description
+    row_number_value = extract_row_value(row, ["sl", "sl #", "sl no", "sl no.", "sl no "])
+    row_number = row_number_value if row_number_value not in (None, "") else row_index
+
+    return {
+        "row_number": row_number,
+        "product_name": product_name,
+        "specs": extract_bulk_specs(clean_description or description),
+        "quantity": quantity,
+        "last_quote": last_quote,
+        "raw_description": description,
+    }
+
+
+def parse_material_requisition_csv(csv_text: str) -> list[dict]:
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows = []
+    for row_index, row in enumerate(reader, start=2):
+        normalized = normalize_requisition_row(row, row_index)
+        if normalized is not None:
+            rows.append(normalized)
+    return rows
+
+
+def require_admin_access(request: Request):
+    admin_key = os.getenv("ADMIN_API_KEY", "").strip()
+    if not admin_key:
+        return
+
+    supplied = request.headers.get("x-admin-key") or request.headers.get("authorization", "").replace("Bearer ", "").strip()
+    if not supplied or supplied != admin_key:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
 
 
 async def enqueue_message(phone_number: str, message: str, rfq_id: str = None, supplier_id: str = None):
@@ -141,12 +271,20 @@ def generate_ranking(rfq_id: str) -> dict:
     if not quotes:
         return {"error": "No quotes found for this RFQ"}
     quotes_summary = "\n".join(
-        f"- {q['suppliers']['name']}: ${q['price']}, delivery: {q.get('delivery_time', '-')}, "
+        f"- Supplier ID: {q['supplier_id']} (Name: {q['suppliers']['name']}): ${q['price']}, delivery: {q.get('delivery_time', '-')}, "
         f"notes: {q.get('quality_notes', '-')}"
         for q in quotes
     )
     result = groq_client.rank_quotes(rfq_details=f"RFQ ID: {rfq_id}", quotes_summary=quotes_summary)
-    db.save_ranking(rfq_id, result["best_supplier_id"], result["reasoning"], result)
+    
+    # Ensure best_supplier_id is a valid supplier UUID from quotes
+    best_supplier_id = result.get("best_supplier_id")
+    quote_supplier_ids = [q["supplier_id"] for q in quotes]
+    if best_supplier_id not in quote_supplier_ids:
+        # Fallback to first quote's supplier_id if LLM returned supplier name instead of ID
+        best_supplier_id = quote_supplier_ids[0]
+
+    db.save_ranking(rfq_id, best_supplier_id, result.get("reasoning", ""), result)
     return result
 
 
@@ -158,15 +296,15 @@ def check_and_auto_rank(rfq_id: str):
 
 
 async def check_deadlines_and_reminders():
-    """Background scheduled job for 50%, 70%, 90% reminders & deadline expiration."""
-    items = db.get_active_rfq_suppliers_with_deadlines()
+    """Background cron job that checks active RFQs and handles deadline expiry & reminders."""
     now = datetime.now(timezone.utc)
-    for item in items:
+    active_items = db.get_active_rfq_suppliers_with_deadlines()
+
+    for item in active_items:
         rfq = item["rfqs"]
         supplier = item["suppliers"]
-        sent_at_str = item.get("sent_at") or rfq.get("created_at")
-        if not sent_at_str:
-            continue
+        sent_at_str = item["sent_at"]
+
         sent_at = datetime.fromisoformat(sent_at_str.replace("Z", "+00:00"))
         deadline_hours = rfq.get("deadline_hours") or 24
         total_seconds = deadline_hours * 3600
@@ -255,8 +393,12 @@ async def whatsapp_webhook(request: Request):
     payload = {}
     try:
         payload = await request.json()
-    except Exception:
-        pass
+        # Change 1 — Webhook event filtering: ignore non-upsert events
+        event_type = payload.get("event")
+        if event_type and event_type != "messages.upsert":
+            return {"status": "ignored", "reason": f"non-upsert event: {event_type}"}
+    except Exception as parse_err:
+        print(f"[Webhook Debug Error] Could not parse request body as JSON: {parse_err}")
 
     try:
         # Evolution API payload shape — adjust field paths to match your actual webhook format
@@ -274,6 +416,15 @@ async def whatsapp_webhook(request: Request):
         # Ignore outgoing messages sent by ourselves (e.g., our own outgoing RFQs)
         if key_data.get("fromMe", False):
             return {"status": "ignored", "reason": "outgoing message (fromMe)"}
+
+        # Change 2 — Message ID deduplication
+        msg_key_id = key_data.get("id")
+        if msg_key_id:
+            if msg_key_id in PROCESSED_MESSAGE_IDS:
+                return {"status": "ignored", "reason": f"already processed message id: {msg_key_id}"}
+            PROCESSED_MESSAGE_IDS.add(msg_key_id)
+            if len(PROCESSED_MESSAGE_IDS) > 2000:
+                PROCESSED_MESSAGE_IDS.clear()
 
         raw_remote_jid = key_data.get("remoteJid", "")
         sender_phone = normalize_phone(raw_remote_jid)
@@ -301,11 +452,14 @@ async def whatsapp_webhook(request: Request):
 
         db.log_message(DEMO_CLIENT_ID, supplier["id"], "inbound", message_text)
 
-        # Fix 1: Check if the message is a quoted reply (reply-to) matching a sent RFQ message
+        # Fix 1 & Change 3: Check if message is a quoted reply (reply-to) matching a sent RFQ message
         matched_rfq_supplier = None
         if quoted_stanza_id:
             matched_rfq_supplier = db.get_rfq_supplier_by_sent_message_id(supplier["id"], quoted_stanza_id)
-        if not matched_rfq_supplier and quoted_text:
+            if not matched_rfq_supplier:
+                print(f"[Webhook] Quoted stanzaId '{quoted_stanza_id}' present but does not match any open RFQ for supplier {supplier['id']}. Ignoring cross-RFQ fallback.")
+                return {"status": "ignored", "reason": "quoted_stanza_id already responded or closed"}
+        elif quoted_text:
             matched_rfq_supplier = db.get_rfq_supplier_by_quoted_text(supplier["id"], quoted_text)
 
         if matched_rfq_supplier and matched_rfq_supplier.get("rfqs"):
@@ -320,8 +474,8 @@ async def whatsapp_webhook(request: Request):
                 try:
                     decision = groq_client.route_supplier_message(message_text, rfq_context, prior_quotes_context)
                 except Exception as groq_err:
-                    import traceback
                     tb_str = traceback.format_exc()
+
                     print(f"\n=== GROQ ERROR (quoted message route) ===\n{tb_str}\n===========================================\n")
                     db.log_webhook_error(f"Groq quoted route error: {groq_err}", tb_str, payload)
                     reason = f"Groq AI service error during message routing: {str(groq_err)}"
@@ -376,6 +530,17 @@ async def whatsapp_webhook(request: Request):
                         extracted_notes=args.get("extracted_notes"),
                     )
                     question = args["clarifying_question"]
+                    if not guardrails.is_safe_to_send(question):
+                        print(f"[Guardrail Triggered] Unsafe output in clarifying question: {question}")
+                        db.flag_for_human_review(
+                            client_id=DEMO_CLIENT_ID,
+                            supplier_id=supplier["id"],
+                            rfq_id=None,
+                            reason="AI generated non-compliant or code response caught by code-level safety guardrail",
+                            category="other",
+                            raw_message=message_text,
+                        )
+                        question = HUMAN_ACK_MSG
                     db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", question)
                     await enqueue_message(supplier["phone_number"], question)
                     return {"status": "clarification_needed", "question": question}
@@ -494,6 +659,17 @@ async def whatsapp_webhook(request: Request):
                 )
                 db.abandon_pending_clarification(pending["id"])
                 question = args["clarifying_question"]
+                if not guardrails.is_safe_to_send(question):
+                    print(f"[Guardrail Triggered] Unsafe output in clarifying question: {question}")
+                    db.flag_for_human_review(
+                        client_id=DEMO_CLIENT_ID,
+                        supplier_id=supplier["id"],
+                        rfq_id=None,
+                        reason="AI generated non-compliant or code response caught by code-level safety guardrail",
+                        category="other",
+                        raw_message=message_text,
+                    )
+                    question = HUMAN_ACK_MSG
                 db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", question)
                 await enqueue_message(supplier["phone_number"], question)
                 return {"status": "clarification_needed", "question": question}
@@ -579,6 +755,17 @@ async def whatsapp_webhook(request: Request):
                 extracted_notes=args.get("extracted_notes"),
             )
             question = args["clarifying_question"]
+            if not guardrails.is_safe_to_send(question):
+                print(f"[Guardrail Triggered] Unsafe output in clarifying question: {question}")
+                db.flag_for_human_review(
+                    client_id=DEMO_CLIENT_ID,
+                    supplier_id=supplier["id"],
+                    rfq_id=None,
+                    reason="AI generated non-compliant or code response caught by code-level safety guardrail",
+                    category="other",
+                    raw_message=message_text,
+                )
+                question = HUMAN_ACK_MSG
             db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", question)
             await enqueue_message(supplier["phone_number"], question)
             return {"status": "clarification_needed", "question": question}
@@ -653,6 +840,95 @@ async def create_rfq_endpoint(req: RFQCreateRequest):
     }
 
 
+@app.post("/rfq/bulk-create")
+async def bulk_create_rfq_endpoint(
+    file: UploadFile = File(...),
+    client_id: str = Form(DEMO_CLIENT_ID),
+    category: Optional[str] = Form(default=None),
+    deadline_hours: Optional[int] = Form(default=None),
+    row_categories: Optional[str] = Form(default=None),
+):
+    """Uploads a CSV material requisition sheet and creates one RFQ per row."""
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported for bulk RFQ import. Please export to .csv first.")
+
+    raw_bytes = await file.read()
+    try:
+        csv_text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        csv_text = raw_bytes.decode("latin-1")
+
+    rows = parse_material_requisition_csv(csv_text)
+    if not rows:
+        raise HTTPException(status_code=400, detail="No valid RFQ rows were found in the uploaded CSV.")
+
+    try:
+        overrides = json.loads(row_categories) if row_categories else []
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="row_categories must be valid JSON when provided")
+
+    if isinstance(overrides, dict):
+        overrides = [overrides.get(str(i)) for i in range(len(rows))]
+
+    if not isinstance(overrides, list):
+        overrides = []
+
+    created_rfqs = []
+    failed_rows = []
+    matched_summary = []
+    default_deadline = deadline_hours if deadline_hours and deadline_hours > 0 else 24
+
+    for idx, row in enumerate(rows):
+        row_category = (overrides[idx] if idx < len(overrides) and overrides[idx] not in (None, "") else category or "").strip()
+        if not row_category:
+            failed_rows.append({"row_number": row["row_number"], "reason": "Missing category. Assign a default category or select one in the preview step."})
+            continue
+
+        product_name = normalize_bulk_description(row["product_name"])
+        if not product_name:
+            failed_rows.append({"row_number": row["row_number"], "reason": "Missing Description column"})
+            continue
+
+        rfq, matched_suppliers = db.create_rfq_and_match_suppliers(
+            client_id=client_id,
+            product_name=product_name,
+            category=row_category,
+            deadline_hours=default_deadline,
+            specs=row["specs"],
+            quantity=row["quantity"],
+        )
+
+        created_rfqs.append({
+            "rfq_id": rfq["id"],
+            "product_name": product_name,
+            "category": row_category,
+            "matched_suppliers_count": len(matched_suppliers),
+            "matched_suppliers": [{"id": s["id"], "name": s["name"], "phone_number": s.get("phone_number")} for s in matched_suppliers],
+        })
+        matched_summary.append({"rfq_id": rfq["id"], "matched_suppliers_count": len(matched_suppliers)})
+
+    return {
+        "status": "success",
+        "created_count": len(created_rfqs),
+        "rows_processed": len(rows),
+        "rfqs": created_rfqs,
+        "matched_suppliers_summary": matched_summary,
+        "failed_rows": failed_rows,
+    }
+
+
+class FlagRespondRequest(BaseModel):
+    response: str
+    send_to_supplier: bool = True
+
+
+@app.get("/rfqs/audit")
+async def get_rfq_audit_endpoint(request: Request, client_id: str = DEMO_CLIENT_ID):
+    """Returns RFQs with null category/deadline values or zero matched suppliers; admin-only."""
+    require_admin_access(request)
+    return db.get_incomplete_rfqs_audit(client_id)
+
+
 @app.get("/flags")
 async def get_flags_endpoint(client_id: str = DEMO_CLIENT_ID):
     """Lists human review escalations for a client."""
@@ -664,6 +940,25 @@ async def resolve_flag_endpoint(flag_id: str):
     """Marks a human escalation flag as resolved."""
     result = db.resolve_flag(flag_id)
     return {"status": "resolved", "flag": result}
+
+
+@app.post("/flags/{flag_id}/respond")
+async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest):
+    """Stores human response on a flag, marks it resolved, and optionally sends message to supplier via WhatsApp."""
+    updated_flags = db.resolve_flag_with_response(flag_id, payload.response)
+    if not updated_flags:
+        raise HTTPException(status_code=404, detail="Flagged item not found")
+
+    flag = updated_flags[0]
+    if payload.send_to_supplier and flag.get("suppliers"):
+        supplier = flag["suppliers"]
+        phone = supplier["phone_number"]
+        rfq_id = flag.get("rfq_id")
+        db.log_message(DEMO_CLIENT_ID, supplier["id"], "outbound", payload.response)
+        await enqueue_message(phone, payload.response, rfq_id=rfq_id, supplier_id=supplier["id"])
+
+    return {"status": "resolved", "flag_id": flag_id, "sent_to_supplier": payload.send_to_supplier}
+
 
 
 @app.post("/rfq/{rfq_id}/rank")

@@ -1,5 +1,49 @@
 import { supabase, DEMO_CLIENT_ID, API_URL } from './supabaseClient';
 
+export function formatRfqDropdownLabel(rfq) {
+  if (!rfq) return '';
+  const parts = [];
+
+  // Product Name
+  const productName = (rfq.product_name || 'Untitled RFQ').trim();
+  parts.push(productName);
+
+  // Specs & Quantity segment: e.g. "60W, qty 30" or "60W" or "qty 30"
+  const specDetails = [];
+  if (rfq.specs && rfq.specs.trim()) {
+    specDetails.push(rfq.specs.trim());
+  }
+  if (rfq.quantity !== null && rfq.quantity !== undefined && rfq.quantity !== '') {
+    specDetails.push(`qty ${rfq.quantity}`);
+  }
+  if (specDetails.length > 0) {
+    parts.push(specDetails.join(', '));
+  }
+
+  // Date/Time segment: formatted as short date+time (e.g. Sep 2, 5:34 AM)
+  if (rfq.created_at) {
+    try {
+      const d = new Date(rfq.created_at);
+      if (!isNaN(d.getTime())) {
+        const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+        parts.push(`${dateStr}, ${timeStr}`);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  let label = parts.join(' — ');
+
+  // Category segment: e.g. " (Building Materials)"
+  if (rfq.category && rfq.category.trim()) {
+    label += ` (${rfq.category.trim()})`;
+  }
+
+  return label;
+}
+
 export async function fetchDashboardMetrics() {
   const [rfqsRes, suppliersRes, quotesRes, flagsRes, recentMessagesRes] = await Promise.all([
     supabase.from('rfqs').select('id, status, created_at', { count: 'exact' }).eq('client_id', DEMO_CLIENT_ID),
@@ -73,6 +117,7 @@ export async function createRFQ(payload) {
       category: payload.category,
       specs: payload.specs,
       quantity: payload.quantity ? parseInt(payload.quantity) : null,
+      last_quote: payload.last_quote !== undefined && payload.last_quote !== null && payload.last_quote !== '' ? Number(payload.last_quote) : null,
       deadline_hours: payload.deadline_hours ? parseInt(payload.deadline_hours) : 24,
     }),
   });
@@ -80,6 +125,20 @@ export async function createRFQ(payload) {
     const errData = await response.json().catch(() => ({}));
     throw new Error(errData.detail || 'Failed to create RFQ');
   }
+  return await response.json();
+}
+
+export async function bulkCreateRFQs(formData) {
+  const response = await fetch(`${API_URL}/rfq/bulk-create`, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Failed to upload RFQs');
+  }
+
   return await response.json();
 }
 
@@ -158,6 +217,20 @@ export async function resolveFlag(flagId) {
   return await response.json();
 }
 
+export async function respondToFlag(flagId, responseText, sendToSupplier = true) {
+  const response = await fetch(`${API_URL}/flags/${flagId}/respond`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ response: responseText, send_to_supplier: sendToSupplier }),
+  });
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Failed to respond to flag');
+  }
+  return await response.json();
+}
+
+
 export async function closeRFQ(rfqId, status = 'closed') {
   const response = await fetch(`${API_URL}/rfq/${rfqId}/close?status=${status}`, {
     method: 'POST',
@@ -168,3 +241,63 @@ export async function closeRFQ(rfqId, status = 'closed') {
   }
   return await response.json();
 }
+
+export async function fetchCategories() {
+  const { data, error } = await supabase
+    .from('categories')
+    .select('name')
+    .eq('client_id', DEMO_CLIENT_ID)
+    .order('created_at', { ascending: true });
+
+  const defaultList = ['Electronics', 'Hardware', 'Plumbing', 'Electrical', 'Tools', 'Building Materials', 'General'];
+  let categoryNames = (data || []).map((c) => c.name);
+
+  if (error || !categoryNames.length) {
+    categoryNames = [...defaultList];
+  }
+
+  // Also collect any categories dynamically from suppliers table if present
+  try {
+    const suppliersRes = await supabase.from('suppliers').select('category').eq('client_id', DEMO_CLIENT_ID);
+    if (suppliersRes.data) {
+      suppliersRes.data.forEach((s) => {
+        if (Array.isArray(s.category)) {
+          s.category.forEach((cat) => {
+            if (cat && !categoryNames.includes(cat)) {
+              categoryNames.push(cat);
+            }
+          });
+        }
+      });
+    }
+  } catch (e) {
+    // Ignore error
+  }
+
+  defaultList.forEach((d) => {
+    if (!categoryNames.includes(d)) categoryNames.push(d);
+  });
+
+  return categoryNames;
+}
+
+export async function createCustomCategory(categoryName) {
+  const cleanName = (categoryName || '').trim();
+  if (!cleanName) throw new Error('Category name cannot be empty');
+
+  // Insert into categories table in Supabase
+  const { data, error } = await supabase
+    .from('categories')
+    .insert({
+      client_id: DEMO_CLIENT_ID,
+      name: cleanName,
+    })
+    .select();
+
+  if (error && error.code !== '23505') {
+    throw error;
+  }
+
+  return cleanName;
+}
+

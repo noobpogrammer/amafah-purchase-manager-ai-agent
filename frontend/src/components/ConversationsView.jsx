@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { fetchMessages, fetchSuppliers, fetchRFQs } from '../api';
+import { fetchMessages, fetchSuppliers, fetchRFQs, formatRfqDropdownLabel } from '../api';
 import { MessageSquare, Phone, Filter, Clock, Bot, User } from 'lucide-react';
 
 export default function ConversationsView() {
@@ -15,8 +15,11 @@ export default function ConversationsView() {
     async function loadFilterOptions() {
       try {
         const [suppData, rfqData] = await Promise.all([fetchSuppliers(), fetchRFQs()]);
-        setSuppliers(suppData);
-        setRfqs(rfqData);
+        setSuppliers(suppData || []);
+        const sortedRfqs = (rfqData || []).sort(
+          (a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)
+        );
+        setRfqs(sortedRfqs);
       } catch (err) {
         console.error('Error fetching options:', err);
       }
@@ -79,7 +82,7 @@ export default function ConversationsView() {
             <option value="">All RFQs</option>
             {rfqs.map((r) => (
               <option key={r.id} value={r.id}>
-                {r.product_name} ({r.category})
+                {formatRfqDropdownLabel(r)}
               </option>
             ))}
           </select>

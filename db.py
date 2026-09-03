@@ -382,6 +382,32 @@ def create_rfq_and_match_suppliers(client_id: str, product_name: str, category: 
     return rfq, unique_suppliers
 
 
+def get_incomplete_rfqs_audit(client_id: str = None):
+    """Returns RFQs with missing category/deadline metadata or no matched suppliers."""
+    query = supabase.table("rfqs").select("*, rfq_suppliers(id)")
+    if client_id:
+        query = query.eq("client_id", client_id)
+
+    res = query.execute()
+    issues = []
+    for rfq in res.data:
+        matched_count = len(rfq.get("rfq_suppliers") or [])
+        if rfq.get("category") is None or rfq.get("deadline_hours") is None or matched_count == 0:
+            issues.append({
+                "id": rfq.get("id"),
+                "product_name": rfq.get("product_name"),
+                "category": rfq.get("category"),
+                "deadline_hours": rfq.get("deadline_hours"),
+                "matched_suppliers_count": matched_count,
+                "status": rfq.get("status"),
+                "created_at": rfq.get("created_at"),
+            })
+    return {
+        "count": len(issues),
+        "items": issues,
+    }
+
+
 def get_supplier_prior_quotes(supplier_id: str, rfq_ids: list = None):
     """Fetches past quote(s) for a supplier to serve as prior context for Groq contradiction detection."""
     query = supabase.table("quotes").select("*, rfqs(product_name)").eq("supplier_id", supplier_id)
@@ -434,6 +460,25 @@ def resolve_flag(flag_id: str):
         .execute()
     )
     return res.data[0] if res.data else None
+
+
+def resolve_flag_with_response(flag_id: str, human_response: str = None):
+    """Stores human response and marks a flagged_for_review item as resolved."""
+    from datetime import datetime, timezone
+
+    res = (
+        supabase.table("flagged_for_review")
+        .update({
+            "status": "resolved",
+            "human_response": human_response,
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        })
+        .eq("id", flag_id)
+        .select("*, suppliers(*), rfqs(*)")
+        .execute()
+    )
+    return res.data if res.data else []
+
 
 
 def close_rfq(rfq_id: str, target_status: str = "closed"):

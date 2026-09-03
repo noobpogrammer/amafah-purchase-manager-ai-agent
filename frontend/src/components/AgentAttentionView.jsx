@@ -1,11 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { fetchFlags, resolveFlag } from '../api';
-import { AlertTriangle, CheckCircle2, Phone, Clock, FileText, Check } from 'lucide-react';
+import { fetchFlags, resolveFlag, respondToFlag } from '../api';
+import { AlertTriangle, CheckCircle2, Phone, Clock, FileText, Check, Send } from 'lucide-react';
 
 export default function AgentAttentionView({ refreshFlagsCount }) {
   const [flags, setFlags] = useState([]);
   const [loading, setLoading] = useState(true);
   const [resolvingId, setResolvingId] = useState(null);
+
+  // Response form states
+  const [responseTexts, setResponseTexts] = useState({});
+  const [sendToSupplierState, setSendToSupplierState] = useState({});
 
   const loadFlags = async () => {
     setLoading(true);
@@ -32,6 +36,24 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
     } catch (err) {
       console.error(err);
       alert('Error resolving flag: ' + err.message);
+    } finally {
+      setResolvingId(null);
+    }
+  };
+
+  const handleRespond = async (flagId) => {
+    const text = (responseTexts[flagId] || '').trim();
+    if (!text) return;
+
+    const sendToSupplier = sendToSupplierState[flagId] !== false;
+    setResolvingId(flagId);
+    try {
+      await respondToFlag(flagId, text, sendToSupplier);
+      setResponseTexts((prev) => ({ ...prev, [flagId]: '' }));
+      await loadFlags();
+    } catch (err) {
+      console.error(err);
+      alert('Error sending human response: ' + err.message);
     } finally {
       setResolvingId(null);
     }
@@ -112,19 +134,53 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                         <p className="raw-text">"{flag.raw_message}"</p>
                       </div>
 
-                      <div className="flag-item-footer">
+                      {/* Human Response Input Section */}
+                      <div className="human-response-section" style={{ marginTop: '0.85rem', paddingTop: '0.85rem', borderTop: '1px solid var(--panel-border)' }}>
+                        <label className="form-label flex-items" style={{ marginBottom: '0.4rem' }}>
+                          <FileText size={14} /> <strong>Human Instruction / Reply:</strong>
+                        </label>
+                        <textarea
+                          className="input-field textarea-input"
+                          placeholder="Type instruction or direct reply for supplier (e.g., 'We accept payment terms at $45/unit')..."
+                          rows={2}
+                          value={responseTexts[flag.id] || ''}
+                          onChange={(e) => setResponseTexts({ ...responseTexts, [flag.id]: e.target.value })}
+                        />
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '0.5rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                          <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
+                            <input
+                              type="checkbox"
+                              checked={sendToSupplierState[flag.id] !== false}
+                              onChange={(e) => setSendToSupplierState({ ...sendToSupplierState, [flag.id]: e.target.checked })}
+                            />
+                            <span>Send response to supplier via WhatsApp</span>
+                          </label>
+
+                          <div style={{ display: 'flex', gap: '0.5rem' }}>
+                            <button
+                              className="btn btn-secondary btn-sm"
+                              onClick={() => handleResolve(flag.id)}
+                              disabled={resolvingId === flag.id}
+                            >
+                              <Check size={14} />
+                              <span>{resolvingId === flag.id ? 'Resolving...' : 'Mark Resolved'}</span>
+                            </button>
+                            <button
+                              className="btn btn-primary btn-sm"
+                              onClick={() => handleRespond(flag.id)}
+                              disabled={resolvingId === flag.id || !(responseTexts[flag.id] || '').trim()}
+                            >
+                              <Send size={14} />
+                              <span>{resolvingId === flag.id ? 'Sending...' : 'Send & Resolve'}</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flag-item-footer" style={{ marginTop: '0.75rem' }}>
                         <span className="timestamp">
                           <Clock size={12} /> Flagged: {new Date(flag.created_at).toLocaleString()}
                         </span>
-
-                        <button
-                          className="btn btn-success btn-sm"
-                          onClick={() => handleResolve(flag.id)}
-                          disabled={resolvingId === flag.id}
-                        >
-                          <Check size={14} />
-                          <span>{resolvingId === flag.id ? 'Resolving...' : 'Mark Resolved'}</span>
-                        </button>
                       </div>
                     </div>
                   );

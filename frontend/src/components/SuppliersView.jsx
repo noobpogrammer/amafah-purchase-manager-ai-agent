@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Users, Plus, Search, Filter, Edit2, Phone, Tag, Check, X } from 'lucide-react';
-import { createSupplier, updateSupplier } from '../api';
+import { createSupplier, updateSupplier, fetchCategories, createCustomCategory } from '../api';
 
-const AVAILABLE_CATEGORIES = [
+const DEFAULT_CATEGORIES = [
   'Electronics',
   'Hardware',
   'Plumbing',
@@ -13,12 +13,18 @@ const AVAILABLE_CATEGORIES = [
 ];
 
 export default function SuppliersView({ suppliers, loading, refreshSuppliers }) {
+  const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const [searchTerm, setSearchTerm] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
   const [showModal, setShowModal] = useState(false);
   const [editingSupplier, setEditingSupplier] = useState(null);
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+
+  // Custom Category State
+  const [showCustomCatInput, setShowCustomCatInput] = useState(false);
+  const [customCatName, setCustomCatName] = useState('');
+  const [creatingCat, setCreatingCat] = useState(false);
 
   // Form State
   const [name, setName] = useState('');
@@ -27,7 +33,23 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
   const [notes, setNotes] = useState('');
   const [isActive, setIsActive] = useState(true);
 
+  const loadCategories = async () => {
+    try {
+      const list = await fetchCategories();
+      if (list && list.length) {
+        setCategories(list);
+      }
+    } catch (e) {
+      console.error('Error loading categories:', e);
+    }
+  };
+
+  useEffect(() => {
+    loadCategories();
+  }, []);
+
   const openAddModal = () => {
+    loadCategories();
     setEditingSupplier(null);
     setName('');
     setPhone('');
@@ -35,10 +57,13 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
     setNotes('');
     setIsActive(true);
     setErrorMsg('');
+    setShowCustomCatInput(false);
+    setCustomCatName('');
     setShowModal(true);
   };
 
   const openEditModal = (supplier) => {
+    loadCategories();
     setEditingSupplier(supplier);
     setName(supplier.name || '');
     setPhone(supplier.phone_number || '');
@@ -46,7 +71,33 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
     setNotes(supplier.notes || '');
     setIsActive(supplier.is_active !== false);
     setErrorMsg('');
+    setShowCustomCatInput(false);
+    setCustomCatName('');
     setShowModal(true);
+  };
+
+  const handleCreateCustomCategory = async (e) => {
+    e.preventDefault();
+    const clean = customCatName.trim();
+    if (!clean) return;
+
+    setCreatingCat(true);
+    try {
+      const created = await createCustomCategory(clean);
+      if (!categories.includes(created)) {
+        setCategories([...categories, created]);
+      }
+      if (!selectedCategories.includes(created)) {
+        setSelectedCategories([...selectedCategories, created]);
+      }
+      setCustomCatName('');
+      setShowCustomCatInput(false);
+    } catch (err) {
+      console.error(err);
+      setErrorMsg(err.message || 'Failed to create custom category');
+    } finally {
+      setCreatingCat(false);
+    }
   };
 
   const toggleCategory = (cat) => {
@@ -146,7 +197,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
             onChange={(e) => setCategoryFilter(e.target.value)}
           >
             <option value="">All Categories</option>
-            {AVAILABLE_CATEGORIES.map((cat) => (
+            {categories.map((cat) => (
               <option key={cat} value={cat}>
                 {cat}
               </option>
@@ -276,7 +327,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
                     Categories * (Multi-select categories served)
                   </label>
                   <div className="category-selection-grid">
-                    {AVAILABLE_CATEGORIES.map((cat) => {
+                    {categories.map((cat) => {
                       const isSelected = selectedCategories.includes(cat);
                       return (
                         <button
@@ -293,6 +344,54 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
                         </button>
                       );
                     })}
+
+                    {showCustomCatInput ? (
+                      <div className="custom-cat-inline-row" style={{ display: 'flex', gap: '0.4rem', marginTop: '0.4rem', width: '100%' }}>
+                        <input
+                          type="text"
+                          className="input-field"
+                          placeholder="Type custom category name..."
+                          value={customCatName}
+                          onChange={(e) => setCustomCatName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              handleCreateCustomCategory(e);
+                            }
+                          }}
+                          autoFocus
+                          style={{ flex: 1 }}
+                        />
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          onClick={handleCreateCustomCategory}
+                          disabled={creatingCat}
+                        >
+                          {creatingCat ? 'Adding...' : 'Add'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => {
+                            setShowCustomCatInput(false);
+                            setCustomCatName('');
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setShowCustomCatInput(true)}
+                        className="category-toggle-chip"
+                        style={{ borderStyle: 'dashed', borderColor: 'var(--primary)', color: 'var(--primary)' }}
+                      >
+                        <Plus size={14} />
+                        <span>+ Custom Category</span>
+                      </button>
+                    )}
                   </div>
                 </div>
 

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { fetchRFQs, fetchRFQDetail, triggerAIRanking } from '../api';
+import { fetchRFQs, fetchRFQDetail, triggerAIRanking, formatRfqDropdownLabel } from '../api';
 import { Sparkles, Trophy, CheckCircle, BarChart3, AlertCircle, Clock } from 'lucide-react';
 
 export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
@@ -12,9 +12,12 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
     async function loadRFQsList() {
       try {
         const data = await fetchRFQs();
-        setRfqs(data);
-        if (!selectedRfqId && data.length > 0) {
-          setSelectedRfqId(data[0].id);
+        const sorted = (data || []).sort(
+          (a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)
+        );
+        setRfqs(sorted);
+        if (!selectedRfqId && sorted.length > 0) {
+          setSelectedRfqId(sorted[0].id);
         }
       } catch (err) {
         console.error('Error fetching RFQs:', err);
@@ -88,7 +91,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
           >
             {rfqs.map((r) => (
               <option key={r.id} value={r.id}>
-                {r.product_name} ({r.category})
+                {formatRfqDropdownLabel(r)}
               </option>
             ))}
           </select>
