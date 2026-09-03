@@ -202,6 +202,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
             quantity: quantityValue,
             last_quote: lastQuoteValue,
             category: category || categories[0] || 'General',
+            deadline_hours: deadlineHours,
             selected: true,
           };
         });
@@ -225,6 +226,20 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
     setBulkRows((prev) => prev.map((row) => row.id === id ? { ...row, category: value } : row));
   };
 
+  const updateBulkRowField = (id, field, value) => {
+    setBulkRows((prev) => prev.map((row) => {
+      if (row.id !== id) return row;
+      const copy = { ...row };
+      if (field === 'quantity' || field === 'deadline_hours') {
+        const n = value === '' || value === null ? null : Number(String(value).replace(/[^0-9.-]/g, ''));
+        copy[field] = Number.isFinite(n) ? n : null;
+      } else {
+        copy[field] = value;
+      }
+      return copy;
+    }));
+  };
+
   const submitBulkRows = async () => {
     const selectedRows = bulkRows.filter((row) => row.selected);
     if (!selectedRows.length) {
@@ -243,6 +258,14 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
     formData.append('category', selectedRows[0].category || category || 'General');
     formData.append('deadline_hours', String(deadlineHours || 24));
     formData.append('row_categories', JSON.stringify(selectedRows.map((row) => row.category || selectedRows[0].category || category || 'General')));
+    const rowUpdates = selectedRows.map((row) => ({
+      product_name: row.product_name,
+      quantity: row.quantity,
+      category: row.category,
+      deadline_hours: row.deadline_hours,
+      specs: row.specs,
+    }));
+    formData.append('row_updates', JSON.stringify(rowUpdates));
 
     setBulkSubmitting(true);
     setErrorMsg('');
@@ -466,9 +489,15 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                           <tr key={row.id}>
                             <td><input type="checkbox" checked={row.selected} onChange={() => toggleBulkRow(row.id)} /></td>
                             <td>{row.rowNumber}</td>
-                            <td>{row.product_name || '—'}</td>
-                            <td>{row.specs || '—'}</td>
-                            <td>{row.quantity ?? '—'}</td>
+                            <td>
+                              <input type="text" className="input-field" value={row.product_name} onChange={(e) => updateBulkRowField(row.id, 'product_name', e.target.value)} />
+                            </td>
+                            <td>
+                              <input type="text" className="input-field" value={row.specs || ''} onChange={(e) => updateBulkRowField(row.id, 'specs', e.target.value)} />
+                            </td>
+                            <td>
+                              <input type="number" className="input-field" value={row.quantity ?? ''} onChange={(e) => updateBulkRowField(row.id, 'quantity', e.target.value)} />
+                            </td>
                             <td>{row.last_quote ?? '—'}</td>
                             <td>
                               <select value={row.category} onChange={(e) => updateBulkRowCategory(row.id, e.target.value)}>
@@ -476,6 +505,9 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                                   <option key={cat} value={cat}>{cat}</option>
                                 ))}
                               </select>
+                            </td>
+                            <td>
+                              <input type="number" className="input-field" min="1" value={row.deadline_hours ?? deadlineHours} onChange={(e) => updateBulkRowField(row.id, 'deadline_hours', e.target.value)} />
                             </td>
                           </tr>
                         ))}

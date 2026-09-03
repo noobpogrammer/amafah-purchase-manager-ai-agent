@@ -653,6 +653,14 @@ class TestRFQCreationValidation:
         assert len(rows) == 1
         assert rows[0]["product_name"] == "0 pcs"
 
+    def test_bulk_import_handles_dash_placeholders_and_missing_numeric_values(self):
+        csv_contents = "Description,Qty,Last Cost\n-,-,-\n"
+        rows = main.parse_material_requisition_csv(csv_contents)
+        assert len(rows) == 1
+        assert rows[0]["product_name"] == "-"
+        assert rows[0]["quantity"] is None
+        assert rows[0]["last_quote"] is None
+
     @pytest.mark.asyncio
     async def test_bulk_create_rfq_endpoint_accepts_csv_file(self, mock_supabase):
         csv_contents = "Sl. #,Item Code,Description,Unit,Qty,Last Cost\n1,ITEM-001,""MULTI PURPOSE LADDER ALUMINIUM 4X5 0 pcs"",pcs,5,12\n"
@@ -674,7 +682,38 @@ class TestRFQCreationValidation:
         assert response.json()["created_count"] == 1
         mock_create.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_bulk_create_rfq_endpoint_uses_row_level_overrides_and_deadlines(self, mock_supabase):
+        csv_contents = "Description,Qty,Last Cost\nPipe 1-inch,10,25\n"
 
+        mock_rfq_data = [{"id": "rfq-2001", "product_name": "Updated Pipe", "category": "Electrical"}]
+        mock_suppliers = [{"id": "s-2", "name": "Supplier 2", "phone_number": "923362853199"}]
+
+        with patch.object(db, "create_rfq_and_match_suppliers", return_value=(mock_rfq_data[0], mock_suppliers)) as mock_create, \
+             patch.object(main, "enqueue_message", new_callable=AsyncMock):
+            from fastapi.testclient import TestClient
+            client = TestClient(main.app)
+            response = client.post(
+                "/rfq/bulk-create",
+                files={"file": ("material_requisition.csv", csv_contents.encode("utf-8"), "text/csv")},
+                data={
+                    "client_id": "demo-client-id",
+                    "category": "Hardware",
+                    "deadline_hours": "24",
+                    "row_updates": '[{"product_name":"Updated Pipe","quantity":99,"category":"Electrical","deadline_hours":12}]',
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["created_count"] == 1
+        mock_create.assert_called_once_with(
+            client_id="demo-client-id",
+            product_name="Updated Pipe",
+            category="Electrical",
+            deadline_hours=12,
+            specs=None,
+            quantity=99,
+        )
 
 
 

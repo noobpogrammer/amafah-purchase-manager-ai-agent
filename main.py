@@ -847,6 +847,7 @@ async def bulk_create_rfq_endpoint(
     category: Optional[str] = Form(default=None),
     deadline_hours: Optional[int] = Form(default=None),
     row_categories: Optional[str] = Form(default=None),
+    row_updates: Optional[str] = Form(default=None),
 ):
     """Uploads a CSV material requisition sheet and creates one RFQ per row."""
     if not file.filename or not file.filename.lower().endswith(".csv"):
@@ -873,6 +874,18 @@ async def bulk_create_rfq_endpoint(
     if not isinstance(overrides, list):
         overrides = []
 
+    # Parse optional row-level updates (product_name, quantity, category, deadline_hours, specs)
+    try:
+        updates = json.loads(row_updates) if row_updates else []
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="row_updates must be valid JSON when provided")
+
+    if isinstance(updates, dict):
+        updates = [updates.get(str(i)) for i in range(len(rows))]
+
+    if not isinstance(updates, list):
+        updates = []
+
     created_rfqs = []
     failed_rows = []
     matched_summary = []
@@ -880,28 +893,63 @@ async def bulk_create_rfq_endpoint(
 
     for idx, row in enumerate(rows):
         row_category = (overrides[idx] if idx < len(overrides) and overrides[idx] not in (None, "") else category or "").strip()
+        row_update = updates[idx] if idx < len(updates) else None
         if not row_category:
             failed_rows.append({"row_number": row["row_number"], "reason": "Missing category. Assign a default category or select one in the preview step."})
             continue
 
-        product_name = normalize_bulk_description(row["product_name"])
-        if not product_name:
+        # Apply row-level overrides when provided
+        final_product_name = None
+        final_quantity = None
+        final_specs = None
+        final_deadline = default_deadline
+        final_category = row_category
+
+        if row_update and isinstance(row_update, dict):
+            if row_update.get("product_name") not in (None, ""):
+                final_product_name = str(row_update.get("product_name")).strip()
+            if row_update.get("quantity") not in (None, ""):
+                try:
+                    final_quantity = int(float(row_update.get("quantity")))
+                except Exception:
+                    final_quantity = None
+            if row_update.get("specs") not in (None, ""):
+                final_specs = str(row_update.get("specs")).strip()
+            if row_update.get("deadline_hours") not in (None, ""):
+                try:
+                    dh = int(row_update.get("deadline_hours"))
+                    if dh > 0:
+                        final_deadline = dh
+                except Exception:
+                    pass
+            if row_update.get("category") not in (None, ""):
+                final_category = str(row_update.get("category")).strip()
+
+        # Fallback to parsed values when override missing
+        if final_product_name in (None, ""):
+            final_product_name = normalize_bulk_description(row["product_name"]) or row.get("product_name")
+        if final_specs in (None, ""):
+            final_specs = row.get("specs")
+        if final_quantity is None:
+            final_quantity = row.get("quantity")
+
+        if not final_product_name:
             failed_rows.append({"row_number": row["row_number"], "reason": "Missing Description column"})
             continue
 
         rfq, matched_suppliers = db.create_rfq_and_match_suppliers(
             client_id=client_id,
-            product_name=product_name,
-            category=row_category,
-            deadline_hours=default_deadline,
-            specs=row["specs"],
-            quantity=row["quantity"],
+            product_name=final_product_name,
+            category=final_category,
+            deadline_hours=final_deadline,
+            specs=final_specs,
+            quantity=final_quantity,
         )
 
         created_rfqs.append({
             "rfq_id": rfq["id"],
-            "product_name": product_name,
-            "category": row_category,
+            "product_name": final_product_name,
+            "category": final_category,
             "matched_suppliers_count": len(matched_suppliers),
             "matched_suppliers": [{"id": s["id"], "name": s["name"], "phone_number": s.get("phone_number")} for s in matched_suppliers],
         })
