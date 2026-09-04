@@ -51,6 +51,47 @@ def get_supplier_by_phone(client_id: str, phone_number: str):
     return None
 
 
+def get_supplier_by_phone_any_client(phone_number: str):
+    """Lookup a supplier by phone number across all clients.
+
+    This mirrors `get_supplier_by_phone` but does not filter by `client_id`.
+    Returns the first matching supplier (prefers exact phone_number match, falls
+    back to matching cleaned digits).
+    """
+    target_digits = clean_phone(phone_number)
+    if not target_digits:
+        return None
+
+    # Try exact match first
+    res = (
+        supabase.table("suppliers")
+        .select("*")
+        .eq("phone_number", phone_number)
+        .execute()
+    )
+    if res.data:
+        return res.data[0]
+
+    # Fallback: scan all suppliers and match by cleaned digits
+    all_suppliers = supabase.table("suppliers").select("*").execute().data
+    for s in all_suppliers:
+        if clean_phone(s.get("phone_number")) == target_digits:
+            return s
+
+    return None
+
+
+def get_profile_by_id(user_id: str):
+    """Lookup a profile row by the auth user id (profiles.id).
+
+    Returns None when not found.
+    """
+    if not user_id:
+        return None
+    res = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+    return res.data
+
+
 def create_supplier(client_id: str, name: str, phone_number: str, categories: list[str] = None, notes: str = None):
     """Creates a new supplier. categories accepts a list of strings (e.g. ['Electronics', 'Hardware'])."""
     return supabase.table("suppliers").insert({

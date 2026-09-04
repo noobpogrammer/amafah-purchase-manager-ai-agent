@@ -494,7 +494,7 @@ class TestQuotedMessageMatching:
         request = MagicMock()
         request.json = AsyncMock(return_value=payload)
 
-        with patch.object(db, "get_supplier_by_phone", return_value=mock_supplier), \
+        with patch.object(db, "get_supplier_by_phone_any_client", return_value=mock_supplier), \
              patch.object(db, "get_rfq_supplier_by_sent_message_id", return_value=mock_rfq_supp) as mock_get_by_stanza, \
              patch.object(db, "log_message"), \
              patch.object(db, "get_supplier_prior_quotes", return_value=[]), \
@@ -542,7 +542,7 @@ class TestQuotedMessageMatching:
         request.json = AsyncMock(return_value=payload)
 
         # First call adds to PROCESSED_MESSAGE_IDS
-        with patch.object(db, "get_supplier_by_phone", return_value=None):
+        with patch.object(db, "get_supplier_by_phone_any_client", return_value=None):
             await main.whatsapp_webhook(request)
 
         # Second call with same message id should be ignored immediately
@@ -568,7 +568,7 @@ class TestQuotedMessageMatching:
         request = MagicMock()
         request.json = AsyncMock(return_value=payload)
 
-        with patch.object(db, "get_supplier_by_phone", return_value=mock_supplier), \
+        with patch.object(db, "get_supplier_by_phone_any_client", return_value=mock_supplier), \
              patch.object(db, "get_rfq_supplier_by_sent_message_id", return_value=None) as mock_stanza_lookup, \
              patch.object(db, "get_rfq_supplier_by_quoted_text") as mock_text_fallback, \
              patch.object(db, "log_message"):
@@ -671,12 +671,17 @@ class TestRFQCreationValidation:
         with patch.object(db, "create_rfq_and_match_suppliers", return_value=(mock_rfq_data[0], mock_suppliers)) as mock_create, \
              patch.object(main, "enqueue_message", new_callable=AsyncMock):
             from fastapi.testclient import TestClient
+            import auth as _auth
             client = TestClient(main.app)
-            response = client.post(
-                "/rfq/bulk-create",
-                files={"file": ("material_requisition.csv", csv_contents.encode("utf-8"), "text/csv")},
-                data={"client_id": "demo-client-id", "category": "Hardware", "deadline_hours": "24"},
-            )
+            with patch.object(_auth, "verify_jwt", return_value={"sub": "user-1"}), \
+                 patch.object(db, "get_profile_by_id", return_value={"id": "user-1", "client_id": "client-xyz", "role": "member"}):
+                headers = {"Authorization": "Bearer faketoken"}
+                response = client.post(
+                    "/rfq/bulk-create",
+                    files={"file": ("material_requisition.csv", csv_contents.encode("utf-8"), "text/csv")},
+                    data={"category": "Hardware", "deadline_hours": "24"},
+                    headers=headers,
+                )
 
         assert response.status_code == 200, response.text
         assert response.json()["created_count"] == 1
@@ -692,22 +697,26 @@ class TestRFQCreationValidation:
         with patch.object(db, "create_rfq_and_match_suppliers", return_value=(mock_rfq_data[0], mock_suppliers)) as mock_create, \
              patch.object(main, "enqueue_message", new_callable=AsyncMock):
             from fastapi.testclient import TestClient
+            import auth as _auth
             client = TestClient(main.app)
-            response = client.post(
-                "/rfq/bulk-create",
-                files={"file": ("material_requisition.csv", csv_contents.encode("utf-8"), "text/csv")},
-                data={
-                    "client_id": "demo-client-id",
-                    "category": "Hardware",
-                    "deadline_hours": "24",
-                    "row_updates": '[{"product_name":"Updated Pipe","quantity":99,"category":"Electrical","deadline_hours":12}]',
-                },
-            )
+            with patch.object(_auth, "verify_jwt", return_value={"sub": "user-1"}), \
+                 patch.object(db, "get_profile_by_id", return_value={"id": "user-1", "client_id": "client-xyz", "role": "member"}):
+                headers = {"Authorization": "Bearer faketoken"}
+                response = client.post(
+                    "/rfq/bulk-create",
+                    files={"file": ("material_requisition.csv", csv_contents.encode("utf-8"), "text/csv")},
+                    data={
+                        "category": "Hardware",
+                        "deadline_hours": "24",
+                        "row_updates": '[{"product_name":"Updated Pipe","quantity":99,"category":"Electrical","deadline_hours":12}]',
+                    },
+                    headers=headers,
+                )
 
         assert response.status_code == 200, response.text
         assert response.json()["created_count"] == 1
         mock_create.assert_called_once_with(
-            client_id="demo-client-id",
+            client_id="client-xyz",
             product_name="Updated Pipe",
             category="Electrical",
             deadline_hours=12,

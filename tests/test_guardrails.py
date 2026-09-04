@@ -85,7 +85,7 @@ async def test_webhook_injection_attempt_escalates_not_complies(mock_supabase):
     request = MagicMock()
     request.json = AsyncMock(return_value=payload)
 
-    with patch.object(db, "get_supplier_by_phone", return_value=mock_supplier), \
+    with patch.object(db, "get_supplier_by_phone_any_client", return_value=mock_supplier), \
          patch.object(db, "get_pending_clarification_for_supplier", return_value=None), \
          patch.object(db, "get_open_rfqs_for_supplier", return_value=mock_open_rfqs), \
          patch.object(db, "get_supplier_prior_quotes", return_value=[]), \
@@ -145,7 +145,7 @@ async def test_legitimate_clarification_still_sends_normally(mock_supabase):
     request = MagicMock()
     request.json = AsyncMock(return_value=payload)
 
-    with patch.object(db, "get_supplier_by_phone", return_value=mock_supplier), \
+    with patch.object(db, "get_supplier_by_phone_any_client", return_value=mock_supplier), \
          patch.object(db, "get_pending_clarification_for_supplier", return_value=None), \
          patch.object(db, "get_open_rfqs_for_supplier", return_value=mock_open_rfqs), \
          patch.object(db, "get_supplier_prior_quotes", return_value=[]), \

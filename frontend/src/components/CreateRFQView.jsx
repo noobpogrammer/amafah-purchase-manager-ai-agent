@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import { Send, CheckCircle, AlertTriangle, ArrowRight, Tag, Clock, Package, FileText, Plus, Upload } from 'lucide-react';
 import { createRFQ, fetchCategories, createCustomCategory, bulkCreateRFQs } from '../api';
-import { DEMO_CLIENT_ID } from '../supabaseClient';
+// client_id is derived server-side from authenticated user; do not import DEMO_CLIENT_ID
 
 const DEFAULT_CATEGORIES = [
   'Electronics',
@@ -254,7 +254,6 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
 
     const formData = new FormData();
     formData.append('file', bulkFile);
-    formData.append('client_id', DEMO_CLIENT_ID);
     formData.append('category', selectedRows[0].category || category || 'General');
     formData.append('deadline_hours', String(deadlineHours || 24));
     formData.append('row_categories', JSON.stringify(selectedRows.map((row) => row.category || selectedRows[0].category || category || 'General')));

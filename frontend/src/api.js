@@ -1,4 +1,4 @@
-import { supabase, DEMO_CLIENT_ID, API_URL } from './supabaseClient';
+import { supabase, API_URL, apiFetch, getCurrentClientId } from './supabaseClient';
 
 export function formatRfqDropdownLabel(rfq) {
   if (!rfq) return '';
@@ -45,12 +45,15 @@ export function formatRfqDropdownLabel(rfq) {
 }
 
 export async function fetchDashboardMetrics() {
+  const clientId = await getCurrentClientId();
+  if (!clientId) throw new Error('Missing client_id (not authenticated)');
+
   const [rfqsRes, suppliersRes, quotesRes, flagsRes, recentMessagesRes] = await Promise.all([
-    supabase.from('rfqs').select('id, status, created_at', { count: 'exact' }).eq('client_id', DEMO_CLIENT_ID),
-    supabase.from('suppliers').select('id', { count: 'exact' }).eq('client_id', DEMO_CLIENT_ID).eq('is_active', true),
+    supabase.from('rfqs').select('id, status, created_at', { count: 'exact' }).eq('client_id', clientId),
+    supabase.from('suppliers').select('id', { count: 'exact' }).eq('client_id', clientId).eq('is_active', true),
     supabase.from('quotes').select('id', { count: 'exact' }),
-    supabase.from('flagged_for_review').select('id', { count: 'exact' }).eq('client_id', DEMO_CLIENT_ID).eq('status', 'pending'),
-    supabase.from('message_log').select('*, suppliers(name)').eq('client_id', DEMO_CLIENT_ID).order('created_at', { ascending: false }).limit(6),
+    supabase.from('flagged_for_review').select('id', { count: 'exact' }).eq('client_id', clientId).eq('status', 'pending'),
+    supabase.from('message_log').select('*, suppliers(name)').eq('client_id', clientId).order('created_at', { ascending: false }).limit(6),
   ]);
 
   const activeRfqs = (rfqsRes.data || []).filter(r => r.status === 'active').length;
@@ -66,20 +69,26 @@ export async function fetchDashboardMetrics() {
 }
 
 export async function fetchSuppliers() {
+  const clientId = await getCurrentClientId();
+  if (!clientId) throw new Error('Missing client_id (not authenticated)');
+
   const { data, error } = await supabase
     .from('suppliers')
     .select('*')
-    .eq('client_id', DEMO_CLIENT_ID)
+    .eq('client_id', clientId)
     .order('created_at', { ascending: false });
   if (error) throw error;
   return data;
 }
 
 export async function createSupplier(payload) {
+  const clientId = await getCurrentClientId();
+  if (!clientId) throw new Error('Missing client_id (not authenticated)');
+
   const { data, error } = await supabase
     .from('suppliers')
     .insert({
-      client_id: DEMO_CLIENT_ID,
+      client_id: clientId,
       name: payload.name,
       phone_number: payload.phone_number,
       category: payload.category || [],
@@ -108,11 +117,10 @@ export async function updateSupplier(id, payload) {
 }
 
 export async function createRFQ(payload) {
-  const response = await fetch(`${API_URL}/rfq/create`, {
+  const response = await apiFetch('/rfq/create', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      client_id: DEMO_CLIENT_ID,
       product_name: payload.product_name,
       category: payload.category,
       specs: payload.specs,
@@ -129,7 +137,7 @@ export async function createRFQ(payload) {
 }
 
 export async function bulkCreateRFQs(formData) {
-  const response = await fetch(`${API_URL}/rfq/bulk-create`, {
+  const response = await apiFetch('/rfq/bulk-create', {
     method: 'POST',
     body: formData,
   });
@@ -143,10 +151,13 @@ export async function bulkCreateRFQs(formData) {
 }
 
 export async function fetchRFQs() {
+  const clientId = await getCurrentClientId();
+  if (!clientId) throw new Error('Missing client_id (not authenticated)');
+
   const { data, error } = await supabase
     .from('rfqs')
     .select('*, rfq_suppliers(id, status, supplier_id, suppliers(name)), quotes(id)')
-    .eq('client_id', DEMO_CLIENT_ID)
+    .eq('client_id', clientId)
     .order('created_at', { ascending: false });
   if (error) throw error;
   return data;
@@ -182,10 +193,13 @@ export async function triggerAIRanking(rfqId) {
 }
 
 export async function fetchMessages(supplierId = null, rfqId = null) {
+  const clientId = await getCurrentClientId();
+  if (!clientId) throw new Error('Missing client_id (not authenticated)');
+
   let query = supabase
     .from('message_log')
     .select('*, suppliers(name, phone_number), rfqs(product_name)')
-    .eq('client_id', DEMO_CLIENT_ID)
+    .eq('client_id', clientId)
     .order('created_at', { ascending: true });
 
   if (supplierId) query = query.eq('supplier_id', supplierId);
@@ -197,10 +211,13 @@ export async function fetchMessages(supplierId = null, rfqId = null) {
 }
 
 export async function fetchFlags() {
+  const clientId = await getCurrentClientId();
+  if (!clientId) throw new Error('Missing client_id (not authenticated)');
+
   const { data, error } = await supabase
     .from('flagged_for_review')
     .select('*, suppliers(name, phone_number), rfqs(product_name)')
-    .eq('client_id', DEMO_CLIENT_ID)
+    .eq('client_id', clientId)
     .order('created_at', { ascending: false });
   if (error) throw error;
   return data;
@@ -243,10 +260,13 @@ export async function closeRFQ(rfqId, status = 'closed') {
 }
 
 export async function fetchCategories() {
+  const clientId = await getCurrentClientId();
+  if (!clientId) throw new Error('Missing client_id (not authenticated)');
+
   const { data, error } = await supabase
     .from('categories')
     .select('name')
-    .eq('client_id', DEMO_CLIENT_ID)
+    .eq('client_id', clientId)
     .order('created_at', { ascending: true });
 
   const defaultList = ['Electronics', 'Hardware', 'Plumbing', 'Electrical', 'Tools', 'Building Materials', 'General'];
@@ -258,7 +278,7 @@ export async function fetchCategories() {
 
   // Also collect any categories dynamically from suppliers table if present
   try {
-    const suppliersRes = await supabase.from('suppliers').select('category').eq('client_id', DEMO_CLIENT_ID);
+    const suppliersRes = await supabase.from('suppliers').select('category').eq('client_id', clientId);
     if (suppliersRes.data) {
       suppliersRes.data.forEach((s) => {
         if (Array.isArray(s.category)) {
@@ -286,10 +306,13 @@ export async function createCustomCategory(categoryName) {
   if (!cleanName) throw new Error('Category name cannot be empty');
 
   // Insert into categories table in Supabase
+  const clientId = await getCurrentClientId();
+  if (!clientId) throw new Error('Missing client_id (not authenticated)');
+
   const { data, error } = await supabase
     .from('categories')
     .insert({
-      client_id: DEMO_CLIENT_ID,
+      client_id: clientId,
       name: cleanName,
     })
     .select();

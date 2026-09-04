@@ -8,7 +8,15 @@ import QuotesReportView from './components/QuotesReportView';
 import ConversationsView from './components/ConversationsView';
 import AgentAttentionView from './components/AgentAttentionView';
 
+import Login from './pages/Login';
+import SignUp from './pages/SignUp';
+import ForgotPassword from './pages/ForgotPassword';
+import ResetPassword from './pages/ResetPassword';
+import TeamSettings from './pages/TeamSettings';
+
 import { fetchDashboardMetrics, fetchSuppliers, fetchFlags } from './api';
+import { supabase } from './supabaseClient';
+import { ensureProfile } from './lib/ensureProfile';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -21,6 +29,10 @@ export default function App() {
   const [loadingMetrics, setLoadingMetrics] = useState(true);
   const [loadingSuppliers, setLoadingSuppliers] = useState(true);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
+
+  const [route, setRoute] = useState(window.location.pathname || '/');
+  const [profileLoadError, setProfileLoadError] = useState(null);
+  const [profileLoading, setProfileLoading] = useState(false);
 
   // Load Dashboard metrics
   const loadMetrics = async () => {
@@ -69,15 +81,68 @@ export default function App() {
     setRefreshTrigger((prev) => prev + 1);
   };
 
+  // Simple pathname-based router helpers
+  const navigate = (path) => {
+    window.history.pushState({}, '', path);
+    setRoute(path);
+  };
+
+  useEffect(() => {
+    const onPop = () => setRoute(window.location.pathname || '/');
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  // On app mount, if there's an active session, attempt to ensure profile
+  useEffect(() => {
+    (async () => {
+      setProfileLoadError(null);
+      setProfileLoading(true);
+      try {
+        const { data: sessionRes } = await supabase.auth.getSession();
+        const user = sessionRes?.session?.user;
+        if (user) {
+          await ensureProfile();
+        }
+      } catch (err) {
+        setProfileLoadError(err.message || String(err));
+      } finally {
+        setProfileLoading(false);
+      }
+    })();
+  }, []);
+
+  // Route: map path to app/tab or standalone pages
+  if (route === '/login') {
+    return <Login navigate={navigate} onLoginSuccess={() => { setActiveTab('dashboard'); }} />;
+  }
+  if (route === '/signup') {
+    return <SignUp navigate={navigate} />;
+  }
+  if (route === '/forgot-password') {
+    return <ForgotPassword navigate={navigate} />;
+  }
+  if (route === '/reset-password') {
+    return <ResetPassword navigate={navigate} />;
+  }
+  if (route === '/team') {
+    return <TeamSettings navigate={navigate} />;
+  }
+
+  // App shell
   return (
     <div className="app-shell">
       <Navbar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         pendingFlagsCount={pendingFlagsCount}
+        navigate={navigate}
       />
 
       <main className="app-container">
+        {profileLoading && <div>Loading profile...</div>}
+        {profileLoadError && <div className="msg error">{profileLoadError}</div>}
+
         {activeTab === 'dashboard' && (
           <DashboardView
             metrics={metrics}

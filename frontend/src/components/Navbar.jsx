@@ -10,7 +10,7 @@ import {
   Bot
 } from 'lucide-react';
 
-export default function Navbar({ activeTab, setActiveTab, pendingFlagsCount }) {
+export default function Navbar({ activeTab, setActiveTab, pendingFlagsCount, navigate }) {
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { id: 'suppliers', label: 'Suppliers', icon: Users },
@@ -56,6 +56,12 @@ export default function Navbar({ activeTab, setActiveTab, pendingFlagsCount }) {
             );
           })}
         </nav>
+
+        <div className="auth-links">
+          <button className="nav-link small" onClick={() => navigate('/team')}>Team</button>
+          <button className="nav-link small" onClick={() => navigate('/login')}>Login</button>
+          <button className="nav-link small" onClick={() => navigate('/signup')}>Sign up</button>
+        </div>
       </div>
     </header>
   );
