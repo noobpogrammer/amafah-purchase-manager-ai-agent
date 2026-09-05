@@ -111,3 +111,47 @@ def test_valid_jwt_resolves_profile(monkeypatch):
     # Because the DB functions that create RFQs will run and in our environment may fail,
     # we assert only that the request was not unauthorized (i.e., not 401).
     assert r.status_code != 401
+
+
+def test_flags_endpoints_require_auth(monkeypatch):
+    # GET /flags without token returns 401
+    r = client.get("/flags")
+    assert r.status_code == 401
+
+    # POST /flags/flag-123/resolve without token returns 401
+    r = client.post("/flags/flag-123/resolve")
+    assert r.status_code == 401
+
+    # POST /flags/flag-123/respond without token returns 401
+    r = client.post("/flags/flag-123/respond", json={"response": "test reply", "send_to_supplier": False})
+    assert r.status_code == 401
+
+
+def test_flags_endpoints_succeed_with_valid_jwt(monkeypatch):
+    import auth
+    import db
+
+    monkeypatch.setattr(auth, "verify_jwt", lambda token: {"sub": "user-123"})
+    monkeypatch.setattr(db, "get_profile_by_id", lambda uid: {"id": uid, "client_id": "client-abc", "role": "member"})
+    monkeypatch.setattr(db, "get_pending_flags", lambda cid: [{"id": "flag-1", "category": "other"}])
+    monkeypatch.setattr(db, "resolve_flag", lambda fid: {"id": fid, "status": "resolved"})
+    monkeypatch.setattr(db, "resolve_flag_with_response", lambda fid, resp: [{"id": fid, "status": "resolved", "suppliers": {"id": "s1", "phone_number": "123"}}])
+    monkeypatch.setattr(db, "log_message", lambda *a, **k: None)
+
+    headers = {"Authorization": "Bearer faketoken"}
+
+    # GET /flags
+    r = client.get("/flags", headers=headers)
+    assert r.status_code == 200
+    assert r.json() == [{"id": "flag-1", "category": "other"}]
+
+    # POST /flags/{id}/resolve
+    r = client.post("/flags/flag-1/resolve", headers=headers)
+    assert r.status_code == 200
+    assert r.json()["status"] == "resolved"
+
+    # POST /flags/{id}/respond
+    r = client.post("/flags/flag-1/respond", json={"response": "We will ship tomorrow", "send_to_supplier": False}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["status"] == "resolved"
+
