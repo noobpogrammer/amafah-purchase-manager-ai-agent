@@ -298,49 +298,84 @@ def check_and_auto_rank(rfq_id: str):
 async def check_deadlines_and_reminders():
     """Background cron job that checks active RFQs and handles deadline expiry & reminders."""
     now = datetime.now(timezone.utc)
-    active_items = db.get_active_rfq_suppliers_with_deadlines()
+    print(f"[{now.isoformat()}] [Scheduler] Running check_deadlines_and_reminders...")
+    try:
+        active_items = db.get_active_rfq_suppliers_with_deadlines()
+        print(f"[{now.isoformat()}] [Scheduler] Found {len(active_items)} active rfq_supplier items pending responses.")
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[{now.isoformat()}] [Scheduler ERROR] Failed to fetch active RFQ suppliers: {e}\n{tb}")
+        db.log_webhook_error(str(e), tb, {"job": "check_deadlines_and_reminders", "stage": "fetch_active_items"})
+        return
 
     for item in active_items:
-        rfq = item["rfqs"]
-        supplier = item["suppliers"]
-        sent_at_str = item["sent_at"]
+        item_id = item.get("id")
+        try:
+            rfq = item.get("rfqs") or {}
+            supplier = item.get("suppliers") or {}
+            sent_at_str = item.get("sent_at")
 
-        sent_at = datetime.fromisoformat(sent_at_str.replace("Z", "+00:00"))
-        deadline_hours = rfq.get("deadline_hours") or 24
-        total_seconds = deadline_hours * 3600
-        elapsed_seconds = (now - sent_at).total_seconds()
-        if total_seconds <= 0:
-            continue
-        percentage = (elapsed_seconds / total_seconds) * 100
-        reminder_count = item.get("reminder_count", 0)
-        phone = supplier["phone_number"]
-        prod = rfq["product_name"]
+            if not sent_at_str:
+                print(f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: missing sent_at timestamp.")
+                continue
 
-        if percentage >= 100:
-            msg = f"RFQ for '{prod}' is now closed as the deadline has passed. Thank you!"
-            client_id = rfq.get("client_id") or supplier.get("client_id")
-            db.log_message(client_id, supplier["id"], "outbound", msg)
-            await enqueue_message(phone, msg)
-            db.close_rfq(rfq["id"], "closed")
-            check_and_auto_rank(rfq["id"])
-        elif percentage >= 90 and reminder_count == 2:
-            msg = f"Final reminder — closing the RFQ for '{prod}' soon! Please reply with your quote if available."
-            client_id = rfq.get("client_id") or supplier.get("client_id")
-            db.log_message(client_id, supplier["id"], "outbound", msg)
-            await enqueue_message(phone, msg, rfq_id=rfq["id"], supplier_id=supplier["id"])
-            db.update_rfq_supplier_reminder(item["id"], 3)
-        elif percentage >= 70 and reminder_count == 1:
-            msg = f"Reminder regarding RFQ for '{prod}'. Please send your quote when ready."
-            client_id = rfq.get("client_id") or supplier.get("client_id")
-            db.log_message(client_id, supplier["id"], "outbound", msg)
-            await enqueue_message(phone, msg, rfq_id=rfq["id"], supplier_id=supplier["id"])
-            db.update_rfq_supplier_reminder(item["id"], 2)
-        elif percentage >= 50 and reminder_count == 0:
-            msg = f"Hi! Just checking in on the RFQ for '{prod}'."
-            client_id = rfq.get("client_id") or supplier.get("client_id")
-            db.log_message(client_id, supplier["id"], "outbound", msg)
-            await enqueue_message(phone, msg, rfq_id=rfq["id"], supplier_id=supplier["id"])
-            db.update_rfq_supplier_reminder(item["id"], 1)
+            try:
+                sent_at = datetime.fromisoformat(sent_at_str.replace("Z", "+00:00"))
+                if sent_at.tzinfo is None:
+                    sent_at = sent_at.replace(tzinfo=timezone.utc)
+            except Exception as parse_err:
+                print(f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: invalid sent_at format '{sent_at_str}': {parse_err}")
+                continue
+
+            deadline_hours = rfq.get("deadline_hours") or 24
+            total_seconds = deadline_hours * 3600
+            elapsed_seconds = (now - sent_at).total_seconds()
+            if total_seconds <= 0:
+                continue
+
+            percentage = (elapsed_seconds / total_seconds) * 100
+            reminder_count = item.get("reminder_count") or 0
+            phone = supplier.get("phone_number")
+            prod = rfq.get("product_name") or "RFQ Item"
+
+            print(
+                f"[{now.isoformat()}] [Scheduler] Checking item {item_id}: RFQ '{prod}' (id: {rfq.get('id')}), "
+                f"supplier '{supplier.get('name')}', sent_at: {sent_at.isoformat()}, elapsed: {elapsed_seconds:.0f}s/{total_seconds:.0f}s ({percentage:.1f}%), reminders_sent: {reminder_count}"
+            )
+
+            if percentage >= 100:
+                print(f"[{now.isoformat()}] [Scheduler] Deadline expired (100%) for RFQ '{prod}' (item {item_id}). Closing RFQ.")
+                msg = f"RFQ for '{prod}' is now closed as the deadline has passed. Thank you!"
+                client_id = rfq.get("client_id") or supplier.get("client_id")
+                db.log_message(client_id, supplier.get("id"), "outbound", msg)
+                await enqueue_message(phone, msg)
+                db.close_rfq(rfq.get("id"), "closed")
+                check_and_auto_rank(rfq.get("id"))
+            elif percentage >= 90 and reminder_count == 2:
+                print(f"[{now.isoformat()}] [Scheduler] Triggering 90% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
+                msg = f"Final reminder — closing the RFQ for '{prod}' soon! Please reply with your quote if available."
+                client_id = rfq.get("client_id") or supplier.get("client_id")
+                db.log_message(client_id, supplier.get("id"), "outbound", msg)
+                await enqueue_message(phone, msg, rfq_id=rfq.get("id"), supplier_id=supplier.get("id"))
+                db.update_rfq_supplier_reminder(item["id"], 3)
+            elif percentage >= 70 and reminder_count == 1:
+                print(f"[{now.isoformat()}] [Scheduler] Triggering 70% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
+                msg = f"Reminder regarding RFQ for '{prod}'. Please send your quote when ready."
+                client_id = rfq.get("client_id") or supplier.get("client_id")
+                db.log_message(client_id, supplier.get("id"), "outbound", msg)
+                await enqueue_message(phone, msg, rfq_id=rfq.get("id"), supplier_id=supplier.get("id"))
+                db.update_rfq_supplier_reminder(item["id"], 2)
+            elif percentage >= 50 and reminder_count == 0:
+                print(f"[{now.isoformat()}] [Scheduler] Triggering 50% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
+                msg = f"Hi! Just checking in on the RFQ for '{prod}'."
+                client_id = rfq.get("client_id") or supplier.get("client_id")
+                db.log_message(client_id, supplier.get("id"), "outbound", msg)
+                await enqueue_message(phone, msg, rfq_id=rfq.get("id"), supplier_id=supplier.get("id"))
+                db.update_rfq_supplier_reminder(item["id"], 1)
+        except Exception as item_err:
+            tb = traceback.format_exc()
+            print(f"[{now.isoformat()}] [Scheduler ERROR] Failed processing item {item_id}: {item_err}\n{tb}")
+            db.log_webhook_error(str(item_err), tb, {"job": "check_deadlines_and_reminders", "item_id": item_id})
 
 
 REQUIRED_ENV_VARS = [
@@ -363,16 +398,29 @@ async def lifespan(app: FastAPI):
             f"Please check your root .env file."
         )
 
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Starting outbound message worker task...")
     worker_task = asyncio.create_task(outbound_worker())
-    scheduler.add_job(check_deadlines_and_reminders, "interval", minutes=15)
+
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Registering check_deadlines_and_reminders job on AsyncIOScheduler (interval: 15m, next_run: now)...")
+    scheduler.add_job(
+        check_deadlines_and_reminders,
+        "interval",
+        minutes=15,
+        next_run_time=datetime.now(timezone.utc),
+        id="check_deadlines_and_reminders",
+        replace_existing=True,
+    )
     scheduler.start()
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] AsyncIOScheduler started successfully.")
     yield
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Shutting down scheduler and worker task...")
     scheduler.shutdown()
     worker_task.cancel()
     try:
         await worker_task
     except asyncio.CancelledError:
         pass
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Outbound worker and scheduler shut down cleanly.")
 
 from fastapi.middleware.cors import CORSMiddleware
 

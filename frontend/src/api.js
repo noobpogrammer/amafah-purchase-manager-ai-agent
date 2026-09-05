@@ -182,7 +182,7 @@ export async function fetchRFQDetail(rfqId) {
 }
 
 export async function triggerAIRanking(rfqId) {
-  const response = await fetch(`${API_URL}/rfq/${rfqId}/rank`, {
+  const response = await apiFetch(`/rfq/${rfqId}/rank`, {
     method: 'POST',
   });
   if (!response.ok) {
@@ -224,18 +224,19 @@ export async function fetchFlags() {
 }
 
 export async function resolveFlag(flagId) {
-  const response = await fetch(`${API_URL}/flags/${flagId}/resolve`, {
+  const response = await apiFetch(`/flags/${flagId}/resolve`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
   });
   if (!response.ok) {
-    throw new Error(`Failed to resolve flag: ${response.statusText}`);
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || `Failed to resolve flag: ${response.statusText}`);
   }
   return await response.json();
 }
 
 export async function respondToFlag(flagId, responseText, sendToSupplier = true) {
-  const response = await fetch(`${API_URL}/flags/${flagId}/respond`, {
+  const response = await apiFetch(`/flags/${flagId}/respond`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ response: responseText, send_to_supplier: sendToSupplier }),
@@ -249,12 +250,13 @@ export async function respondToFlag(flagId, responseText, sendToSupplier = true)
 
 
 export async function closeRFQ(rfqId, status = 'closed') {
-  const response = await fetch(`${API_URL}/rfq/${rfqId}/close?status=${status}`, {
+  const response = await apiFetch(`/rfq/${rfqId}/close?status=${status}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
   });
   if (!response.ok) {
-    throw new Error(`Failed to close RFQ: ${response.statusText}`);
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || `Failed to close RFQ: ${response.statusText}`);
   }
   return await response.json();
 }
