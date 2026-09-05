@@ -1,4 +1,5 @@
-import { supabase, API_URL, apiFetch, getCurrentClientId } from './supabaseClient';
+import { supabase, API_URL, authorizedFetch, apiFetch, getCurrentClientId } from './supabaseClient';
+export { authorizedFetch, apiFetch };
 
 export function formatRfqDropdownLabel(rfq) {
   if (!rfq) return '';
@@ -117,7 +118,7 @@ export async function updateSupplier(id, payload) {
 }
 
 export async function createRFQ(payload) {
-  const response = await apiFetch('/rfq/create', {
+  const response = await authorizedFetch('/rfq/create', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -137,7 +138,7 @@ export async function createRFQ(payload) {
 }
 
 export async function bulkCreateRFQs(formData) {
-  const response = await apiFetch('/rfq/bulk-create', {
+  const response = await authorizedFetch('/rfq/bulk-create', {
     method: 'POST',
     body: formData,
   });
@@ -182,7 +183,7 @@ export async function fetchRFQDetail(rfqId) {
 }
 
 export async function triggerAIRanking(rfqId) {
-  const response = await apiFetch(`/rfq/${rfqId}/rank`, {
+  const response = await authorizedFetch(`/rfq/${rfqId}/rank`, {
     method: 'POST',
   });
   if (!response.ok) {
@@ -224,7 +225,7 @@ export async function fetchFlags() {
 }
 
 export async function resolveFlag(flagId) {
-  const response = await apiFetch(`/flags/${flagId}/resolve`, {
+  const response = await authorizedFetch(`/flags/${flagId}/resolve`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
   });
@@ -236,7 +237,7 @@ export async function resolveFlag(flagId) {
 }
 
 export async function respondToFlag(flagId, responseText, sendToSupplier = true) {
-  const response = await apiFetch(`/flags/${flagId}/respond`, {
+  const response = await authorizedFetch(`/flags/${flagId}/respond`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ response: responseText, send_to_supplier: sendToSupplier }),
@@ -250,13 +251,22 @@ export async function respondToFlag(flagId, responseText, sendToSupplier = true)
 
 
 export async function closeRFQ(rfqId, status = 'closed') {
-  const response = await apiFetch(`/rfq/${rfqId}/close?status=${status}`, {
+  const response = await authorizedFetch(`/rfq/${rfqId}/close?status=${status}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
   });
   if (!response.ok) {
     const errData = await response.json().catch(() => ({}));
     throw new Error(errData.detail || `Failed to close RFQ: ${response.statusText}`);
+  }
+  return await response.json();
+}
+
+export async function fetchRFQsAudit() {
+  const response = await authorizedFetch('/rfqs/audit');
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || `Failed to fetch RFQ audit: ${response.statusText}`);
   }
   return await response.json();
 }

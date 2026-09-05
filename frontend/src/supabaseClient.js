@@ -112,16 +112,31 @@ export async function getCurrentClientId() {
 	}
 }
 
-// Helper to call backend API with the current Supabase session access token when available.
-export async function apiFetch(path, options = {}) {
-	const sessionRes = await supabase.auth.getSession();
-	const token = sessionRes?.data?.session?.access_token;
+// Single shared API client function that retrieves the current Supabase session token and attaches Authorization header
+export async function authorizedFetch(path, options = {}) {
+	let token = null;
+	try {
+		const sessionRes = await supabase.auth.getSession();
+		token = sessionRes?.data?.session?.access_token;
+		if (!token && typeof supabase?.auth?.refreshSession === 'function') {
+			const refreshRes = await supabase.auth.refreshSession();
+			token = refreshRes?.data?.session?.access_token;
+		}
+	} catch (e) {
+		console.warn('[authorizedFetch] Could not retrieve Supabase session token:', e);
+	}
+
 	const headers = Object.assign({}, options.headers || {});
 	if (token) {
 		headers['Authorization'] = `Bearer ${token}`;
 	}
-	return fetch(`${API_URL}${path}`, Object.assign({}, options, { headers }));
+
+	const url = path.startsWith('http') ? path : `${API_URL}${path.startsWith('/') ? '' : '/'}${path}`;
+	return fetch(url, Object.assign({}, options, { headers }));
 }
+
+// Backward-compatible alias
+export const apiFetch = authorizedFetch;
 
 // Wire auth state changes to clear cache on sign-out or user switch
 try {
