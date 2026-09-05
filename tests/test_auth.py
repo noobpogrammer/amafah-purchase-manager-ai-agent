@@ -1,12 +1,37 @@
-import json
+import jwt
 import pytest
 
 from fastapi.testclient import TestClient
 
+import auth
 import main
 
 
 client = TestClient(main.app)
+
+
+def test_verify_jwt_accepts_hs256_supabase_token(monkeypatch):
+    secret = "test-jwt-secret"
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", secret)
+    token = jwt.encode(
+        {"sub": "user-123", "aud": "authenticated", "role": "authenticated"},
+        secret,
+        algorithm="HS256",
+    )
+    payload = auth.verify_jwt(token)
+    assert payload["sub"] == "user-123"
+
+
+def test_verify_jwt_rejects_wrong_secret(monkeypatch):
+    monkeypatch.setenv("SUPABASE_JWT_SECRET", "correct-secret")
+    token = jwt.encode(
+        {"sub": "user-123", "aud": "authenticated"},
+        "wrong-secret",
+        algorithm="HS256",
+    )
+    with pytest.raises(Exception) as exc:
+        auth.verify_jwt(token)
+    assert getattr(exc.value, "status_code", None) == 401
 
 
 def test_missing_authorization_header_returns_401():
