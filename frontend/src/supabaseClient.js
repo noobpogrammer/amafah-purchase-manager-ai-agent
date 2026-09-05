@@ -39,6 +39,13 @@ export let supabase = _createdSupabase;
 export const DEMO_CLIENT_ID = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_DEMO_CLIENT_ID) || process.env.VITE_DEMO_CLIENT_ID || 'd88c52ad-3d0b-42e9-86f1-b9f70018856b';
 export const API_URL = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_URL) || process.env.VITE_API_URL || 'http://localhost:8000';
 
+if (typeof window !== 'undefined' && API_URL.includes('localhost') && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+	console.error(
+		`[Amafha] VITE_API_URL is "${API_URL}" but this page is served from ${window.location.origin}. ` +
+			'Set VITE_API_URL to the backend public Railway URL at frontend build time, then redeploy.'
+	);
+}
+
 // In-memory session cache for client_id resolved from `profiles`.
 let cachedClientId = null;
 let cachedUserId = null;

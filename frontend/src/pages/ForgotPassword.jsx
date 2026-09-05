@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { supabase } from '../supabaseClient';
+import AuthShell from '../components/AuthShell';
 
 export default function ForgotPassword({ navigate }) {
   const [email, setEmail] = useState('');
@@ -11,7 +12,9 @@ export default function ForgotPassword({ navigate }) {
     setLoading(true);
     setMessage(null);
     try {
-      const { data, error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: `${window.location.origin}/reset-password` });
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/reset-password`,
+      });
       if (error) setMessage({ type: 'error', text: error.message });
       else setMessage({ type: 'success', text: 'Check your email for reset instructions.' });
     } catch (err) {
@@ -22,14 +25,33 @@ export default function ForgotPassword({ navigate }) {
   };
 
   return (
-    <div className="auth-page">
-      <h2>Forgot password</h2>
+    <AuthShell
+      title="Reset your password"
+      subtitle="We’ll email a reset link if an account exists for that address."
+      footer={
+        <button type="button" className="btn-ghost auth-text-link" onClick={() => navigate('/login')}>
+          Back to sign in
+        </button>
+      }
+    >
       {message && <div className={`msg ${message.type}`}>{message.text}</div>}
       <form onSubmit={handleSubmit} className="auth-form">
-        <label>Email</label>
-        <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" required />
-        <button type="submit" disabled={loading}>{loading ? 'Sending...' : 'Send reset email'}</button>
+        <div className="form-group">
+          <label className="form-label" htmlFor="forgot-email">Email</label>
+          <input
+            id="forgot-email"
+            className="input-field input-plain"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            type="email"
+            autoComplete="email"
+            required
+          />
+        </div>
+        <button type="submit" className="btn btn-primary btn-lg auth-submit" disabled={loading}>
+          {loading ? 'Sending...' : 'Send reset email'}
+        </button>
       </form>
-    </div>
+    </AuthShell>
   );
 }

@@ -18,6 +18,12 @@ import { fetchDashboardMetrics, fetchSuppliers, fetchFlags } from './api';
 import { supabase } from './supabaseClient';
 import { ensureProfile } from './lib/ensureProfile';
 
+const PUBLIC_PATHS = ['/login', '/signup', '/forgot-password', '/reset-password'];
+
+function pathOnly(route) {
+  return (route || '/').split('?')[0];
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [selectedRfqId, setSelectedRfqId] = useState(null);
@@ -31,10 +37,10 @@ export default function App() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
 
   const [route, setRoute] = useState(window.location.pathname || '/');
+  const [session, setSession] = useState(undefined);
   const [profileLoadError, setProfileLoadError] = useState(null);
   const [profileLoading, setProfileLoading] = useState(false);
 
-  // Load Dashboard metrics
   const loadMetrics = async () => {
     setLoadingMetrics(true);
     try {
@@ -48,7 +54,6 @@ export default function App() {
     }
   };
 
-  // Load Suppliers list
   const loadSuppliers = async () => {
     setLoadingSuppliers(true);
     try {
@@ -61,7 +66,6 @@ export default function App() {
     }
   };
 
-  // Refresh flags count for navbar
   const refreshFlagsCount = async () => {
     try {
       const flags = await fetchFlags();
@@ -72,19 +76,13 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    loadMetrics();
-    loadSuppliers();
-  }, [refreshTrigger]);
-
   const handleRFQCreated = () => {
     setRefreshTrigger((prev) => prev + 1);
   };
 
-  // Simple pathname-based router helpers
   const navigate = (path) => {
     window.history.pushState({}, '', path);
-    setRoute(path);
+    setRoute(pathOnly(path));
   };
 
   useEffect(() => {
@@ -93,54 +91,141 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
-  // On app mount, if there's an active session, attempt to ensure profile
   useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const { data: sessionRes } = await supabase.auth.getSession();
+      if (!mounted) return;
+      setSession(sessionRes?.session ?? null);
+    })();
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession ?? null);
+    });
+
+    return () => {
+      mounted = false;
+      sub?.subscription?.unsubscribe?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (session === undefined) return;
+    const path = pathOnly(route);
+    const isPublic = PUBLIC_PATHS.includes(path);
+    if (!session && !isPublic) {
+      navigate('/login');
+      return;
+    }
+    if (session && (path === '/login' || path === '/signup')) {
+      navigate('/');
+    }
+  }, [session, route]);
+
+  useEffect(() => {
+    if (!session) return;
     (async () => {
       setProfileLoadError(null);
       setProfileLoading(true);
       try {
-        const { data: sessionRes } = await supabase.auth.getSession();
-        const user = sessionRes?.session?.user;
-        if (user) {
-          await ensureProfile();
-        }
+        await ensureProfile();
       } catch (err) {
         setProfileLoadError(err.message || String(err));
       } finally {
         setProfileLoading(false);
       }
     })();
-  }, []);
+  }, [session]);
 
-  // Route: map path to app/tab or standalone pages
-  if (route === '/login') {
-    return <Login navigate={navigate} onLoginSuccess={() => { setActiveTab('dashboard'); }} />;
+  useEffect(() => {
+    if (!session) return;
+    loadMetrics();
+    loadSuppliers();
+  }, [refreshTrigger, session]);
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    setActiveTab('dashboard');
+    setMetrics(null);
+    setSuppliers([]);
+    navigate('/login');
+  };
+
+  if (session === undefined) {
+    return (
+      <div className="auth-page">
+        <div className="loading-state">Checking session...</div>
+      </div>
+    );
   }
-  if (route === '/signup') {
-    return <SignUp navigate={navigate} />;
+
+  const path = pathOnly(route);
+  const isPublic = PUBLIC_PATHS.includes(path);
+
+  if (!session && isPublic) {
+    if (path === '/login') {
+      return (
+        <Login
+          navigate={navigate}
+          onLoginSuccess={() => {
+            setActiveTab('dashboard');
+          }}
+        />
+      );
+    }
+    if (path === '/signup') {
+      return <SignUp navigate={navigate} />;
+    }
+    if (path === '/forgot-password') {
+      return <ForgotPassword navigate={navigate} />;
+    }
+    if (path === '/reset-password') {
+      return <ResetPassword navigate={navigate} />;
+    }
   }
-  if (route === '/forgot-password') {
+
+  if (!session) {
+    return (
+      <div className="auth-page">
+        <div className="loading-state">Redirecting to sign in...</div>
+      </div>
+    );
+  }
+
+  const navbar = (
+    <Navbar
+      activeTab={activeTab}
+      setActiveTab={setActiveTab}
+      pendingFlagsCount={pendingFlagsCount}
+      navigate={navigate}
+      onSignOut={handleSignOut}
+    />
+  );
+
+  if (path === '/team') {
+    return (
+      <div className="app-shell">
+        {navbar}
+        <main className="app-container">
+          <TeamSettings navigate={navigate} />
+        </main>
+      </div>
+    );
+  }
+
+  if (path === '/forgot-password') {
     return <ForgotPassword navigate={navigate} />;
   }
-  if (route === '/reset-password') {
+  if (path === '/reset-password') {
     return <ResetPassword navigate={navigate} />;
   }
-  if (route === '/team') {
-    return <TeamSettings navigate={navigate} />;
-  }
 
-  // App shell
   return (
     <div className="app-shell">
-      <Navbar
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        pendingFlagsCount={pendingFlagsCount}
-        navigate={navigate}
-      />
+      {navbar}
 
       <main className="app-container">
-        {profileLoading && <div>Loading profile...</div>}
+        {profileLoading && <div className="loading-state">Loading profile...</div>}
         {profileLoadError && <div className="msg error">{profileLoadError}</div>}
 
         {activeTab === 'dashboard' && (

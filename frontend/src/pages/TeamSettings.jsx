@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { supabase, getCurrentClientId } from '../supabaseClient';
+import { supabase } from '../supabaseClient';
+import { Copy, UserPlus } from 'lucide-react';
 
 function hexEncode(bytes) {
   return Array.from(new Uint8Array(bytes)).map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -30,7 +31,7 @@ export default function TeamSettings({ navigate }) {
       if (invErr) return setMessage({ type: 'error', text: invErr.message });
       setInvitations(invs || []);
     })();
-  }, []);
+  }, [navigate]);
 
   const handleInvite = async (e) => {
     e.preventDefault();
@@ -54,12 +55,12 @@ export default function TeamSettings({ navigate }) {
       if (!clientId) throw new Error('No client_id on profile');
 
       const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-      const { data, error } = await supabase.from('invitations').insert([{ client_id: clientId, email, role, token_hash, expires_at: expiresAt, invited_by: user.id }]);
+      const { error } = await supabase.from('invitations').insert([{ client_id: clientId, email, role, token_hash, expires_at: expiresAt, invited_by: user.id }]);
       if (error) throw error;
-      setMessage({ type: 'success', text: 'Invitation created. Copy the link below.' });
+      setMessage({ type: 'success', text: 'Invitation created. Copy the link below — it is shown only once.' });
       const inviteLink = `${window.location.origin}/signup?invite=${rawHex}`;
-      // Show invite link in UI (raw token is only shown once)
       setInvitations((prev) => prev.concat([{ email, role, inviteLink }]));
+      setEmail('');
     } catch (err) {
       setMessage({ type: 'error', text: err.message || String(err) });
     } finally {
@@ -68,34 +69,101 @@ export default function TeamSettings({ navigate }) {
   };
 
   return (
-    <div className="team-settings">
-      <h2>Team Settings</h2>
+    <div className="view-container">
+      <div className="view-header">
+        <div>
+          <h2 className="view-title">Team & invites</h2>
+          <p className="view-description">Invite teammates to this procurement workspace. Admins only.</p>
+        </div>
+      </div>
+
       {message && <div className={`msg ${message.type}`}>{message.text}</div>}
 
-      <section className="invite-form">
-        <h3>Invite teammate</h3>
-        <form onSubmit={handleInvite} className="auth-form">
-          <label>Email</label>
-          <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" required />
-          <label>Role</label>
-          <select value={role} onChange={(e) => setRole(e.target.value)}>
-            <option value="member">Member</option>
-            <option value="admin">Admin</option>
-          </select>
-          <button type="submit" disabled={loading}>{loading ? 'Inviting...' : 'Invite'}</button>
-        </form>
-      </section>
+      {profile && profile.role !== 'admin' && (
+        <div className="error-alert">You need admin access to send invitations.</div>
+      )}
 
-      <section className="invitation-list">
-        <h3>Pending invitations</h3>
-        <ul>
-          {invitations.map((inv, i) => (
-            <li key={i}>
-              <strong>{inv.email}</strong> — {inv.role} {inv.inviteLink && (<div>Invite link: <input readOnly value={inv.inviteLink} onFocus={(e)=>e.target.select()} /></div>)}
-            </li>
-          ))}
-        </ul>
-      </section>
+      <div className="card">
+        <div className="card-header">
+          <h3 className="card-title flex-items">
+            <UserPlus size={18} />
+            Invite teammate
+          </h3>
+        </div>
+        <form onSubmit={handleInvite} className="auth-form">
+          <div className="form-row">
+            <div className="form-group">
+              <label className="form-label" htmlFor="invite-email">Email</label>
+              <input
+                id="invite-email"
+                className="input-field input-plain"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                type="email"
+                required
+                disabled={!profile || profile.role !== 'admin'}
+              />
+            </div>
+            <div className="form-group">
+              <label className="form-label" htmlFor="invite-role">Role</label>
+              <select
+                id="invite-role"
+                className="input-field input-plain select-input"
+                value={role}
+                onChange={(e) => setRole(e.target.value)}
+                disabled={!profile || profile.role !== 'admin'}
+              >
+                <option value="member">Member</option>
+                <option value="admin">Admin</option>
+              </select>
+            </div>
+          </div>
+          <button
+            type="submit"
+            className="btn btn-primary"
+            disabled={loading || !profile || profile.role !== 'admin'}
+          >
+            {loading ? 'Inviting...' : 'Send invite'}
+          </button>
+        </form>
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <h3 className="card-title">Pending invitations</h3>
+        </div>
+        {invitations.length === 0 ? (
+          <div className="empty-state">No pending invitations.</div>
+        ) : (
+          <ul className="invite-list">
+            {invitations.map((inv, i) => (
+              <li key={i} className="supplier-matched-chip">
+                <div>
+                  <strong>{inv.email}</strong>
+                  <span className="phone-sub">{inv.role}</span>
+                  {inv.inviteLink && (
+                    <div className="invite-link-row">
+                      <input
+                        className="input-field input-plain"
+                        readOnly
+                        value={inv.inviteLink}
+                        onFocus={(e) => e.target.select()}
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => navigator.clipboard.writeText(inv.inviteLink)}
+                      >
+                        <Copy size={14} /> Copy
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   );
 }

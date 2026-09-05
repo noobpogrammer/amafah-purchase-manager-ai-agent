@@ -7,10 +7,11 @@ import {
   MessageSquare,
   BarChart3,
   AlertTriangle,
-  Bot
+  Bot,
+  LogOut
 } from 'lucide-react';
 
-export default function Navbar({ activeTab, setActiveTab, pendingFlagsCount, navigate }) {
+export default function Navbar({ activeTab, setActiveTab, pendingFlagsCount, navigate, onSignOut }) {
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { id: 'suppliers', label: 'Suppliers', icon: Users },
@@ -29,7 +30,7 @@ export default function Navbar({ activeTab, setActiveTab, pendingFlagsCount, nav
   return (
     <header className="app-header">
       <div className="header-container">
-        <div className="brand-logo" onClick={() => setActiveTab('dashboard')}>
+        <div className="brand-logo" onClick={() => { setActiveTab('dashboard'); navigate('/'); }}>
           <div className="logo-icon-wrap">
             <Bot size={22} className="logo-icon" />
           </div>
@@ -42,11 +43,11 @@ export default function Navbar({ activeTab, setActiveTab, pendingFlagsCount, nav
         <nav className="nav-menu">
           {navItems.map((item) => {
             const Icon = item.icon;
-            const isActive = activeTab === item.id;
+            const isActive = activeTab === item.id && window.location.pathname === '/';
             return (
               <button
                 key={item.id}
-                onClick={() => setActiveTab(item.id)}
+                onClick={() => { setActiveTab(item.id); navigate('/'); }}
                 className={`nav-link ${isActive ? 'active' : ''}`}
               >
                 <Icon size={18} />
@@ -58,9 +59,11 @@ export default function Navbar({ activeTab, setActiveTab, pendingFlagsCount, nav
         </nav>
 
         <div className="auth-links">
-          <button className="nav-link small" onClick={() => navigate('/team')}>Team</button>
-          <button className="nav-link small" onClick={() => navigate('/login')}>Login</button>
-          <button className="nav-link small" onClick={() => navigate('/signup')}>Sign up</button>
+          <button className={`nav-link small ${window.location.pathname === '/team' ? 'active' : ''}`} onClick={() => navigate('/team')}>Team</button>
+          <button className="nav-link small" onClick={onSignOut}>
+            <LogOut size={16} />
+            Sign out
+          </button>
         </div>
       </div>
     </header>

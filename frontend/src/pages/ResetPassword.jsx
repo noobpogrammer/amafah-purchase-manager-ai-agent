@@ -1,18 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from '../supabaseClient';
+import AuthShell from '../components/AuthShell';
 
 export default function ResetPassword({ navigate }) {
-  const [user, setUser] = useState(null);
   const [password, setPassword] = useState('');
   const [message, setMessage] = useState(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
-      if (event === 'PASSWORD_RECOVERY' || event === 'USER_UPDATED') {
-        setUser(session?.user ?? null);
-      }
-    });
+    const { data: sub } = supabase.auth.onAuthStateChange(() => {});
     return () => sub?.subscription?.unsubscribe?.();
   }, []);
 
@@ -21,7 +17,7 @@ export default function ResetPassword({ navigate }) {
     setLoading(true);
     setMessage(null);
     try {
-      const { data, error } = await supabase.auth.updateUser({ password });
+      const { error } = await supabase.auth.updateUser({ password });
       if (error) setMessage({ type: 'error', text: error.message });
       else {
         setMessage({ type: 'success', text: 'Password updated. You can now log in.' });
@@ -35,14 +31,33 @@ export default function ResetPassword({ navigate }) {
   };
 
   return (
-    <div className="auth-page">
-      <h2>Reset password</h2>
+    <AuthShell
+      title="Choose a new password"
+      subtitle="Enter a new password for your Amafha account."
+      footer={
+        <button type="button" className="btn-ghost auth-text-link" onClick={() => navigate('/login')}>
+          Back to sign in
+        </button>
+      }
+    >
       {message && <div className={`msg ${message.type}`}>{message.text}</div>}
       <form onSubmit={handleSubmit} className="auth-form">
-        <label>New password</label>
-        <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" required />
-        <button type="submit" disabled={loading}>{loading ? 'Updating...' : 'Set new password'}</button>
+        <div className="form-group">
+          <label className="form-label" htmlFor="reset-password">New password</label>
+          <input
+            id="reset-password"
+            className="input-field input-plain"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            type="password"
+            autoComplete="new-password"
+            required
+          />
+        </div>
+        <button type="submit" className="btn btn-primary btn-lg auth-submit" disabled={loading}>
+          {loading ? 'Updating...' : 'Set new password'}
+        </button>
       </form>
-    </div>
+    </AuthShell>
   );
 }
