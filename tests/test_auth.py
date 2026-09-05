@@ -22,6 +22,30 @@ def test_verify_jwt_accepts_hs256_supabase_token(monkeypatch):
     assert payload["sub"] == "user-123"
 
 
+def test_verify_jwt_accepts_es256_jwks_token(monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_key = private_key.public_key()
+    token = jwt.encode(
+        {"sub": "user-ec", "aud": "authenticated", "role": "authenticated"},
+        private_key,
+        algorithm="ES256",
+        headers={"kid": "test-ec"},
+    )
+
+    class FakeSigningKey:
+        key = public_key
+
+    class FakeClient:
+        def get_signing_key_from_jwt(self, _token):
+            return FakeSigningKey()
+
+    monkeypatch.setattr(auth, "_get_jwks_client", lambda: FakeClient())
+    payload = auth.verify_jwt(token)
+    assert payload["sub"] == "user-ec"
+
+
 def test_verify_jwt_rejects_wrong_secret(monkeypatch):
     monkeypatch.setenv("SUPABASE_JWT_SECRET", "correct-secret")
     token = jwt.encode(
