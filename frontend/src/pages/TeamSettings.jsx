@@ -1,16 +1,17 @@
 import React, { useEffect, useState } from 'react';
 import { supabase } from '../supabaseClient';
-import { inviteUser } from '../api';
-import { Copy, UserPlus, Users, Mail } from 'lucide-react';
+import { createInviteToken } from '../api';
+import { Copy, UserPlus, Users, Link as LinkIcon, Check } from 'lucide-react';
 
 export default function TeamSettings({ navigate }) {
   const [profile, setProfile] = useState(null);
-  const [invitations, setInvitations] = useState([]);
+  const [pendingTokens, setPendingTokens] = useState([]);
   const [teamMembers, setTeamMembers] = useState([]);
-  const [email, setEmail] = useState('');
   const [role, setRole] = useState('member');
   const [message, setMessage] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [latestInviteLink, setLatestInviteLink] = useState(null);
+  const [copied, setCopied] = useState(false);
 
   const loadData = async () => {
     const sessionRes = await supabase.auth.getSession();
@@ -24,15 +25,20 @@ export default function TeamSettings({ navigate }) {
     if (data.role !== 'admin') return setMessage({ type: 'error', text: 'Admin access required' });
 
     const clientId = data.client_id;
-    const [invsRes, membersRes] = await Promise.all([
-      supabase.from('invitations').select('*').eq('client_id', clientId).is('accepted_at', null).order('created_at', { ascending: false }),
+    const [tokensRes, membersRes] = await Promise.all([
+      supabase
+        .from('invite_tokens')
+        .select('*')
+        .eq('client_id', clientId)
+        .is('used_at', null)
+        .order('created_at', { ascending: false }),
       supabase.from('profiles').select('*').eq('client_id', clientId).order('created_at', { ascending: false }),
     ]);
 
-    if (invsRes.error) console.error('Error fetching invitations:', invsRes.error);
+    if (tokensRes.error) console.error('Error fetching invite tokens:', tokensRes.error);
     if (membersRes.error) console.error('Error fetching members:', membersRes.error);
 
-    setInvitations(invsRes.data || []);
+    setPendingTokens(tokensRes.data || []);
     setTeamMembers(membersRes.data || []);
   };
 
@@ -40,17 +46,19 @@ export default function TeamSettings({ navigate }) {
     loadData();
   }, [navigate]);
 
-  const handleInvite = async (e) => {
+  const handleGenerateLink = async (e) => {
     e.preventDefault();
     setMessage(null);
     setLoading(true);
+    setCopied(false);
     try {
-      const res = await inviteUser({ email, role });
+      const res = await createInviteToken({ role });
+      const inviteUrl = `${window.location.origin}/accept-invite?token=${res.token}`;
+      setLatestInviteLink(inviteUrl);
       setMessage({
         type: 'success',
-        text: `Invitation email sent to ${email}. The user will receive an email from Supabase to accept and join the team.`,
+        text: 'Invitation link generated! Copy and send it to your teammate.',
       });
-      setEmail('');
       await loadData();
     } catch (err) {
       setMessage({ type: 'error', text: err.message || String(err) });
@@ -59,6 +67,11 @@ export default function TeamSettings({ navigate }) {
     }
   };
 
+  const copyToClipboard = (text) => {
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2500);
+  };
 
   return (
     <div className="view-container">
@@ -72,32 +85,20 @@ export default function TeamSettings({ navigate }) {
       {message && <div className={`msg ${message.type}`}>{message.text}</div>}
 
       {profile && profile.role !== 'admin' && (
-        <div className="error-alert">You need admin access to send invitations.</div>
+        <div className="error-alert">You need admin access to generate team invitations.</div>
       )}
 
       <div className="card">
         <div className="card-header">
           <h3 className="card-title flex-items">
             <UserPlus size={18} />
-            Invite teammate
+            Generate invite link
           </h3>
         </div>
-        <form onSubmit={handleInvite} className="auth-form">
+        <form onSubmit={handleGenerateLink} className="auth-form">
           <div className="form-row">
             <div className="form-group">
-              <label className="form-label" htmlFor="invite-email">Email</label>
-              <input
-                id="invite-email"
-                className="input-field input-plain"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                type="email"
-                required
-                disabled={!profile || profile.role !== 'admin'}
-              />
-            </div>
-            <div className="form-group">
-              <label className="form-label" htmlFor="invite-role">Role</label>
+              <label className="form-label" htmlFor="invite-role">Assign Role</label>
               <select
                 id="invite-role"
                 className="input-field input-plain select-input"
@@ -105,8 +106,8 @@ export default function TeamSettings({ navigate }) {
                 onChange={(e) => setRole(e.target.value)}
                 disabled={!profile || profile.role !== 'admin'}
               >
-                <option value="member">Member</option>
-                <option value="admin">Admin</option>
+                <option value="member">Member (Regular access)</option>
+                <option value="admin">Admin (Manage team & settings)</option>
               </select>
             </div>
           </div>
@@ -115,9 +116,35 @@ export default function TeamSettings({ navigate }) {
             className="btn btn-primary"
             disabled={loading || !profile || profile.role !== 'admin'}
           >
-            {loading ? 'Inviting...' : 'Send invite'}
+            {loading ? 'Generating...' : 'Create shareable invite link'}
           </button>
         </form>
+
+        {latestInviteLink && (
+          <div style={{ marginTop: '1.25rem', padding: '1rem', background: 'rgba(255,255,255,0.03)', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)' }}>
+            <label className="form-label flex-items" style={{ marginBottom: '0.5rem', color: '#10b981' }}>
+              <LinkIcon size={16} /> Shareable Invite Link:
+            </label>
+            <div className="invite-link-row">
+              <input
+                className="input-field input-plain"
+                readOnly
+                value={latestInviteLink}
+                onFocus={(e) => e.target.select()}
+              />
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={() => copyToClipboard(latestInviteLink)}
+              >
+                {copied ? <><Check size={14} /> Copied</> : <><Copy size={14} /> Copy link</>}
+              </button>
+            </div>
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary, #888)', marginTop: '0.5rem' }}>
+              This link is single-use and valid for 7 days. Once the user creates their account, they will automatically be assigned to this workspace.
+            </p>
+          </div>
+        )}
       </div>
 
       <div className="card">
@@ -143,44 +170,50 @@ export default function TeamSettings({ navigate }) {
         )}
       </div>
 
-      {invitations.length > 0 && (
+      {pendingTokens.length > 0 && (
         <div className="card">
           <div className="card-header">
             <h3 className="card-title flex-items">
-              <Mail size={18} />
-              Pending invitations ({invitations.length})
+              <LinkIcon size={18} />
+              Active invitation links ({pendingTokens.length})
             </h3>
           </div>
           <ul className="invite-list">
-            {invitations.map((inv, i) => (
-              <li key={i} className="supplier-matched-chip">
-                <div>
-                  <strong>{inv.email}</strong>
-                  <span className="phone-sub">{inv.role}</span>
-                  {inv.inviteLink && (
+            {pendingTokens.map((tok) => {
+              const url = `${window.location.origin}/accept-invite?token=${tok.token}`;
+              return (
+                <li key={tok.id} className="supplier-matched-chip">
+                  <div style={{ width: '100%' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.25rem' }}>
+                      <span className="phone-sub">Role: {tok.role}</span>
+                      <span className="phone-sub" style={{ fontSize: '0.75rem' }}>
+                        Created: {new Date(tok.created_at).toLocaleDateString()}
+                      </span>
+                    </div>
                     <div className="invite-link-row">
                       <input
                         className="input-field input-plain"
                         readOnly
-                        value={inv.inviteLink}
+                        value={url}
                         onFocus={(e) => e.target.select()}
                       />
                       <button
                         type="button"
                         className="btn btn-secondary btn-sm"
-                        onClick={() => navigator.clipboard.writeText(inv.inviteLink)}
+                        onClick={() => copyToClipboard(url)}
                       >
                         <Copy size={14} /> Copy
                       </button>
                     </div>
-                  )}
-                </div>
-              </li>
-            ))}
+                  </div>
+                </li>
+              );
+            })}
           </ul>
         </div>
       )}
     </div>
   );
 }
+
 

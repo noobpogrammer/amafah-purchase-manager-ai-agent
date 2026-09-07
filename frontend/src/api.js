@@ -336,17 +336,35 @@ export async function createCustomCategory(categoryName) {
   return cleanName;
 }
 
-export async function inviteUser({ email, role = 'member' }) {
+export async function createInviteToken({ role = 'member', email = null }) {
   const response = await authorizedFetch('/admin/invite', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, role }),
+    body: JSON.stringify({ role, email }),
   });
   if (!response.ok) {
     const errData = await response.json().catch(() => ({}));
-    throw new Error(errData.detail || 'Failed to send invitation');
+    throw new Error(errData.detail || 'Failed to generate invitation link');
   }
   return await response.json();
 }
 
+export async function validateInviteToken(token) {
+  const response = await apiFetch(`/invite/${encodeURIComponent(token)}`);
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Invalid or expired invitation link');
+  }
+  return await response.json();
+}
 
+export async function claimInviteToken(token) {
+  const response = await apiFetch(`/invite/${encodeURIComponent(token)}/claim`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Failed to claim invitation');
+  }
+  return await response.json();
+}

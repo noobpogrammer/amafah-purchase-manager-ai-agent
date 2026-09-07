@@ -4,6 +4,8 @@ plugged in whenever the Supabase project is ready.
 """
 
 import os
+import secrets
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 load_dotenv()
 from supabase import create_client, Client
@@ -12,6 +14,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 
 
 def clean_phone(phone: str) -> str:
@@ -88,8 +91,56 @@ def get_profile_by_id(user_id: str):
     """
     if not user_id:
         return None
-    res = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+    res = supabase.table("profiles").select("*").eq("id", user_id).maybe_single().execute()
     return res.data
+
+
+def create_invite_token(client_id: str, role: str = "member", created_by: str = None, expires_in_days: int = 7) -> dict:
+    """Generates an opaque URL-safe invite token and inserts it into invite_tokens."""
+    token = secrets.token_urlsafe(32)
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=expires_in_days)).isoformat()
+    row = {
+        "token": token,
+        "client_id": client_id,
+        "role": role if role in ("admin", "member") else "member",
+        "created_by": created_by,
+        "expires_at": expires_at,
+    }
+    res = supabase.table("invite_tokens").insert(row).execute()
+    return res.data[0] if res.data else row
+
+
+def get_invite_token(token: str) -> dict | None:
+    """Retrieves an invite token row from invite_tokens."""
+    if not token:
+        return None
+    res = supabase.table("invite_tokens").select("*").eq("token", token).maybe_single().execute()
+    return res.data
+
+
+def mark_invite_token_used(token: str) -> dict | None:
+    """Marks an invite token as used at the current timestamp."""
+    if not token:
+        return None
+    now_iso = datetime.now(timezone.utc).isoformat()
+    res = supabase.table("invite_tokens").update({"used_at": now_iso}).eq("token", token).execute()
+    return res.data[0] if res.data else None
+
+
+def list_invite_tokens(client_id: str) -> list[dict]:
+    """Lists pending unused invite tokens for a client."""
+    if not client_id:
+        return []
+    res = (
+        supabase.table("invite_tokens")
+        .select("*")
+        .eq("client_id", client_id)
+        .is_("used_at", "null")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return res.data or []
+
 
 
 def create_supplier(client_id: str, name: str, phone_number: str, categories: list[str] = None, notes: str = None):

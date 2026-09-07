@@ -1114,17 +1114,17 @@ async def close_rfq_endpoint(rfq_id: str, status: str = "closed", current_user=D
     return {"status": status, "rfq": result}
 
 
-class InviteUserRequest(BaseModel):
-    email: str
+class InviteCreateRequest(BaseModel):
     role: str = "member"
+    email: Optional[str] = None
 
 
 @app.post("/admin/invite")
 async def invite_user_endpoint(
-    req: InviteUserRequest,
+    req: InviteCreateRequest,
     current_user=Depends(get_current_user),
 ):
-    """Admin-only endpoint to send a team invitation via Supabase Admin API."""
+    """Admin-only endpoint to generate a secure opaque invite link for a team member."""
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin role required")
 
@@ -1132,38 +1132,63 @@ async def invite_user_endpoint(
     if not client_id:
         raise HTTPException(status_code=400, detail="User has no associated client_id")
 
-    email = req.email.strip().lower()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Valid email is required")
-
     role = req.role.strip().lower() if req.role in ("admin", "member") else "member"
+
+    token_row = db.create_invite_token(
+        client_id=client_id,
+        role=role,
+        created_by=current_user.get("user_id"),
+    )
 
     frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
     if not frontend_url:
         frontend_url = "https://powerful-rebirth-production.up.railway.app"
 
-    redirect_to = f"{frontend_url}/accept-invite"
+    invite_link = f"{frontend_url}/accept-invite?token={token_row['token']}"
 
-    try:
-        invite_res = db.supabase.auth.admin.invite_user_by_email(
-            email,
-            options={
-                "data": {
-                    "client_id": client_id,
-                    "role": role,
-                },
-                "redirect_to": redirect_to,
-            },
-        )
-        user_id = getattr(getattr(invite_res, "user", None), "id", None)
-        return {
-            "status": "success",
-            "message": f"Invitation sent to {email}",
-            "email": email,
-            "role": role,
-            "user_id": user_id,
-        }
-    except Exception as e:
-        print(f"Error inviting user {email}: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "status": "success",
+        "token": token_row["token"],
+        "invite_link": invite_link,
+        "role": role,
+        "client_id": client_id,
+        "expires_at": token_row.get("expires_at"),
+    }
+
+
+@app.get("/invite/{token}")
+async def get_invite_details_endpoint(token: str):
+    """Public endpoint to validate an invite token and retrieve target client_id/role."""
+    token_row = db.get_invite_token(token)
+    if not token_row:
+        raise HTTPException(status_code=404, detail="Invitation not found or invalid")
+
+    if token_row.get("used_at"):
+        raise HTTPException(status_code=410, detail="This invitation link has already been used")
+
+    expires_at_str = token_row.get("expires_at")
+    if expires_at_str:
+        try:
+            expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) > expires_at:
+                raise HTTPException(status_code=410, detail="This invitation link has expired")
+        except Exception:
+            pass
+
+    return {
+        "status": "valid",
+        "client_id": token_row["client_id"],
+        "role": token_row.get("role", "member"),
+    }
+
+
+@app.post("/invite/{token}/claim")
+async def claim_invite_token_endpoint(token: str):
+    """Public endpoint to mark an invite token as used after successful signup."""
+    token_row = db.get_invite_token(token)
+    if not token_row:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    db.mark_invite_token_used(token)
+    return {"status": "claimed"}
+
 

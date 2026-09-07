@@ -158,7 +158,7 @@ def test_flags_endpoints_succeed_with_valid_jwt(monkeypatch):
 
 def test_admin_invite_requires_auth_and_admin(monkeypatch):
     # 1. Missing auth -> 401
-    r = client.post("/admin/invite", json={"email": "teammate@example.com", "role": "member"})
+    r = client.post("/admin/invite", json={"role": "member"})
     assert r.status_code == 401
 
     # 2. Member role -> 403
@@ -167,7 +167,7 @@ def test_admin_invite_requires_auth_and_admin(monkeypatch):
     monkeypatch.setattr(db, "get_profile_by_id", lambda uid: {"id": uid, "client_id": "client-abc", "role": "member"})
 
     headers = {"Authorization": "Bearer membertoken"}
-    r = client.post("/admin/invite", json={"email": "teammate@example.com", "role": "member"}, headers=headers)
+    r = client.post("/admin/invite", json={"role": "member"}, headers=headers)
     assert r.status_code == 403
     assert "Admin role required" in r.json().get("detail", "")
 
@@ -176,32 +176,65 @@ def test_admin_invite_succeeds_for_admin(monkeypatch):
     monkeypatch.setattr(auth, "verify_jwt", lambda token: {"sub": "user-admin"})
     import db
     monkeypatch.setattr(db, "get_profile_by_id", lambda uid: {"id": uid, "client_id": "client-abc", "role": "admin"})
-
-    captured_call = {}
-
-    class FakeUser:
-        id = "new-invited-uuid"
-
-    class FakeInviteResponse:
-        user = FakeUser()
-
-    def fake_invite(email, options=None):
-        captured_call["email"] = email
-        captured_call["options"] = options
-        return FakeInviteResponse()
-
-    monkeypatch.setattr(db.supabase.auth.admin, "invite_user_by_email", fake_invite)
+    monkeypatch.setattr(db, "create_invite_token", lambda client_id, role, created_by: {
+        "token": "test-opaque-token-123",
+        "client_id": client_id,
+        "role": role,
+        "created_by": created_by,
+        "expires_at": "2026-09-14T00:00:00+00:00",
+    })
 
     headers = {"Authorization": "Bearer admintoken"}
-    r = client.post("/admin/invite", json={"email": "teammate@example.com", "role": "member"}, headers=headers)
+    r = client.post("/admin/invite", json={"role": "member"}, headers=headers)
     assert r.status_code == 200
     data = r.json()
     assert data["status"] == "success"
-    assert data["email"] == "teammate@example.com"
-    assert data["user_id"] == "new-invited-uuid"
-    assert captured_call["email"] == "teammate@example.com"
-    assert captured_call["options"]["data"]["client_id"] == "client-abc"
-    assert captured_call["options"]["data"]["role"] == "member"
-    assert "accept-invite" in captured_call["options"]["redirect_to"]
+    assert data["token"] == "test-opaque-token-123"
+    assert "/accept-invite?token=test-opaque-token-123" in data["invite_link"]
+    assert data["client_id"] == "client-abc"
+    assert data["role"] == "member"
+
+
+def test_get_invite_token_lifecycle(monkeypatch):
+    import db
+
+    # 1. Non-existent token -> 404
+    monkeypatch.setattr(db, "get_invite_token", lambda t: None)
+    r = client.get("/invite/invalid-token")
+    assert r.status_code == 404
+
+    # 2. Already used token -> 410
+    monkeypatch.setattr(db, "get_invite_token", lambda t: {
+        "token": t,
+        "client_id": "client-abc",
+        "role": "member",
+        "used_at": "2026-09-07T00:00:00+00:00",
+        "expires_at": "2026-09-14T00:00:00+00:00",
+    })
+    r = client.get("/invite/used-token")
+    assert r.status_code == 410
+    assert "already been used" in r.json().get("detail", "")
+
+    # 3. Valid active token -> 200
+    monkeypatch.setattr(db, "get_invite_token", lambda t: {
+        "token": t,
+        "client_id": "client-abc",
+        "role": "admin",
+        "used_at": None,
+        "expires_at": "2099-01-01T00:00:00+00:00",
+    })
+    r = client.get("/invite/valid-token")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "valid"
+    assert data["client_id"] == "client-abc"
+    assert data["role"] == "admin"
+
+    # 4. Claim token -> 200
+    monkeypatch.setattr(db, "mark_invite_token_used", lambda t: {"token": t, "used_at": "2026-09-07T00:00:00"})
+    r = client.post("/invite/valid-token/claim")
+    assert r.status_code == 200
+    assert r.json() == {"status": "claimed"}
+
 
 
