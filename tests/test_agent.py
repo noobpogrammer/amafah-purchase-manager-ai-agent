@@ -669,7 +669,8 @@ class TestRFQCreationValidation:
         mock_suppliers = [{"id": "s-1", "name": "Supplier 1", "phone_number": "923362853198"}]
 
         with patch.object(db, "create_rfq_and_match_suppliers", return_value=(mock_rfq_data[0], mock_suppliers)) as mock_create, \
-             patch.object(main, "enqueue_message", new_callable=AsyncMock):
+             patch.object(main, "enqueue_message", new_callable=AsyncMock) as mock_enqueue, \
+             patch.object(db, "log_message") as mock_log:
             from fastapi.testclient import TestClient
             import auth as _auth
             client = TestClient(main.app)
@@ -686,6 +687,12 @@ class TestRFQCreationValidation:
         assert response.status_code == 200, response.text
         assert response.json()["created_count"] == 1
         mock_create.assert_called_once()
+        mock_log.assert_called_once()
+        mock_enqueue.assert_called_once()
+        enqueue_args = mock_enqueue.call_args[0]
+        assert enqueue_args[0] == "923362853198"
+        assert "MULTI PURPOSE LADDER ALUMINIUM 4X5" in enqueue_args[1]
+        assert "Required Within: 24 hours" in enqueue_args[1]
 
     @pytest.mark.asyncio
     async def test_bulk_create_rfq_endpoint_uses_row_level_overrides_and_deadlines(self, mock_supabase):
@@ -695,7 +702,8 @@ class TestRFQCreationValidation:
         mock_suppliers = [{"id": "s-2", "name": "Supplier 2", "phone_number": "923362853199"}]
 
         with patch.object(db, "create_rfq_and_match_suppliers", return_value=(mock_rfq_data[0], mock_suppliers)) as mock_create, \
-             patch.object(main, "enqueue_message", new_callable=AsyncMock):
+             patch.object(main, "enqueue_message", new_callable=AsyncMock) as mock_enqueue, \
+             patch.object(db, "log_message") as mock_log:
             from fastapi.testclient import TestClient
             import auth as _auth
             client = TestClient(main.app)
@@ -723,6 +731,12 @@ class TestRFQCreationValidation:
             specs=None,
             quantity=99,
         )
+        mock_log.assert_called_once()
+        mock_enqueue.assert_called_once()
+        enqueue_args = mock_enqueue.call_args[0]
+        assert enqueue_args[0] == "923362853199"
+        assert "Updated Pipe" in enqueue_args[1]
+        assert "Required Within: 12 hours" in enqueue_args[1]
 
 
 

@@ -1028,6 +1028,22 @@ async def bulk_create_rfq_endpoint(
             quantity=final_quantity,
         )
 
+        if matched_suppliers:
+            rfq_msg = (
+                f"Hi! This is Amafha Hardware Store.\n"
+                f"We're requesting a quote for the following item:\n\n"
+                f"• Product: {final_product_name}\n"
+                f"• Specs: {final_specs or 'Standard'}\n"
+                f"• Quantity: {final_quantity or 'N/A'}\n"
+                f"• Required Within: {final_deadline} hours\n\n"
+                f"Please reply directly to this message with your price per unit (AED) and estimated delivery time. Thanks!"
+            )
+            for supplier in matched_suppliers:
+                phone = supplier.get("phone_number")
+                if phone:
+                    db.log_message(tenant_client_id, supplier["id"], "outbound", rfq_msg, related_rfq_id=rfq["id"])
+                    await enqueue_message(phone, rfq_msg, rfq_id=rfq["id"], supplier_id=supplier["id"])
+
         created_rfqs.append({
             "rfq_id": rfq["id"],
             "product_name": final_product_name,
