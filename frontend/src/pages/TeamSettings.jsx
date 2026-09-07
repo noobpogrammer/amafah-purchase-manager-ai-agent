@@ -44,6 +44,23 @@ export default function TeamSettings({ navigate }) {
 
   useEffect(() => {
     loadData();
+
+    const handleFocus = () => {
+      loadData();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        loadData();
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, [navigate]);
 
   const handleGenerateLink = async (e) => {
