@@ -2,6 +2,11 @@ import React, { useState, useEffect } from 'react';
 import { fetchRFQs, fetchRFQDetail, triggerAIRanking, formatRfqDropdownLabel } from '../api';
 import { Sparkles, Trophy, CheckCircle, BarChart3, AlertCircle, Clock } from 'lucide-react';
 
+const formatCurrencyInText = (text) => {
+  if (!text || typeof text !== 'string') return text;
+  return text.replace(/\$(\d+(?:\.\d+)?)/g, 'AED $1');
+};
+
 export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
   const [rfqs, setRfqs] = useState([]);
   const [reportData, setReportData] = useState(null);
@@ -63,12 +68,24 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
   const quotes = reportData?.quotes || [];
   const ranking = reportData?.ranking;
 
+  const getSupplierName = (supplierId) => {
+    if (!supplierId) return null;
+    const quoteMatch = quotes.find((q) => q.supplier_id === supplierId);
+    if (quoteMatch?.suppliers?.name) return quoteMatch.suppliers.name;
+    const supplierMatch = reportData?.suppliers?.find(
+      (s) => s.supplier_id === supplierId || s.suppliers?.id === supplierId || s.id === supplierId
+    );
+    if (supplierMatch?.suppliers?.name) return supplierMatch.suppliers.name;
+    if (supplierMatch?.name) return supplierMatch.name;
+    return null;
+  };
+
   // Find best supplier name from ranking
   let bestSupplierName = 'Best Supplier';
   if (ranking?.best_supplier_id) {
-    const matched = quotes.find((q) => q.supplier_id === ranking.best_supplier_id);
-    if (matched && matched.suppliers?.name) {
-      bestSupplierName = matched.suppliers.name;
+    const matched = getSupplierName(ranking.best_supplier_id);
+    if (matched) {
+      bestSupplierName = matched;
     }
   }
 
@@ -132,7 +149,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                 <Trophy size={20} className="trophy-icon" /> AI Optimal Choice
               </div>
               <h3 className="hero-supplier-name">AI Recommends: {bestSupplierName}</h3>
-              <p className="hero-reasoning">{ranking.reasoning}</p>
+              <p className="hero-reasoning">{formatCurrencyInText(ranking.reasoning)}</p>
             </div>
           ) : (
             <div className="card alert-banner info-banner">
@@ -212,15 +229,22 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                 </h4>
               </div>
               <div className="ranking-breakdown-list">
-                {ranking.ranking_json.ranking.map((item, idx) => (
-                  <div key={idx} className="ranking-item">
-                    <div className="rank-badge">#{item.rank}</div>
-                    <div className="rank-details">
-                      <strong>Supplier ID: {item.supplier_id}</strong>
-                      <p>{item.summary}</p>
+                {ranking.ranking_json.ranking.map((item, idx) => {
+                  const supplierName = getSupplierName(item.supplier_id);
+                  return (
+                    <div key={idx} className="ranking-item">
+                      <div className="rank-badge">#{item.rank}</div>
+                      <div className="rank-details">
+                        <strong>
+                          {supplierName
+                            ? `${supplierName} (ID: ${item.supplier_id})`
+                            : `Supplier ID: ${item.supplier_id}`}
+                        </strong>
+                        <p>{formatCurrencyInText(item.summary)}</p>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}

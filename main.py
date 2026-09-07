@@ -259,7 +259,7 @@ def format_prior_quotes_context(prior_quotes: list) -> str:
     for q in prior_quotes:
         product = q.get("rfqs", {}).get("product_name", "Unknown Product") if isinstance(q.get("rfqs"), dict) else "Unknown Product"
         lines.append(
-            f"- Product: {product} | RFQ ID: {q['rfq_id']} | Price: ${q['price']} | "
+            f"- Product: {product} | RFQ ID: {q['rfq_id']} | Price: AED {q['price']} | "
             f"Delivery: {q.get('delivery_time', '-')} | Notes: {q.get('quality_notes', '-')}"
         )
     return "\n".join(lines)
@@ -271,7 +271,7 @@ def generate_ranking(rfq_id: str) -> dict:
     if not quotes:
         return {"error": "No quotes found for this RFQ"}
     quotes_summary = "\n".join(
-        f"- Supplier ID: {q['supplier_id']} (Name: {q['suppliers']['name']}): ${q['price']}, delivery: {q.get('delivery_time', '-')}, "
+        f"- Supplier ID: {q['supplier_id']} (Name: {q['suppliers']['name']}): AED {q['price']}, delivery: {q.get('delivery_time', '-')}, "
         f"notes: {q.get('quality_notes', '-')}"
         for q in quotes
     )
