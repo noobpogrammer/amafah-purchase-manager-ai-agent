@@ -692,7 +692,7 @@ class TestRFQCreationValidation:
         enqueue_args = mock_enqueue.call_args[0]
         assert enqueue_args[0] == "923362853198"
         assert "MULTI PURPOSE LADDER ALUMINIUM 4X5" in enqueue_args[1]
-        assert "Required Within: 24 hours" in enqueue_args[1]
+        assert "Quote Required Within: 24 hour(s)" in enqueue_args[1]
 
     @pytest.mark.asyncio
     async def test_bulk_create_rfq_endpoint_uses_row_level_overrides_and_deadlines(self, mock_supabase):
@@ -736,7 +736,7 @@ class TestRFQCreationValidation:
         enqueue_args = mock_enqueue.call_args[0]
         assert enqueue_args[0] == "923362853199"
         assert "Updated Pipe" in enqueue_args[1]
-        assert "Required Within: 12 hours" in enqueue_args[1]
+        assert "Quote Required Within: 12 hour(s)" in enqueue_args[1]
 
 
 

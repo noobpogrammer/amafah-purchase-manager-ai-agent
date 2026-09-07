@@ -902,7 +902,7 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
         f"• Product: {req.product_name}\n"
         f"• Specs: {req.specs or 'Standard'}\n"
         f"• Quantity: {req.quantity or 'N/A'}\n"
-        f"• Required Within: {req.deadline_hours} hours\n\n"
+        f"• Quote Required Within: {req.deadline_hours} hour(s)\n\n"
         f"Please reply directly to this message with your price per unit (AED) and estimated delivery time. Thanks!"
     )
 
@@ -1035,7 +1035,7 @@ async def bulk_create_rfq_endpoint(
                 f"• Product: {final_product_name}\n"
                 f"• Specs: {final_specs or 'Standard'}\n"
                 f"• Quantity: {final_quantity or 'N/A'}\n"
-                f"• Required Within: {final_deadline} hours\n\n"
+                f"• Quote Required Within: {final_deadline} hour(s)\n\n"
                 f"Please reply directly to this message with your price per unit (AED) and estimated delivery time. Thanks!"
             )
             for supplier in matched_suppliers:
