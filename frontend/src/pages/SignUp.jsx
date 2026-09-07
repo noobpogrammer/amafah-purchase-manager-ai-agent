@@ -42,12 +42,8 @@ export default function SignUp({ navigate }) {
 
   return (
     <AuthShell
-      title={inviteToken ? 'Join your team' : 'Create your account'}
-      subtitle={
-        inviteToken
-          ? 'You were invited to Amafha. Create an account to accept the invite after email verification.'
-          : 'Set up access to the Procurement Command Center.'
-      }
+      title="Create your account"
+      subtitle="Set up access to the Procurement Command Center."
       footer={
         <>
           Already have an account?{' '}
@@ -57,18 +53,9 @@ export default function SignUp({ navigate }) {
         </>
       }
     >
-      {inviteToken && (
-        <div className="alert-banner info-banner auth-invite-banner">
-          <div className="alert-content">
-            <div>
-              <strong>Team invitation detected</strong>
-              <p>This signup is linked to a pending invite token.</p>
-            </div>
-          </div>
-        </div>
-      )}
       {message && <div className={`msg ${message.type}`}>{message.text}</div>}
       <form onSubmit={handleSubmit} className="auth-form">
+
         <div className="form-group">
           <label className="form-label" htmlFor="signup-email">Email</label>
           <input
