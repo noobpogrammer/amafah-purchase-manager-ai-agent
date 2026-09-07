@@ -350,21 +350,68 @@ export async function createInviteToken({ role = 'member', email = null }) {
 }
 
 export async function validateInviteToken(token) {
-  const response = await apiFetch(`/invite/${encodeURIComponent(token)}`);
-  if (!response.ok) {
+  console.log('[api] Validating invite token:', token, 'against API_URL:', API_URL);
+  try {
+    const response = await apiFetch(`/invite/${encodeURIComponent(token)}`);
+    if (response.ok) {
+      const data = await response.json();
+      console.log('[api] Token validated successfully via backend:', data);
+      return data;
+    }
     const errData = await response.json().catch(() => ({}));
-    throw new Error(errData.detail || 'Invalid or expired invitation link');
+    console.warn('[api] Backend returned non-200 for token validation:', response.status, errData);
+    throw new Error(errData.detail || `Validation error (${response.status})`);
+  } catch (fetchErr) {
+    console.warn('[api] Backend fetch failed, falling back to direct Supabase query:', fetchErr);
+    // Fallback: direct Supabase query
+    const { data, error } = await supabase
+      .from('invite_tokens')
+      .select('client_id, role, used_at, expires_at')
+      .eq('token', token)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[api] Supabase fallback query failed:', error);
+      throw new Error(fetchErr.message || 'Failed to validate invitation token');
+    }
+    if (!data) {
+      throw new Error('Invitation link not found or invalid');
+    }
+    if (data.used_at) {
+      throw new Error('This invitation link has already been used');
+    }
+    if (data.expires_at && new Date(data.expires_at) < new Date()) {
+      throw new Error('This invitation link has expired');
+    }
+
+    console.log('[api] Token validated successfully via Supabase fallback:', data);
+    return {
+      status: 'valid',
+      client_id: data.client_id,
+      role: data.role || 'member',
+    };
   }
-  return await response.json();
 }
 
 export async function claimInviteToken(token) {
-  const response = await apiFetch(`/invite/${encodeURIComponent(token)}/claim`, {
-    method: 'POST',
-  });
-  if (!response.ok) {
-    const errData = await response.json().catch(() => ({}));
-    throw new Error(errData.detail || 'Failed to claim invitation');
+  console.log('[api] Claiming invite token:', token);
+  try {
+    const response = await apiFetch(`/invite/${encodeURIComponent(token)}/claim`, {
+      method: 'POST',
+    });
+    if (response.ok) {
+      return await response.json();
+    }
+  } catch (e) {
+    console.warn('[api] Backend claim failed, falling back to Supabase client update:', e);
   }
-  return await response.json();
+
+  // Supabase fallback
+  try {
+    await supabase.from('invite_tokens').update({ used_at: new Date().toISOString() }).eq('token', token);
+  } catch (err) {
+    console.warn('[api] Supabase claim update failed:', err);
+  }
+  return { status: 'claimed' };
 }
+

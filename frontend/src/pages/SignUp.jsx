@@ -8,20 +8,15 @@ export default function SignUp({ navigate }) {
   const [confirm, setConfirm] = useState('');
   const [message, setMessage] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [inviteToken, setInviteToken] = useState(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const invite = params.get('invite');
-    if (invite) {
-      setInviteToken(invite);
-      try {
-        sessionStorage.setItem('pending_invite_token', invite);
-      } catch (e) {
-        // ignore
-      }
+    const token = params.get('token') || params.get('invite');
+    if (token) {
+      navigate(`/accept-invite?token=${encodeURIComponent(token)}`);
     }
-  }, []);
+  }, [navigate]);
+
 
   const handleSubmit = async (e) => {
     e.preventDefault();

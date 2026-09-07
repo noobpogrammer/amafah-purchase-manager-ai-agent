@@ -18,6 +18,9 @@ export default function AcceptInvite({ navigate }) {
     const params = new URLSearchParams(window.location.search);
     const urlToken = params.get('token') || sessionStorage.getItem('pending_invite_token');
 
+    console.log('[AcceptInvite] URL:', window.location.href);
+    console.log('[AcceptInvite] Extracted token from URL/session:', urlToken);
+
     if (!urlToken) {
       setValidating(false);
       setMessage({
@@ -37,9 +40,12 @@ export default function AcceptInvite({ navigate }) {
     (async () => {
       setValidating(true);
       try {
+        console.log('[AcceptInvite] Initiating token validation for:', urlToken);
         const info = await validateInviteToken(urlToken);
+        console.log('[AcceptInvite] Resolved invite token payload:', info);
         setInviteInfo(info);
       } catch (err) {
+        console.error('[AcceptInvite] Token validation failed:', err);
         setMessage({
           type: 'error',
           text: err.message || 'This invitation link is invalid, expired, or has already been used.',
@@ -54,7 +60,10 @@ export default function AcceptInvite({ navigate }) {
     e.preventDefault();
     setMessage(null);
 
+    console.log('[AcceptInvite] Submit triggered. inviteInfo:', inviteInfo);
+
     if (!inviteInfo || !inviteInfo.client_id) {
+      console.error('[AcceptInvite] Submission blocked: missing client_id in inviteInfo');
       setMessage({ type: 'error', text: 'Invalid invitation. Cannot create account.' });
       return;
     }
@@ -71,6 +80,17 @@ export default function AcceptInvite({ navigate }) {
 
     setLoading(true);
     try {
+      console.log('[AcceptInvite] Calling supabase.auth.signUp with:', {
+        email,
+        options: {
+          data: {
+            client_id: inviteInfo.client_id,
+            role: inviteInfo.role || 'member',
+          },
+          emailRedirectTo: `${window.location.origin}/login`,
+        },
+      });
+
       const { data, error } = await supabase.auth.signUp({
         email,
         password,
@@ -83,6 +103,8 @@ export default function AcceptInvite({ navigate }) {
         },
       });
 
+      console.log('[AcceptInvite] signUp response:', data, 'error:', error);
+
       if (error) throw error;
 
       // Mark token claimed
@@ -91,7 +113,7 @@ export default function AcceptInvite({ navigate }) {
           await claimInviteToken(token);
           sessionStorage.removeItem('pending_invite_token');
         } catch (claimErr) {
-          console.warn('Could not mark token as claimed:', claimErr);
+          console.warn('[AcceptInvite] Could not mark token as claimed:', claimErr);
         }
       }
 
@@ -101,11 +123,13 @@ export default function AcceptInvite({ navigate }) {
         text: 'Account created! Please check your email to confirm your account, then sign in to access your workspace.',
       });
     } catch (err) {
+      console.error('[AcceptInvite] Registration failed:', err);
       setMessage({ type: 'error', text: err.message || String(err) });
     } finally {
       setLoading(false);
     }
   };
+
 
   if (validating) {
     return (
