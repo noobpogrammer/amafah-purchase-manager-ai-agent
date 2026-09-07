@@ -155,3 +155,53 @@ def test_flags_endpoints_succeed_with_valid_jwt(monkeypatch):
     assert r.status_code == 200
     assert r.json()["status"] == "resolved"
 
+
+def test_admin_invite_requires_auth_and_admin(monkeypatch):
+    # 1. Missing auth -> 401
+    r = client.post("/admin/invite", json={"email": "teammate@example.com", "role": "member"})
+    assert r.status_code == 401
+
+    # 2. Member role -> 403
+    monkeypatch.setattr(auth, "verify_jwt", lambda token: {"sub": "user-member"})
+    import db
+    monkeypatch.setattr(db, "get_profile_by_id", lambda uid: {"id": uid, "client_id": "client-abc", "role": "member"})
+
+    headers = {"Authorization": "Bearer membertoken"}
+    r = client.post("/admin/invite", json={"email": "teammate@example.com", "role": "member"}, headers=headers)
+    assert r.status_code == 403
+    assert "Admin role required" in r.json().get("detail", "")
+
+
+def test_admin_invite_succeeds_for_admin(monkeypatch):
+    monkeypatch.setattr(auth, "verify_jwt", lambda token: {"sub": "user-admin"})
+    import db
+    monkeypatch.setattr(db, "get_profile_by_id", lambda uid: {"id": uid, "client_id": "client-abc", "role": "admin"})
+
+    captured_call = {}
+
+    class FakeUser:
+        id = "new-invited-uuid"
+
+    class FakeInviteResponse:
+        user = FakeUser()
+
+    def fake_invite(email, options=None):
+        captured_call["email"] = email
+        captured_call["options"] = options
+        return FakeInviteResponse()
+
+    monkeypatch.setattr(db.supabase.auth.admin, "invite_user_by_email", fake_invite)
+
+    headers = {"Authorization": "Bearer admintoken"}
+    r = client.post("/admin/invite", json={"email": "teammate@example.com", "role": "member"}, headers=headers)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "success"
+    assert data["email"] == "teammate@example.com"
+    assert data["user_id"] == "new-invited-uuid"
+    assert captured_call["email"] == "teammate@example.com"
+    assert captured_call["options"]["data"]["client_id"] == "client-abc"
+    assert captured_call["options"]["data"]["role"] == "member"
+    assert "accept-invite" in captured_call["options"]["redirect_to"]
+
+

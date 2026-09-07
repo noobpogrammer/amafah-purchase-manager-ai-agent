@@ -12,13 +12,15 @@ import Login from './pages/Login';
 import SignUp from './pages/SignUp';
 import ForgotPassword from './pages/ForgotPassword';
 import ResetPassword from './pages/ResetPassword';
+import AcceptInvite from './pages/AcceptInvite';
 import TeamSettings from './pages/TeamSettings';
 
 import { fetchDashboardMetrics, fetchSuppliers, fetchFlags } from './api';
 import { supabase } from './supabaseClient';
 import { ensureProfile } from './lib/ensureProfile';
 
-const PUBLIC_PATHS = ['/login', '/signup', '/forgot-password', '/reset-password'];
+const PUBLIC_PATHS = ['/login', '/signup', '/forgot-password', '/reset-password', '/accept-invite'];
+
 
 function pathOnly(route) {
   return (route || '/').split('?')[0];
@@ -182,6 +184,9 @@ export default function App() {
     if (path === '/reset-password') {
       return <ResetPassword navigate={navigate} />;
     }
+    if (path === '/accept-invite') {
+      return <AcceptInvite navigate={navigate} />;
+    }
   }
 
   if (!session) {
@@ -219,6 +224,10 @@ export default function App() {
   if (path === '/reset-password') {
     return <ResetPassword navigate={navigate} />;
   }
+  if (path === '/accept-invite') {
+    return <AcceptInvite navigate={navigate} />;
+  }
+
 
   return (
     <div className="app-shell">

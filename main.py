@@ -1112,3 +1112,58 @@ async def close_rfq_endpoint(rfq_id: str, status: str = "closed", current_user=D
         return {"error": "Invalid status. Must be 'closed' or 'cancelled'."}
     result = db.update_rfq_status(rfq_id, status)
     return {"status": status, "rfq": result}
+
+
+class InviteUserRequest(BaseModel):
+    email: str
+    role: str = "member"
+
+
+@app.post("/admin/invite")
+async def invite_user_endpoint(
+    req: InviteUserRequest,
+    current_user=Depends(get_current_user),
+):
+    """Admin-only endpoint to send a team invitation via Supabase Admin API."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=400, detail="User has no associated client_id")
+
+    email = req.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+
+    role = req.role.strip().lower() if req.role in ("admin", "member") else "member"
+
+    frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+    if not frontend_url:
+        frontend_url = "https://powerful-rebirth-production.up.railway.app"
+
+    redirect_to = f"{frontend_url}/accept-invite"
+
+    try:
+        invite_res = db.supabase.auth.admin.invite_user_by_email(
+            email,
+            options={
+                "data": {
+                    "client_id": client_id,
+                    "role": role,
+                },
+                "redirect_to": redirect_to,
+            },
+        )
+        user_id = getattr(getattr(invite_res, "user", None), "id", None)
+        return {
+            "status": "success",
+            "message": f"Invitation sent to {email}",
+            "email": email,
+            "role": role,
+            "user_id": user_id,
+        }
+    except Exception as e:
+        print(f"Error inviting user {email}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+

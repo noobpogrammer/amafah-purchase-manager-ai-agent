@@ -336,3 +336,17 @@ export async function createCustomCategory(categoryName) {
   return cleanName;
 }
 
+export async function inviteUser({ email, role = 'member' }) {
+  const response = await authorizedFetch('/admin/invite', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, role }),
+  });
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Failed to send invitation');
+  }
+  return await response.json();
+}
+
+
