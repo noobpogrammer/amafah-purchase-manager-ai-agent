@@ -592,6 +592,8 @@ class TestQuotedMessageMatching:
         }
 
         mock_supplier = {"id": "supp-1", "name": "Test Supplier", "phone_number": "923362853198"}
+        mock_client = {"id": "client-1", "name": "Test Client", "whatsapp_instance": "Mohammad"}
+        mock_supplier = {"id": "supp-1", "client_id": "client-1", "name": "Test Supplier", "phone_number": "923362853198"}
         mock_rfq_supp = {
             "id": "rfq-supp-1",
             "rfq_id": "rfq-30w",
@@ -603,7 +605,8 @@ class TestQuotedMessageMatching:
         request = MagicMock()
         request.json = AsyncMock(return_value=payload)
 
-        with patch.object(db, "get_supplier_by_phone_any_client", return_value=mock_supplier), \
+        with patch.object(db, "get_client_by_instance", return_value=mock_client), \
+             patch.object(db, "get_supplier_by_phone", return_value=mock_supplier), \
              patch.object(db, "get_rfq_supplier_by_sent_message_id", return_value=mock_rfq_supp) as mock_get_by_stanza, \
              patch.object(db, "log_message"), \
              patch.object(db, "get_supplier_prior_quotes", return_value=[]), \
@@ -651,7 +654,7 @@ class TestQuotedMessageMatching:
         request.json = AsyncMock(return_value=payload)
 
         # First call adds to PROCESSED_MESSAGE_IDS
-        with patch.object(db, "get_supplier_by_phone_any_client", return_value=None), \
+        with patch.object(db, "get_client_by_instance", return_value=None), \
              patch.object(db, "log_webhook_error"):
             await main.whatsapp_webhook(request)
 
@@ -669,10 +672,12 @@ class TestQuotedMessageMatching:
                 "message": {"conversation": "Hello pricing is 45"}
             }
         }
+        mock_client = {"id": "client-1", "name": "Test Client", "whatsapp_instance": "Mohammad"}
         request = MagicMock()
         request.json = AsyncMock(return_value=payload)
 
-        with patch.object(db, "get_supplier_by_phone_any_client", return_value=None), \
+        with patch.object(db, "get_client_by_instance", return_value=mock_client), \
+             patch.object(db, "get_supplier_by_phone", return_value=None), \
              patch.object(db, "log_webhook_error") as mock_log_err:
             response = await main.whatsapp_webhook(request)
 
@@ -681,6 +686,21 @@ class TestQuotedMessageMatching:
             mock_log_err.assert_called_once()
             err_msg = mock_log_err.call_args[1]["error_message"]
             assert "923188012805" in err_msg
+
+    def test_get_client_by_instance_lookup(self, mock_supabase):
+        mock_clients = [
+            {"id": "c-1", "name": "Amafah Dubai", "whatsapp_instance": "Mohammad"},
+            {"id": "c-2", "name": "Al Nonn Hardware", "whatsapp_instance": "al-nonn"},
+        ]
+        mock_query = MagicMock()
+        mock_query.select.return_value = mock_query
+        mock_query.eq.return_value = mock_query
+        mock_query.execute.return_value = MagicMock(data=[mock_clients[0]])
+        mock_supabase.table.return_value = mock_query
+
+        client = db.get_client_by_instance("Mohammad")
+        assert client is not None
+        assert client["id"] == "c-1"
 
     def test_get_supplier_by_phone_any_client_formats(self, mock_supabase):
         mock_suppliers = [
@@ -702,7 +722,6 @@ class TestQuotedMessageMatching:
         assert res is not None
         assert res["id"] == "s-1"
 
-
     @pytest.mark.asyncio
     async def test_webhook_strict_stanza_id_no_cross_rfq_fallback(self, mock_supabase):
         payload = {
@@ -717,11 +736,13 @@ class TestQuotedMessageMatching:
                 }
             }
         }
-        mock_supplier = {"id": "supp-1", "name": "Test Supplier", "phone_number": "923362853198"}
+        mock_client = {"id": "client-1", "name": "Test Client", "whatsapp_instance": "Mohammad"}
+        mock_supplier = {"id": "supp-1", "client_id": "client-1", "name": "Test Supplier", "phone_number": "923362853198"}
         request = MagicMock()
         request.json = AsyncMock(return_value=payload)
 
-        with patch.object(db, "get_supplier_by_phone_any_client", return_value=mock_supplier), \
+        with patch.object(db, "get_client_by_instance", return_value=mock_client), \
+             patch.object(db, "get_supplier_by_phone", return_value=mock_supplier), \
              patch.object(db, "get_rfq_supplier_by_sent_message_id", return_value=None) as mock_stanza_lookup, \
              patch.object(db, "get_rfq_supplier_by_quoted_text") as mock_text_fallback, \
              patch.object(db, "log_message"):
@@ -731,6 +752,7 @@ class TestQuotedMessageMatching:
             assert response["reason"] == "quoted_stanza_id already responded or closed"
             mock_stanza_lookup.assert_called_once_with("supp-1", "3EB0_CLOSED_RFQ")
             mock_text_fallback.assert_not_called()
+
 
     def test_prompt_injection_security_guardrail(self):
         """Verify that sending a prompt injection message causes Groq to escalate to human."""

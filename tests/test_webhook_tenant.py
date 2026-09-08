@@ -19,9 +19,13 @@ spec.loader.exec_module(main)
 def test_webhook_derives_client_id_and_logs(monkeypatch):
     calls = []
 
-    # Stub supplier lookup across all clients
-    def fake_get_supplier_by_phone_any_client(phone):
-        return {"id": "supplier-1", "client_id": "client-123", "phone_number": phone}
+    # Stub client lookup by instance
+    def fake_get_client_by_instance(instance):
+        return {"id": "client-123", "name": "Test Client", "whatsapp_instance": instance}
+
+    # Stub scoped supplier lookup
+    def fake_get_supplier_by_phone(client_id, phone):
+        return {"id": "supplier-1", "client_id": client_id, "phone_number": phone}
 
     # Stub open rfqs to force the "no_open_rfq" path
     def fake_get_open_rfqs_for_supplier(supplier_id):
@@ -30,7 +34,8 @@ def test_webhook_derives_client_id_and_logs(monkeypatch):
     def fake_log_message(client_id, supplier_id, direction, body, related_rfq_id=None):
         calls.append((client_id, supplier_id, direction, body, related_rfq_id))
 
-    monkeypatch.setattr(main.db, "get_supplier_by_phone_any_client", fake_get_supplier_by_phone_any_client)
+    monkeypatch.setattr(main.db, "get_client_by_instance", fake_get_client_by_instance)
+    monkeypatch.setattr(main.db, "get_supplier_by_phone", fake_get_supplier_by_phone)
     monkeypatch.setattr(main.db, "get_open_rfqs_for_supplier", fake_get_open_rfqs_for_supplier)
     monkeypatch.setattr(main.db, "log_message", fake_log_message)
     # Stub other DB helpers that may be invoked during webhook handling to avoid real DB calls
@@ -43,6 +48,7 @@ def test_webhook_derives_client_id_and_logs(monkeypatch):
 
     payload = {
         "event": "messages.upsert",
+        "instance": "test-instance",
         "data": [
             {
                 "key": {"remoteJid": "12345@s.whatsapp.net", "id": "msg-1"},
@@ -55,5 +61,52 @@ def test_webhook_derives_client_id_and_logs(monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body.get("status") == "no_open_rfq"
-    # Ensure log_message was called and the client_id was derived from supplier
+    # Ensure log_message was called and the client_id was derived from instance
     assert calls and calls[0][0] == "client-123"
+
+
+def test_webhook_disambiguates_same_phone_under_different_clients(monkeypatch):
+    """Verifies that the same supplier phone under two clients routes strictly according to the instance."""
+    calls = []
+
+    clients_db = {
+        "client-a-instance": {"id": "client-A", "name": "Business A", "whatsapp_instance": "client-a-instance"},
+        "client-b-instance": {"id": "client-B", "name": "Business B", "whatsapp_instance": "client-b-instance"},
+    }
+    suppliers_db = {
+        ("client-A", "923188012805"): {"id": "supp-A", "client_id": "client-A", "name": "Supplier under A", "phone_number": "923188012805"},
+        ("client-B", "923188012805"): {"id": "supp-B", "client_id": "client-B", "name": "Supplier under B", "phone_number": "923188012805"},
+    }
+
+    monkeypatch.setattr(main.db, "get_client_by_instance", lambda inst: clients_db.get(inst))
+    monkeypatch.setattr(main.db, "get_supplier_by_phone", lambda c_id, ph: suppliers_db.get((c_id, ph)))
+    monkeypatch.setattr(main.db, "get_open_rfqs_for_supplier", lambda supp_id: [])
+    monkeypatch.setattr(main.db, "log_message", lambda c_id, s_id, d, b, r=None: calls.append((c_id, s_id, d, b)))
+    monkeypatch.setattr(main.db, "get_pending_clarification_for_supplier", lambda s: None)
+    monkeypatch.setattr(main.db, "get_rfq_supplier_by_sent_message_id", lambda s, m: None)
+    monkeypatch.setattr(main.db, "get_rfq_supplier_by_quoted_text", lambda s, q: None)
+
+    client = TestClient(main.app)
+
+    # Inbound message to Client A's instance
+    payload_a = {
+        "event": "messages.upsert",
+        "instance": "client-a-instance",
+        "data": [{"key": {"remoteJid": "923188012805@s.whatsapp.net", "id": "msg-a"}, "message": {"conversation": "Quote 50"}}]
+    }
+    resp_a = client.post("/webhook/whatsapp", json=payload_a)
+    assert resp_a.status_code == 200
+    assert calls[-1][0] == "client-A"
+    assert calls[-1][1] == "supp-A"
+
+    # Inbound message to Client B's instance
+    payload_b = {
+        "event": "messages.upsert",
+        "instance": "client-b-instance",
+        "data": [{"key": {"remoteJid": "923188012805@s.whatsapp.net", "id": "msg-b"}, "message": {"conversation": "Quote 45"}}]
+    }
+    resp_b = client.post("/webhook/whatsapp", json=payload_b)
+    assert resp_b.status_code == 200
+    assert calls[-1][0] == "client-B"
+    assert calls[-1][1] == "supp-B"
+

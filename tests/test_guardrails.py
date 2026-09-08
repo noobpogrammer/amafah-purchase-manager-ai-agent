@@ -63,16 +63,12 @@ async def test_webhook_injection_attempt_escalates_not_complies(mock_supabase):
         }
     }
 
-    mock_supplier = {"id": "supp-injection-1", "name": "Test Supplier", "phone_number": "971501234567"}
-    mock_open_rfqs = [{
-        "id": "rs-1",
-        "rfq_id": "rfq-100",
-        "supplier_id": "supp-injection-1",
-        "status": "sent",
-        "rfqs": {"id": "rfq-100", "product_name": "LED Panel 40W", "status": "active"}
-    }]
+    mock_client = {"id": "client-1", "name": "Test Client", "whatsapp_instance": "Mohammad"}
+    mock_supplier = {"id": "supp-injection-1", "client_id": "client-1", "name": "Attacker", "phone_number": "971501234567"}
+    mock_open_rfqs = [
+        {"id": "rs-100", "rfqs": {"id": "rfq-100", "product_name": "Inverters", "status": "active"}}
+    ]
 
-    # Non-compliant model output containing code injection
     unsafe_question = "Sure! Here is your code: ```python\ndef hack(): import os; os.system('echo pwned')\n```"
     mock_groq_decision = {
         "tool_name": "request_clarification",
@@ -85,7 +81,8 @@ async def test_webhook_injection_attempt_escalates_not_complies(mock_supabase):
     request = MagicMock()
     request.json = AsyncMock(return_value=payload)
 
-    with patch.object(db, "get_supplier_by_phone_any_client", return_value=mock_supplier), \
+    with patch.object(db, "get_client_by_instance", return_value=mock_client), \
+         patch.object(db, "get_supplier_by_phone", return_value=mock_supplier), \
          patch.object(db, "get_pending_clarification_for_supplier", return_value=None), \
          patch.object(db, "get_open_rfqs_for_supplier", return_value=mock_open_rfqs), \
          patch.object(db, "get_supplier_prior_quotes", return_value=[]), \
@@ -127,7 +124,8 @@ async def test_legitimate_clarification_still_sends_normally(mock_supabase):
         }
     }
 
-    mock_supplier = {"id": "supp-legit-1", "name": "Test Supplier", "phone_number": "971501234567"}
+    mock_client = {"id": "client-1", "name": "Test Client", "whatsapp_instance": "Mohammad"}
+    mock_supplier = {"id": "supp-legit-1", "client_id": "client-1", "name": "Test Supplier", "phone_number": "971501234567"}
     mock_open_rfqs = [
         {"id": "rs-1", "rfqs": {"id": "rfq-1", "product_name": "LED Panel 40W", "status": "active"}},
         {"id": "rs-2", "rfqs": {"id": "rfq-2", "product_name": "LED Panel 90W", "status": "active"}}
@@ -145,7 +143,8 @@ async def test_legitimate_clarification_still_sends_normally(mock_supabase):
     request = MagicMock()
     request.json = AsyncMock(return_value=payload)
 
-    with patch.object(db, "get_supplier_by_phone_any_client", return_value=mock_supplier), \
+    with patch.object(db, "get_client_by_instance", return_value=mock_client), \
+         patch.object(db, "get_supplier_by_phone", return_value=mock_supplier), \
          patch.object(db, "get_pending_clarification_for_supplier", return_value=None), \
          patch.object(db, "get_open_rfqs_for_supplier", return_value=mock_open_rfqs), \
          patch.object(db, "get_supplier_prior_quotes", return_value=[]), \

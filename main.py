@@ -523,22 +523,42 @@ async def whatsapp_webhook(request: Request):
         if not sender_phone or not message_text:
             return {"status": "ignored", "reason": "no message content"}
 
-        # Resolve supplier across all clients (Evolution instance is shared)
-        supplier = db.get_supplier_by_phone_any_client(sender_phone)
-        if not supplier:
-            err_msg = f"Unknown supplier: sender_phone='{sender_phone}' (raw remoteJid='{raw_remote_jid}') could not be matched to any supplier in database."
+        # Resolve tenant/client unambiguously by Evolution API instance name
+        instance_name = (
+            payload.get("instance")
+            or payload.get("instanceName")
+            or (data.get("instance") if isinstance(data, dict) else None)
+            or (data.get("instanceName") if isinstance(data, dict) else None)
+            or EVOLUTION_INSTANCE
+        )
+
+        client = db.get_client_by_instance(instance_name) if instance_name else None
+        if not client:
+            err_msg = f"Unknown or unconfigured instance '{instance_name}' in webhook payload."
             db.log_webhook_error(
                 error_message=err_msg,
-                traceback_str=f"Unmatched incoming WhatsApp message from sender_phone='{sender_phone}' (raw remoteJid='{raw_remote_jid}'). Message: {message_text[:500]}",
+                traceback_str=f"Instance '{instance_name}' does not match any client in database. Raw payload: {payload}",
+                raw_payload=payload,
+            )
+            print(f"[Webhook] {err_msg}")
+            return {"status": "ignored", "reason": f"unknown instance: {instance_name}"}
+
+        client_id = client["id"]
+
+        # Look up supplier scoped strictly to this client
+        supplier = db.get_supplier_by_phone(client_id, sender_phone)
+        if not supplier:
+            err_msg = f"Unknown supplier: sender_phone='{sender_phone}' (raw remoteJid='{raw_remote_jid}') not found for client '{client.get('name')}' (id={client_id}, instance='{instance_name}')."
+            db.log_webhook_error(
+                error_message=err_msg,
+                traceback_str=f"Unmatched incoming WhatsApp message from sender_phone='{sender_phone}' for client {client_id}. Message: {message_text[:500]}",
                 raw_payload=payload,
             )
             print(f"[Webhook] {err_msg}")
             return {"status": "ignored", "reason": "unknown supplier"}
 
-
-        # Derive tenant from supplier record — this is the source of truth for this webhook
-        client_id = supplier.get("client_id")
         db.log_message(client_id, supplier["id"], "inbound", message_text)
+
 
         # Fix 1 & Change 3: Check if message is a quoted reply (reply-to) matching a sent RFQ message
         matched_rfq_supplier = None

@@ -59,11 +59,10 @@ def get_supplier_by_phone(client_id: str, phone_number: str):
 
 
 def get_supplier_by_phone_any_client(phone_number: str):
-    """Lookup a supplier by phone number across all clients.
+    """[DEPRECATED] Lookup a supplier by phone number across all clients.
 
-    This mirrors `get_supplier_by_phone` but does not filter by `client_id`.
-    Returns the first matching supplier (prefers exact phone_number match, falls
-    back to matching cleaned digits and national/international format suffix).
+    Prefer looking up the client via `get_client_by_instance` first, then using
+    `get_supplier_by_phone(client_id, phone_number)` to prevent cross-tenant ambiguity.
     """
     target_digits = clean_phone(phone_number)
     if not target_digits:
@@ -90,6 +89,34 @@ def get_supplier_by_phone_any_client(phone_number: str):
                 return s
 
     return None
+
+
+def get_client_by_instance(instance_name: str):
+    """Lookup a client row by whatsapp_instance name.
+
+    Performs exact match first, and case-insensitive trimmed match as fallback.
+    """
+    if not instance_name:
+        return None
+
+    clean_instance = instance_name.strip()
+    res = (
+        supabase.table("clients")
+        .select("*")
+        .eq("whatsapp_instance", clean_instance)
+        .execute()
+    )
+    if res.data:
+        return res.data[0]
+
+    # Fallback: case-insensitive scan across active clients
+    all_clients = supabase.table("clients").select("*").execute().data
+    for c in (all_clients or []):
+        if (c.get("whatsapp_instance") or "").strip().lower() == clean_instance.lower():
+            return c
+
+    return None
+
 
 
 
