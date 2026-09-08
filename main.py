@@ -1260,6 +1260,11 @@ def generate_daily_procurement_docx(date_str: str, rfq_data_list: list) -> bytes
                 row_cells[3].text = str(q.get("delivery_time") or "Not specified")
                 row_cells[4].text = str(q.get("quality_notes") or "Standard")
 
+            if item.get("reasoning"):
+                p = doc.add_paragraph()
+                p.add_run("AI Reasoning: ").bold = True
+                p.add_run(item["reasoning"])
+
         doc.add_paragraph()
 
     doc_io = io.BytesIO()
@@ -1301,15 +1306,19 @@ async def get_daily_report_endpoint(
     for rfq in rfqs:
         quotes = db.get_quotes_for_rfq(rfq["id"]) or []
         top_quotes = []
+        reasoning = None
 
         if quotes:
             ranking_data = None
             existing_ranking = db.get_ranking_for_rfq(rfq["id"])
             if existing_ranking and existing_ranking.get("ranking_json"):
                 ranking_data = existing_ranking.get("ranking_json")
+                reasoning = ranking_data.get("reasoning") or existing_ranking.get("reasoning")
             else:
                 try:
                     ranking_data = generate_ranking(rfq["id"])
+                    if ranking_data:
+                        reasoning = ranking_data.get("reasoning")
                 except Exception as e:
                     print(f"[Daily Report] Failed generating ranking for RFQ {rfq['id']}: {e}")
 
@@ -1345,6 +1354,7 @@ async def get_daily_report_endpoint(
             "rfq": rfq,
             "quotes": quotes,
             "top_quotes": top_quotes,
+            "reasoning": reasoning,
         })
 
     doc_bytes = generate_daily_procurement_docx(date.strip(), rfq_data_list)

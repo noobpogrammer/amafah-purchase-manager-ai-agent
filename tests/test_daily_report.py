@@ -145,3 +145,6 @@ def test_daily_report_generates_docx_with_mix_of_responded_and_unresponded_rfqs(
         assert rows[2][0] == "#2"
         assert rows[2][1] == "Ace Hardware"
         assert rows[2][2] == "AED 120.0"
+
+        # Verify AI Reasoning paragraph is present for RFQ 1
+        assert "AI Reasoning: BuildPro Supplies offers the lowest price (AED 110.0) with fastest delivery (1 day)." in doc_text
