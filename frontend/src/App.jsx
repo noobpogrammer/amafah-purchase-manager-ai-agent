@@ -5,6 +5,7 @@ import SuppliersView from './components/SuppliersView';
 import CreateRFQView from './components/CreateRFQView';
 import RFQDetailView from './components/RFQDetailView';
 import QuotesReportView from './components/QuotesReportView';
+import DailyReportView from './components/DailyReportView';
 import ConversationsView from './components/ConversationsView';
 import AgentAttentionView from './components/AgentAttentionView';
 
@@ -277,6 +278,8 @@ export default function App() {
             setSelectedRfqId={setSelectedRfqId}
           />
         )}
+
+        {activeTab === 'daily_report' && <DailyReportView />}
 
         {activeTab === 'conversations' && <ConversationsView />}
 

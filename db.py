@@ -421,6 +421,25 @@ def save_ranking(rfq_id: str, best_supplier_id: str, reasoning: str, ranking_jso
     }).execute()
 
 
+def get_ranking_for_rfq(rfq_id: str) -> dict | None:
+    res = supabase.table("rfq_rankings").select("*").eq("rfq_id", rfq_id).order("created_at", desc=True).limit(1).execute()
+    return res.data[0] if res.data else None
+
+
+def get_rfqs_by_date(client_id: str, start_dt: str, end_dt: str) -> list:
+    """Returns all RFQs for client_id created between start_dt and end_dt."""
+    res = (
+        supabase.table("rfqs")
+        .select("*")
+        .eq("client_id", client_id)
+        .gte("created_at", start_dt)
+        .lt("created_at", end_dt)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return res.data or []
+
+
 def get_suppliers_by_category(client_id: str, category: str) -> list:
     """Finds active suppliers whose category array contains the specified category for a client."""
     res = (

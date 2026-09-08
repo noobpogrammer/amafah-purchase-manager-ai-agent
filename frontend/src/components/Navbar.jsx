@@ -8,7 +8,8 @@ import {
   BarChart3,
   AlertTriangle,
   Bot,
-  LogOut
+  LogOut,
+  FileDown
 } from 'lucide-react';
 
 export default function Navbar({ activeTab, setActiveTab, pendingFlagsCount, navigate, onSignOut }) {
@@ -18,6 +19,7 @@ export default function Navbar({ activeTab, setActiveTab, pendingFlagsCount, nav
     { id: 'create_rfq', label: 'Create RFQ', icon: PlusCircle },
     { id: 'rfqs', label: 'RFQs & Tracking', icon: FileText },
     { id: 'quotes_report', label: 'Quotes & AI Ranking', icon: BarChart3 },
+    { id: 'daily_report', label: 'Daily Report', icon: FileDown },
     { id: 'conversations', label: 'WhatsApp Logs', icon: MessageSquare },
     {
       id: 'flags',

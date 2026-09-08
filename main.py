@@ -13,11 +13,14 @@ import random
 import re
 import traceback
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
+import docx
+from docx.enum.table import WD_TABLE_ALIGNMENT
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Depends
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 import requests
 from starlette.concurrency import run_in_threadpool
@@ -1206,5 +1209,154 @@ async def claim_invite_token_endpoint(token: str):
         raise HTTPException(status_code=404, detail="Invitation not found")
     db.mark_invite_token_used(token)
     return {"status": "claimed"}
+
+
+def generate_daily_procurement_docx(date_str: str, rfq_data_list: list) -> bytes:
+    """Generates a formatted Word (.docx) document summarizing daily RFQ activity."""
+    doc = docx.Document()
+    doc.add_heading(f"Daily Procurement Report — {date_str}", level=0)
+
+    for item in rfq_data_list:
+        rfq = item["rfq"]
+        quotes = item["quotes"]
+        top_quotes = item.get("top_quotes") or []
+
+        doc.add_heading(f"RFQ: {rfq.get('product_name', 'Unnamed Product')}", level=1)
+
+        p = doc.add_paragraph()
+        p.add_run("Category: ").bold = True
+        p.add_run(f"{rfq.get('category') or 'General'}   |   ")
+        p.add_run("Quantity: ").bold = True
+        p.add_run(f"{rfq.get('quantity') if rfq.get('quantity') is not None else 'N/A'}   |   ")
+        p.add_run("Specs: ").bold = True
+        p.add_run(f"{rfq.get('specs') or 'Standard'}   |   ")
+        p.add_run("Deadline: ").bold = True
+        p.add_run(f"{rfq.get('deadline_hours', 24)} hour(s)")
+
+        if not quotes:
+            doc.add_paragraph("No one responded to this RFQ.")
+        else:
+            table = doc.add_table(rows=1, cols=5)
+            table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+            hdr_cells = table.rows[0].cells
+            hdr_cells[0].text = "Rank"
+            hdr_cells[1].text = "Supplier"
+            hdr_cells[2].text = "Price"
+            hdr_cells[3].text = "Delivery Time"
+            hdr_cells[4].text = "Quality / Warranty Notes"
+
+            for cell in hdr_cells:
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.bold = True
+
+            for q_idx, q in enumerate(top_quotes, 1):
+                row_cells = table.add_row().cells
+                rank_val = q.get("rank") if q.get("rank") is not None else q_idx
+                row_cells[0].text = f"#{rank_val}"
+                row_cells[1].text = str(q.get("supplier_name") or "Unknown")
+                row_cells[2].text = f"AED {q.get('price')}" if q.get('price') is not None else "N/A"
+                row_cells[3].text = str(q.get("delivery_time") or "Not specified")
+                row_cells[4].text = str(q.get("quality_notes") or "Standard")
+
+        doc.add_paragraph()
+
+    doc_io = io.BytesIO()
+    doc.save(doc_io)
+    doc_io.seek(0)
+    return doc_io.getvalue()
+
+
+@app.get("/reports/daily")
+async def get_daily_report_endpoint(
+    date: str,
+    current_user=Depends(get_current_user),
+):
+    """Admin-only endpoint generating a daily procurement summary report (.docx)."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    try:
+        target_date = datetime.strptime(date.strip(), "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date format. Expected YYYY-MM-DD.")
+
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=400, detail="User has no associated client_id")
+
+    start_dt = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc).isoformat()
+    end_dt = datetime.combine(target_date + timedelta(days=1), datetime.min.time()).replace(tzinfo=timezone.utc).isoformat()
+
+    rfqs = db.get_rfqs_by_date(client_id, start_dt, end_dt)
+
+    if not rfqs:
+        return JSONResponse(
+            status_code=200,
+            content={"status": "no_data", "message": "No RFQs were created on this date."}
+        )
+
+    rfq_data_list = []
+    for rfq in rfqs:
+        quotes = db.get_quotes_for_rfq(rfq["id"]) or []
+        top_quotes = []
+
+        if quotes:
+            ranking_data = None
+            existing_ranking = db.get_ranking_for_rfq(rfq["id"])
+            if existing_ranking and existing_ranking.get("ranking_json"):
+                ranking_data = existing_ranking.get("ranking_json")
+            else:
+                try:
+                    ranking_data = generate_ranking(rfq["id"])
+                except Exception as e:
+                    print(f"[Daily Report] Failed generating ranking for RFQ {rfq['id']}: {e}")
+
+            rank_map = {}
+            if ranking_data and isinstance(ranking_data, dict) and ranking_data.get("ranking"):
+                for item in ranking_data["ranking"]:
+                    s_id = item.get("supplier_id")
+                    if s_id:
+                        rank_map[s_id] = item
+
+            if rank_map:
+                sorted_quotes = sorted(
+                    quotes,
+                    key=lambda q: rank_map.get(q.get("supplier_id"), {}).get("rank", 999)
+                )
+            else:
+                sorted_quotes = sorted(
+                    quotes,
+                    key=lambda q: q.get("price") if q.get("price") is not None else float("inf")
+                )
+
+            for q in sorted_quotes[:5]:
+                rank_item = rank_map.get(q.get("supplier_id"), {})
+                top_quotes.append({
+                    "rank": rank_item.get("rank"),
+                    "supplier_name": q.get("suppliers", {}).get("name") if isinstance(q.get("suppliers"), dict) else "Supplier",
+                    "price": q.get("price"),
+                    "delivery_time": q.get("delivery_time"),
+                    "quality_notes": q.get("quality_notes"),
+                })
+
+        rfq_data_list.append({
+            "rfq": rfq,
+            "quotes": quotes,
+            "top_quotes": top_quotes,
+        })
+
+    doc_bytes = generate_daily_procurement_docx(date.strip(), rfq_data_list)
+    filename = f"Daily_Procurement_Report_{date.strip()}.docx"
+
+    return StreamingResponse(
+        io.BytesIO(doc_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
 
 

@@ -9,3 +9,4 @@ python-multipart
 pytest
 pytest-asyncio
 PyJWT>=2.8.0
+python-docx

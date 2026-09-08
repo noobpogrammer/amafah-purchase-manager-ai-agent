@@ -442,4 +442,22 @@ export async function claimInviteToken(token) {
   return { status: 'claimed' };
 }
 
+export async function downloadDailyReport(dateStr) {
+  const response = await authorizedFetch(`/reports/daily?date=${encodeURIComponent(dateStr)}`);
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || data.message || 'Failed to generate report');
+    }
+    return { type: 'json', data };
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `Failed to generate report (${response.status})`);
+  }
+  const blob = await response.blob();
+  return { type: 'blob', blob, filename: `Daily_Procurement_Report_${dateStr}.docx` };
+}
+
 
