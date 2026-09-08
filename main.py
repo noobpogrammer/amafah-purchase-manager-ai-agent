@@ -236,10 +236,12 @@ def send_whatsapp_message(phone_number: str, message: str) -> dict:
 
 
 def normalize_phone(remote_jid: str) -> str:
-    """Strips everything from '@' onward to normalize WhatsApp remoteJid to plain digits."""
+    """Strips everything from '@' onward and device suffixes to normalize WhatsApp remoteJid to plain digits."""
     if not remote_jid:
         return ""
-    return remote_jid.split("@")[0]
+    user_part = remote_jid.split("@")[0]
+    return user_part.split(":")[0]
+
 
 
 def format_rfq_context(open_rfqs: list) -> str:
@@ -524,7 +526,15 @@ async def whatsapp_webhook(request: Request):
         # Resolve supplier across all clients (Evolution instance is shared)
         supplier = db.get_supplier_by_phone_any_client(sender_phone)
         if not supplier:
+            err_msg = f"Unknown supplier: sender_phone='{sender_phone}' (raw remoteJid='{raw_remote_jid}') could not be matched to any supplier in database."
+            db.log_webhook_error(
+                error_message=err_msg,
+                traceback_str=f"Unmatched incoming WhatsApp message from sender_phone='{sender_phone}' (raw remoteJid='{raw_remote_jid}'). Message: {message_text[:500]}",
+                raw_payload=payload,
+            )
+            print(f"[Webhook] {err_msg}")
             return {"status": "ignored", "reason": "unknown supplier"}
+
 
         # Derive tenant from supplier record — this is the source of truth for this webhook
         client_id = supplier.get("client_id")

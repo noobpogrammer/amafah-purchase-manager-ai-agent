@@ -47,9 +47,13 @@ def get_supplier_by_phone(client_id: str, phone_number: str):
         .execute()
         .data
     )
-    for s in all_suppliers:
-        if clean_phone(s.get("phone_number")) == target_digits:
+    for s in (all_suppliers or []):
+        s_digits = clean_phone(s.get("phone_number"))
+        if s_digits == target_digits:
             return s
+        if len(target_digits) >= 9 and len(s_digits) >= 9:
+            if target_digits.endswith(s_digits.lstrip("0")) or s_digits.endswith(target_digits.lstrip("0")):
+                return s
 
     return None
 
@@ -59,7 +63,7 @@ def get_supplier_by_phone_any_client(phone_number: str):
 
     This mirrors `get_supplier_by_phone` but does not filter by `client_id`.
     Returns the first matching supplier (prefers exact phone_number match, falls
-    back to matching cleaned digits).
+    back to matching cleaned digits and national/international format suffix).
     """
     target_digits = clean_phone(phone_number)
     if not target_digits:
@@ -77,11 +81,16 @@ def get_supplier_by_phone_any_client(phone_number: str):
 
     # Fallback: scan all suppliers and match by cleaned digits
     all_suppliers = supabase.table("suppliers").select("*").execute().data
-    for s in all_suppliers:
-        if clean_phone(s.get("phone_number")) == target_digits:
+    for s in (all_suppliers or []):
+        s_digits = clean_phone(s.get("phone_number"))
+        if s_digits == target_digits:
             return s
+        if len(target_digits) >= 9 and len(s_digits) >= 9:
+            if target_digits.endswith(s_digits.lstrip("0")) or s_digits.endswith(target_digits.lstrip("0")):
+                return s
 
     return None
+
 
 
 def get_profile_by_id(user_id: str):

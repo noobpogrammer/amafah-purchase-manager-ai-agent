@@ -651,13 +651,57 @@ class TestQuotedMessageMatching:
         request.json = AsyncMock(return_value=payload)
 
         # First call adds to PROCESSED_MESSAGE_IDS
-        with patch.object(db, "get_supplier_by_phone_any_client", return_value=None):
+        with patch.object(db, "get_supplier_by_phone_any_client", return_value=None), \
+             patch.object(db, "log_webhook_error"):
             await main.whatsapp_webhook(request)
 
         # Second call with same message id should be ignored immediately
         response = await main.whatsapp_webhook(request)
         assert response["status"] == "ignored"
         assert "already processed message id" in response["reason"]
+
+    @pytest.mark.asyncio
+    async def test_webhook_unknown_supplier_logs_to_webhook_errors(self, mock_supabase):
+        payload = {
+            "event": "messages.upsert",
+            "data": {
+                "key": {"remoteJid": "923188012805:1@s.whatsapp.net", "fromMe": False, "id": "unknown-supp-msg"},
+                "message": {"conversation": "Hello pricing is 45"}
+            }
+        }
+        request = MagicMock()
+        request.json = AsyncMock(return_value=payload)
+
+        with patch.object(db, "get_supplier_by_phone_any_client", return_value=None), \
+             patch.object(db, "log_webhook_error") as mock_log_err:
+            response = await main.whatsapp_webhook(request)
+
+            assert response["status"] == "ignored"
+            assert response["reason"] == "unknown supplier"
+            mock_log_err.assert_called_once()
+            err_msg = mock_log_err.call_args[1]["error_message"]
+            assert "923188012805" in err_msg
+
+    def test_get_supplier_by_phone_any_client_formats(self, mock_supabase):
+        mock_suppliers = [
+            {"id": "s-1", "name": "Pak Supplier", "phone_number": "+92 3188012805"},
+            {"id": "s-2", "name": "UAE Supplier", "phone_number": "971501234567"},
+        ]
+        mock_query = MagicMock()
+        mock_query.select.return_value = mock_query
+        mock_query.eq.return_value = mock_query
+        # First eq query for exact match fails (returns empty list)
+        mock_query.execute.side_effect = [
+            MagicMock(data=[]),            # exact match attempt
+            MagicMock(data=mock_suppliers) # fallback scan
+        ]
+        mock_supabase.table.return_value = mock_query
+
+        # Search with cleaned plain digits
+        res = db.get_supplier_by_phone_any_client("923188012805")
+        assert res is not None
+        assert res["id"] == "s-1"
+
 
     @pytest.mark.asyncio
     async def test_webhook_strict_stanza_id_no_cross_rfq_fallback(self, mock_supabase):
