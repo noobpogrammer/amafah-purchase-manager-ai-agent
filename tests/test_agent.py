@@ -194,6 +194,115 @@ class TestFlagForHumanReviewAndResolve:
         open_rfqs = db.get_open_rfqs_for_supplier("supp-1")
         assert len(open_rfqs) == 1
         assert open_rfqs[0]["rfqs"]["id"] == "rfq-1"
+        mock_query.in_.assert_called_with("status", ["sent", "clarifying", "responded"])
+
+    def test_get_open_rfqs_includes_responded_status_for_active_rfq(self, mock_supabase):
+        mock_data = [
+            {"id": "rs-1", "status": "responded", "rfqs": {"id": "rfq-1", "status": "active"}},
+            {"id": "rs-2", "status": "responded", "rfqs": {"id": "rfq-2", "status": "closed"}},
+        ]
+        mock_query = MagicMock()
+        mock_query.select.return_value = mock_query
+        mock_query.eq.return_value = mock_query
+        mock_query.in_.return_value = mock_query
+        mock_query.execute.return_value = MagicMock(data=mock_data)
+        mock_supabase.table.return_value = mock_query
+
+        open_rfqs = db.get_open_rfqs_for_supplier("supp-1")
+        assert len(open_rfqs) == 1
+        assert open_rfqs[0]["rfqs"]["id"] == "rfq-1"
+
+    def test_get_quotes_for_rfq_returns_only_latest_quote_per_supplier(self, mock_supabase):
+        mock_quotes_data = [
+            {
+                "id": "q-revised",
+                "supplier_id": "sup-1",
+                "price": 40.0,
+                "created_at": "2026-09-08T12:00:00Z",
+                "suppliers": {"name": "Supplier 1"},
+            },
+            {
+                "id": "q-initial",
+                "supplier_id": "sup-1",
+                "price": 50.0,
+                "created_at": "2026-09-08T10:00:00Z",
+                "suppliers": {"name": "Supplier 1"},
+            },
+            {
+                "id": "q-sup2",
+                "supplier_id": "sup-2",
+                "price": 45.0,
+                "created_at": "2026-09-08T11:00:00Z",
+                "suppliers": {"name": "Supplier 2"},
+            },
+        ]
+        mock_query = MagicMock()
+        mock_query.select.return_value = mock_query
+        mock_query.eq.return_value = mock_query
+        mock_query.order.return_value = mock_query
+        mock_query.execute.return_value = MagicMock(data=mock_quotes_data)
+        mock_supabase.table.return_value = mock_query
+
+        quotes = db.get_quotes_for_rfq("rfq-1")
+        assert len(quotes) == 2
+        # sup-1 should be the revised quote with price 40.0
+        sup1_quote = next(q for q in quotes if q["supplier_id"] == "sup-1")
+        assert sup1_quote["id"] == "q-revised"
+        assert sup1_quote["price"] == 40.0
+        # sup-2 should be present
+        sup2_quote = next(q for q in quotes if q["supplier_id"] == "sup-2")
+        assert sup2_quote["id"] == "q-sup2"
+        assert sup2_quote["price"] == 45.0
+
+    def test_quote_revision_lifecycle_and_post_closure_rejection(self, mock_supabase):
+        # 1. Initial state: supplier has responded, RFQ is active
+        mock_active_data = [
+            {"id": "rs-1", "status": "responded", "supplier_id": "sup-1", "rfqs": {"id": "rfq-1", "status": "active"}}
+        ]
+        mock_query = MagicMock()
+        mock_query.select.return_value = mock_query
+        mock_query.eq.return_value = mock_query
+        mock_query.in_.return_value = mock_query
+        mock_query.execute.return_value = MagicMock(data=mock_active_data)
+        mock_supabase.table.return_value = mock_query
+
+        # Before closure: get_open_rfqs finds active RFQ for revision
+        open_rfqs = db.get_open_rfqs_for_supplier("sup-1")
+        assert len(open_rfqs) == 1
+        assert open_rfqs[0]["rfqs"]["id"] == "rfq-1"
+
+        # 2. Revised quote recorded: get_quotes_for_rfq returns the revised quote
+        mock_quotes_data = [
+            {"id": "q-revised", "supplier_id": "sup-1", "price": 42.0, "created_at": "2026-09-08T12:00:00Z"},
+            {"id": "q-initial", "supplier_id": "sup-1", "price": 50.0, "created_at": "2026-09-08T10:00:00Z"},
+        ]
+        mock_quote_query = MagicMock()
+        mock_quote_query.select.return_value = mock_quote_query
+        mock_quote_query.eq.return_value = mock_quote_query
+        mock_quote_query.order.return_value = mock_quote_query
+        mock_quote_query.execute.return_value = MagicMock(data=mock_quotes_data)
+        mock_supabase.table.return_value = mock_quote_query
+
+        quotes = db.get_quotes_for_rfq("rfq-1")
+        assert len(quotes) == 1
+        assert quotes[0]["id"] == "q-revised"
+        assert quotes[0]["price"] == 42.0
+
+        # 3. RFQ is closed
+        mock_closed_data = [
+            {"id": "rs-1", "status": "responded", "supplier_id": "sup-1", "rfqs": {"id": "rfq-1", "status": "closed"}}
+        ]
+        mock_closed_query = MagicMock()
+        mock_closed_query.select.return_value = mock_closed_query
+        mock_closed_query.eq.return_value = mock_closed_query
+        mock_closed_query.in_.return_value = mock_closed_query
+        mock_closed_query.execute.return_value = MagicMock(data=mock_closed_data)
+        mock_supabase.table.return_value = mock_closed_query
+
+        # 4. Message sent after closure: no_open_rfq (empty list returned)
+        closed_rfqs = db.get_open_rfqs_for_supplier("sup-1")
+        assert len(closed_rfqs) == 0
+
 
 
 class TestClarificationRoundsCap:

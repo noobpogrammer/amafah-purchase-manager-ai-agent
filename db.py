@@ -171,16 +171,16 @@ def format_supplier_categories(categories) -> str:
 
 
 def get_open_rfqs_for_supplier(supplier_id: str):
-    """All active RFQs currently sent to this supplier, awaiting a reply."""
+    """All active RFQs sent to this supplier, awaiting an initial reply or revision."""
     res = (
         supabase.table("rfq_suppliers")
         .select("*, rfqs(*)")
         .eq("supplier_id", supplier_id)
-        .in_("status", ["sent", "clarifying"])
+        .in_("status", ["sent", "clarifying", "responded"])
         .execute()
     )
     # Strictly filter only entries where the underlying RFQ is active
-    return [entry for entry in res.data if entry.get("rfqs", {}).get("status") == "active"]
+    return [entry for entry in (res.data or []) if entry.get("rfqs", {}).get("status") == "active"]
 
 
 def record_quote(rfq_id: str, supplier_id: str, price: float,
@@ -405,11 +405,23 @@ def log_message(client_id: str, supplier_id: str, direction: str,
     }).execute()
 
 
-def get_quotes_for_rfq(rfq_id: str):
-    res = supabase.table("quotes").select("*, suppliers(name)").eq(
-        "rfq_id", rfq_id
-    ).execute()
-    return res.data
+def get_quotes_for_rfq(rfq_id: str) -> list:
+    """Returns only the most recent quote per supplier for an RFQ."""
+    res = (
+        supabase.table("quotes")
+        .select("*, suppliers(name)")
+        .eq("rfq_id", rfq_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    latest_quotes = []
+    seen_suppliers = set()
+    for q in (res.data or []):
+        supplier_id = q.get("supplier_id")
+        if supplier_id and supplier_id not in seen_suppliers:
+            seen_suppliers.add(supplier_id)
+            latest_quotes.append(q)
+    return latest_quotes
 
 
 def save_ranking(rfq_id: str, best_supplier_id: str, reasoning: str, ranking_json: dict):

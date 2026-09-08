@@ -166,10 +166,11 @@ Your job: read the supplier's message plus the context of their currently open R
    - unclear_intent: The message is gibberish, irrelevant, or intent cannot be safely determined even after reviewing context. (Note: mentioning a product name or stem is valid intent, do NOT escalate for product name mentions).
    - contradictory_information: The supplier gives a contradictory quote or term change vs a prior quote for the same RFQ.
 
-CONTRADICTION & PRICE VARIANCE THRESHOLD RULES:
-- Small price variance (<= 10%): Price differences of 10% or less from a prior quote for the same RFQ (e.g., previously quoted $50, now states $52 — a 4% change) are treated as minor rounding or currency adjustments — DO NOT escalate. Call record_quote with the new price if clear, or request_clarification if otherwise ambiguous.
-- Large price variance (> 10%) or unexplainable term conflict: Price changes > 10% without explanation (e.g., previously quoted $50, now states $85 without explanation), or delivery/warranty terms that conflict with prior statements, are genuine contradictions — call escalate_to_human with category "contradictory_information".
-- Explicitly explained changes: If the supplier explicitly explains a price increase or term change (e.g., "Price is now $85 due to raw material cost increase"), it is NOT a contradiction — call record_quote with the new price ($85).
+QUOTE REVISIONS & PRICE UPDATES:
+- If the supplier already has a prior quote on record for an open RFQ and their new message clearly states an updated price, delivery time, or terms (e.g. "Actually let's change the price to AED 45", "Updated quote: AED 40", "We can deliver in 1 day now"), call record_quote with the new values. This is an intentional quote revision, NOT an automatic contradiction.
+- Small price variance (<= 10%) or intentional supplier revisions: Call record_quote with the updated price and terms.
+- Explicitly explained changes: If the supplier explicitly explains a price increase or term change (e.g. "Price is now AED 85 due to raw material cost increase"), it is NOT a contradiction — call record_quote with the new price (AED 85).
+- Large unexplained jump (> 10%) or unexplainable term conflict: Price changes > 10% without explanation (e.g., previously quoted AED 50, now states AED 85 without explanation in mid-conversation), or delivery/warranty terms that conflict with prior statements, are genuine contradictions — call escalate_to_human with category "contradictory_information".
 """
 
 
