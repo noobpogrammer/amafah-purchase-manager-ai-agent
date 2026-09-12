@@ -401,6 +401,7 @@ class TestReminderSystemAudit:
             "rfqs": {
                 "id": "rfq-100",
                 "product_name": "Cement 5kg",
+                "status": "active",
                 "deadline_hours": 24,
                 "created_at": sent_at,
             },
@@ -435,6 +436,7 @@ class TestReminderSystemAudit:
             "rfqs": {
                 "id": "rfq-100",
                 "product_name": "Cement 5kg",
+                "status": "active",
                 "deadline_hours": 24,
                 "created_at": sent_at,
             },
@@ -469,6 +471,7 @@ class TestReminderSystemAudit:
             "rfqs": {
                 "id": "rfq-100",
                 "product_name": "Cement 5kg",
+                "status": "active",
                 "deadline_hours": 24,
                 "created_at": sent_at,
             },
@@ -579,7 +582,7 @@ class TestReminderSystemAudit:
             "id": "rfq-supp-pending",
             "sent_at": sent_at,
             "reminder_count": 0,
-            "rfqs": {"id": "rfq-300", "product_name": "Paints", "deadline_hours": 24},
+            "rfqs": {"id": "rfq-300", "product_name": "Paints", "status": "active", "deadline_hours": 24},
             "suppliers": {"id": "supp-pending", "name": "Pending Supp", "phone_number": "11111111"},
         }
 

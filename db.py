@@ -212,11 +212,11 @@ def format_supplier_categories(categories) -> str:
 
 def is_rfq_open(rfq: dict) -> bool:
     """
-    Returns True if an RFQ is strictly active and within its deadline window (now < due_by).
+    Returns True if an RFQ is strictly in 'active' status and within its deadline window (now < due_by).
     """
     if not rfq or not isinstance(rfq, dict):
         return False
-    if rfq.get("status") and rfq.get("status") not in ("active", "sent", "clarifying", "responded"):
+    if rfq.get("status") != "active":
         return False
     due_by_str = rfq.get("due_by")
     if due_by_str:
@@ -528,6 +528,28 @@ def get_message_by_event_key(event_key: str) -> dict | None:
     except Exception as e:
         logger.debug("get_message_by_event_key error for %s: %s", event_key, e)
         return None
+
+
+def get_supplier_conversation_history(client_id: str, supplier_id: str, limit: int = 10, exclude_message_id: str = None) -> list[dict]:
+    """
+    Fetches bounded chronological conversation history (oldest -> newest) for a supplier from message_log.
+    """
+    if not client_id or not supplier_id:
+        return []
+    try:
+        query = (
+            supabase.table("message_log")
+            .select("id, direction, body, related_rfq_id, created_at, status")
+            .eq("client_id", client_id)
+            .eq("supplier_id", supplier_id)
+        )
+        if exclude_message_id:
+            query = query.neq("id", exclude_message_id)
+        res = query.order("created_at", desc=True).limit(limit).execute()
+        return list(reversed(res.data or []))
+    except Exception as ex:
+        logger.warning("get_supplier_conversation_history error for supplier %s: %s", supplier_id, ex)
+        return []
 
 
 def get_rfq_suppliers_for_rfq(rfq_id: str) -> list[dict]:

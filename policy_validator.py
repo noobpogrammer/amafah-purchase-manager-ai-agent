@@ -55,6 +55,7 @@ def validate_action(
     client_id: str,
     supplier_id: str,
     context_rfqs: Optional[List[Dict[str, Any]]] = None,
+    matched_rfq_id: Optional[str] = None,
 ) -> ValidationResult:
     """
     Deterministic validation of an LLM action proposal.
@@ -101,6 +102,15 @@ def validate_action(
                 action=tool_name,
                 category=ActionCategory.MUTATION,
                 reason="Missing or invalid rfq_id in record_quote proposal.",
+            )
+
+        # Deterministic stanza lock: proposal cannot switch away from matched RFQ
+        if matched_rfq_id and rfq_id != matched_rfq_id:
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.MUTATION,
+                reason=f"Proposed RFQ '{rfq_id}' does not match deterministically locked RFQ '{matched_rfq_id}'.",
             )
 
         # Validate numeric price
@@ -218,6 +228,15 @@ def validate_action(
                 reason="Missing or empty candidate_rfq_ids for clarification request.",
             )
 
+        # Deterministic stanza lock: clarification candidates cannot divert away from matched RFQ
+        if matched_rfq_id and (candidate_ids != [matched_rfq_id] and matched_rfq_id not in candidate_ids):
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=f"Clarification candidate RFQs do not include deterministically locked RFQ '{matched_rfq_id}'.",
+            )
+
         if not question or not isinstance(question, str):
             return ValidationResult(
                 is_valid=False,
@@ -288,6 +307,15 @@ def validate_action(
                 action=tool_name,
                 category=ActionCategory.PROPOSE_COMMUNICATE,
                 reason="Missing or invalid rfq_id in negotiate_price proposal.",
+            )
+
+        # Deterministic stanza lock: proposal cannot switch away from matched RFQ
+        if matched_rfq_id and rfq_id != matched_rfq_id:
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=f"Proposed RFQ '{rfq_id}' does not match deterministically locked RFQ '{matched_rfq_id}'.",
             )
 
         # Validate numeric price

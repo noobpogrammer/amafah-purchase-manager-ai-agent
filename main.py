@@ -27,10 +27,14 @@ import requests
 from starlette.concurrency import run_in_threadpool
 
 import db
+import logging
 from auth import get_current_user
 import groq_client
+from groq_client import AgentContext
 import guardrails
-from policy_validator import ActionProposal, validate_action, ActionCategory
+from policy_validator import ActionProposal, validate_action, ActionCategory, ValidationResult
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -726,6 +730,159 @@ app.add_middleware(
 )
 
 
+async def execute_validated_action(
+    validation: ValidationResult,
+    context: AgentContext,
+    raw_message: str,
+    supplier: dict,
+    client_id: str,
+) -> dict:
+    """
+    Consolidated, deterministic action execution across all inbound message origins:
+    1. Executes DB mutations (quotes, clarification state, negotiation attempts, human escalation flags).
+    2. Logs outbound messages in message_log.
+    3. Enqueues outbound WhatsApp delivery through the paced queue.
+    """
+    phone_number = supplier.get("phone_number")
+    supplier_id = supplier["id"]
+
+    if validation.action == "record_quote":
+        args = validation.sanitized_args
+        target_rfq_id = args["rfq_id"]
+        db.record_quote(
+            rfq_id=target_rfq_id,
+            supplier_id=supplier_id,
+            price=args["price"],
+            delivery_time=args.get("delivery_time"),
+            quality_notes=args.get("quality_notes"),
+            raw_message=raw_message,
+        )
+
+        # Resolve pending clarification if one was active for this supplier
+        if context.pending_clarification:
+            db.resolve_pending_clarification(context.pending_clarification["id"])
+            db.revert_unresolved_candidates(
+                supplier_id=supplier_id,
+                resolved_rfq_id=target_rfq_id,
+                candidate_rfq_ids=context.pending_clarification.get("pending_rfq_ids", []),
+            )
+
+        msg_log_id = db.log_message(client_id, supplier_id, "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
+        await enqueue_message(phone_number, THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+
+        if context.match_source:
+            return {"status": "recorded_via_quoted_message", "rfq_id": target_rfq_id}
+        elif context.pending_clarification:
+            return {
+                "status": "recorded_from_clarification",
+                "rfq_id": target_rfq_id,
+                "clarification_id": context.pending_clarification["id"],
+            }
+        else:
+            return {"status": "recorded", "rfq_id": target_rfq_id}
+
+    elif validation.action == "negotiate_price":
+        args = validation.sanitized_args
+        target_rfq_id = args["rfq_id"]
+        quoted_price = args["quoted_price"]
+        neg_msg = args["negotiation_message"]
+        delivery = args.get("delivery_time")
+        notes = args.get("quality_notes")
+
+        db.record_quote(
+            rfq_id=target_rfq_id,
+            supplier_id=supplier_id,
+            price=quoted_price,
+            delivery_time=delivery,
+            quality_notes=notes,
+            raw_message=raw_message,
+        )
+
+        attempts = db.increment_negotiation_attempts(target_rfq_id, supplier_id)
+        if attempts <= 0:
+            if context.pending_clarification:
+                db.resolve_pending_clarification(context.pending_clarification["id"])
+                db.revert_unresolved_candidates(
+                    supplier_id=supplier_id,
+                    resolved_rfq_id=target_rfq_id,
+                    candidate_rfq_ids=context.pending_clarification.get("pending_rfq_ids", []),
+                )
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
+            await enqueue_message(phone_number, THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+            return {"status": "rejected_by_policy", "reason": "Negotiation attempt limit reached."}
+
+        if context.pending_clarification:
+            db.resolve_pending_clarification(context.pending_clarification["id"])
+            db.revert_unresolved_candidates(
+                supplier_id=supplier_id,
+                resolved_rfq_id=target_rfq_id,
+                candidate_rfq_ids=context.pending_clarification.get("pending_rfq_ids", []),
+            )
+
+        msg_log_id = db.log_message(client_id, supplier_id, "outbound", neg_msg, related_rfq_id=target_rfq_id)
+        await enqueue_message(phone_number, neg_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+        return {"status": "negotiation_sent", "rfq_id": target_rfq_id, "attempts": attempts}
+
+    elif validation.action == "request_clarification":
+        args = validation.sanitized_args
+        candidate_ids = args.get("candidate_rfq_ids") or []
+        next_round = (context.pending_clarification.get("round_number", 1) + 1) if context.pending_clarification else 1
+
+        db.create_pending_clarification(
+            client_id=client_id,
+            supplier_id=supplier_id,
+            candidate_rfq_ids=candidate_ids,
+            raw_message=raw_message,
+            extracted_price=args.get("extracted_price"),
+            extracted_delivery=args.get("extracted_delivery"),
+            extracted_notes=args.get("extracted_notes"),
+            round_number=next_round,
+        )
+        if context.pending_clarification:
+            db.abandon_pending_clarification(context.pending_clarification["id"])
+
+        question = args["clarifying_question"]
+        single_rfq = candidate_ids[0] if len(candidate_ids) == 1 else (context.matched_rfq_id or None)
+        if single_rfq:
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", question, related_rfq_id=single_rfq)
+            await enqueue_message(phone_number, question, rfq_id=single_rfq, supplier_id=supplier_id, message_log_id=msg_log_id)
+        else:
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", question)
+            await enqueue_message(phone_number, question, message_log_id=msg_log_id)
+        return {"status": "clarification_needed", "question": question}
+
+    elif validation.action == "escalate_to_human":
+        args = validation.sanitized_args
+        esc_rfq_id = args.get("rfq_id") or context.matched_rfq_id
+        reason = args.get("reason", "Human review requested by agent")
+        category = args.get("category", "other")
+
+        db.flag_for_human_review(
+            client_id=client_id,
+            supplier_id=supplier_id,
+            rfq_id=esc_rfq_id,
+            reason=reason,
+            category=category,
+            raw_message=raw_message,
+        )
+        if context.pending_clarification:
+            db.abandon_pending_clarification(context.pending_clarification["id"])
+
+        if esc_rfq_id:
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", HUMAN_ACK_MSG, related_rfq_id=esc_rfq_id)
+            await enqueue_message(phone_number, HUMAN_ACK_MSG, rfq_id=esc_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+        else:
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", HUMAN_ACK_MSG)
+            await enqueue_message(phone_number, HUMAN_ACK_MSG, message_log_id=msg_log_id)
+        return {
+            "status": "escalated",
+            "reason": reason,
+            "category": category,
+        }
+
+    return {"status": "unhandled_action", "action": validation.action}
+
+
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
     payload = {}
@@ -739,11 +896,9 @@ async def whatsapp_webhook(request: Request):
         print(f"[Webhook Debug Error] Could not parse request body as JSON: {parse_err}")
 
     try:
-        # Evolution API payload shape — adjust field paths to match your actual webhook format
+        # Evolution API payload shape
         data = payload.get("data", {})
 
-        # Evolution API occasionally sends "data" as a list (batched events)
-        # instead of a single dict. Take the first item if so; skip if empty.
         if isinstance(data, list):
             if not data:
                 return {"status": "ignored", "reason": "empty batched event"}
@@ -751,7 +906,7 @@ async def whatsapp_webhook(request: Request):
 
         key_data = data.get("key", {})
 
-        # Ignore outgoing messages sent by ourselves (e.g., our own outgoing RFQs)
+        # Ignore outgoing messages sent by ourselves
         if key_data.get("fromMe", False):
             return {"status": "ignored", "reason": "outgoing message (fromMe)"}
 
@@ -818,189 +973,30 @@ async def whatsapp_webhook(request: Request):
             print(f"[Webhook] {err_msg}")
             return {"status": "ignored", "reason": "unknown supplier"}
 
-        db.log_message(client_id, supplier["id"], "inbound", message_text)
+        inbound_log_id = db.log_message(client_id, supplier["id"], "inbound", message_text)
 
-
-        # Fix 1 & Change 3: Check if message is a quoted reply (reply-to) matching a sent RFQ message
+        # 1. Deterministic Quoted / Stanza Match
         matched_rfq_supplier = None
+        match_source = None
         if quoted_stanza_id:
             matched_rfq_supplier = db.get_rfq_supplier_by_sent_message_id(supplier["id"], quoted_stanza_id)
             if not matched_rfq_supplier:
                 print(f"[Webhook] Quoted stanzaId '{quoted_stanza_id}' present but does not match any open RFQ for supplier {supplier['id']}. Ignoring cross-RFQ fallback.")
                 return {"status": "ignored", "reason": "quoted_stanza_id already responded or closed"}
+            match_source = "exact_stanza"
         elif quoted_text:
             matched_rfq_supplier = db.get_rfq_supplier_by_quoted_text(supplier["id"], quoted_text)
+            if matched_rfq_supplier:
+                match_source = "quoted_text"
 
-        if matched_rfq_supplier and matched_rfq_supplier.get("rfqs"):
-                matched_rfq = matched_rfq_supplier["rfqs"]
-                print(f"[Webhook] Direct match via quoted message (stanzaId: {quoted_stanza_id}) -> RFQ ID: {matched_rfq['id']} ({matched_rfq['product_name']})")
-
-                # Single RFQ context — bypasses multi-RFQ ambiguity resolution entirely!
-                rfq_context = format_rfq_context([matched_rfq_supplier], current_supplier_id=supplier["id"])
-                prior_quotes = db.get_supplier_prior_quotes(supplier["id"], [matched_rfq["id"]])
-                prior_quotes_context = format_prior_quotes_context(prior_quotes)
-
-                try:
-                    decision = groq_client.route_supplier_message(message_text, rfq_context, prior_quotes_context)
-                except Exception as groq_err:
-                    tb_str = traceback.format_exc()
-
-                    print(f"\n=== GROQ ERROR (quoted message route) ===\n{tb_str}\n===========================================\n")
-                    db.log_webhook_error(f"Groq quoted route error: {groq_err}", tb_str, payload)
-                    reason = f"Groq AI service error during message routing: {str(groq_err)}"
-                    db.flag_for_human_review(
-                        client_id=client_id,
-                        supplier_id=supplier["id"],
-                        rfq_id=matched_rfq["id"],
-                        reason=reason,
-                        category="other",
-                        raw_message=message_text,
-                    )
-                    msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
-                    await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
-                    return {"status": "escalated_due_to_groq_error", "reason": reason}
-
-                decision_tool = decision.get("tool_name", "")
-                decision_args = dict(decision.get("arguments", {}))
-                if decision_tool in ("record_quote", "negotiate_price") and not decision_args.get("rfq_id"):
-                    decision_args["rfq_id"] = matched_rfq["id"]
-
-                proposal = ActionProposal(
-                    tool_name=decision_tool,
-                    arguments=decision_args,
-                    raw_message=message_text,
-                )
-                validation = validate_action(proposal, client_id=client_id, supplier_id=supplier["id"], context_rfqs=[matched_rfq_supplier])
-
-                if not validation.is_valid:
-                    print(f"[Policy Validator] Rejected action '{proposal.tool_name}': {validation.reason}")
-                    db.flag_for_human_review(
-                        client_id=client_id,
-                        supplier_id=supplier["id"],
-                        rfq_id=matched_rfq["id"],
-                        reason=f"Policy Validator rejection: {validation.reason}",
-                        category="other",
-                        raw_message=message_text,
-                    )
-                    msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG, related_rfq_id=matched_rfq["id"])
-                    await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, rfq_id=matched_rfq["id"], supplier_id=supplier["id"], message_log_id=msg_log_id)
-                    return {"status": "rejected_by_policy", "reason": validation.reason}
-
-                if validation.action == "record_quote":
-                    args = validation.sanitized_args
-                    target_rfq_id = args["rfq_id"]
-                    db.record_quote(
-                        rfq_id=target_rfq_id,
-                        supplier_id=supplier["id"],
-                        price=args["price"],
-                        delivery_time=args.get("delivery_time"),
-                        quality_notes=args.get("quality_notes"),
-                        raw_message=message_text,
-                    )
-
-                    # Check for pending clarification for supplier and revert unresolved candidates
-                    pending_clarif = db.get_pending_clarification_for_supplier(supplier["id"])
-                    if pending_clarif:
-                        db.resolve_pending_clarification(pending_clarif["id"])
-                        db.revert_unresolved_candidates(
-                            supplier_id=supplier["id"],
-                            resolved_rfq_id=target_rfq_id,
-                            candidate_rfq_ids=pending_clarif.get("pending_rfq_ids", []),
-                        )
-
-                    msg_log_id = db.log_message(client_id, supplier["id"], "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
-                    await enqueue_message(supplier["phone_number"], THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
-                    return {"status": "recorded_via_quoted_message", "rfq_id": target_rfq_id}
-
-                elif validation.action == "negotiate_price":
-                    args = validation.sanitized_args
-                    target_rfq_id = args["rfq_id"]
-                    quoted_price = args["quoted_price"]
-                    neg_msg = args["negotiation_message"]
-                    delivery = args.get("delivery_time")
-                    notes = args.get("quality_notes")
-
-                    db.record_quote(
-                        rfq_id=target_rfq_id,
-                        supplier_id=supplier["id"],
-                        price=quoted_price,
-                        delivery_time=delivery,
-                        quality_notes=notes,
-                        raw_message=message_text,
-                    )
-
-                    attempts = db.increment_negotiation_attempts(target_rfq_id, supplier["id"])
-                    if attempts <= 0:
-                        pending_clarif = db.get_pending_clarification_for_supplier(supplier["id"])
-                        if pending_clarif:
-                            db.resolve_pending_clarification(pending_clarif["id"])
-                            db.revert_unresolved_candidates(
-                                supplier_id=supplier["id"],
-                                resolved_rfq_id=target_rfq_id,
-                                candidate_rfq_ids=pending_clarif.get("pending_rfq_ids", []),
-                            )
-                        msg_log_id = db.log_message(client_id, supplier["id"], "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
-                        await enqueue_message(supplier["phone_number"], THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
-                        return {"status": "rejected_by_policy", "reason": "Negotiation attempt limit reached."}
-
-                    pending_clarif = db.get_pending_clarification_for_supplier(supplier["id"])
-                    if pending_clarif:
-                        db.resolve_pending_clarification(pending_clarif["id"])
-                        db.revert_unresolved_candidates(
-                            supplier_id=supplier["id"],
-                            resolved_rfq_id=target_rfq_id,
-                            candidate_rfq_ids=pending_clarif.get("pending_rfq_ids", []),
-                        )
-
-                    msg_log_id = db.log_message(client_id, supplier["id"], "outbound", neg_msg, related_rfq_id=target_rfq_id)
-                    await enqueue_message(supplier["phone_number"], neg_msg, rfq_id=target_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
-                    return {"status": "negotiation_sent", "rfq_id": target_rfq_id, "attempts": attempts}
-
-                elif validation.action == "request_clarification":
-                    args = validation.sanitized_args
-                    db.create_pending_clarification(
-                        client_id=client_id,
-                        supplier_id=supplier["id"],
-                        candidate_rfq_ids=args.get("candidate_rfq_ids", [matched_rfq["id"]]),
-                        raw_message=message_text,
-                        extracted_price=args.get("extracted_price"),
-                        extracted_delivery=args.get("extracted_delivery"),
-                        extracted_notes=args.get("extracted_notes"),
-                    )
-                    question = args["clarifying_question"]
-                    msg_log_id = db.log_message(client_id, supplier["id"], "outbound", question, related_rfq_id=matched_rfq["id"])
-                    await enqueue_message(supplier["phone_number"], question, rfq_id=matched_rfq["id"], supplier_id=supplier["id"], message_log_id=msg_log_id)
-                    return {"status": "clarification_needed", "question": question}
-
-                elif validation.action == "escalate_to_human":
-                    args = validation.sanitized_args
-                    esc_rfq_id = args.get("rfq_id") or matched_rfq["id"]
-                    db.flag_for_human_review(
-                        client_id=client_id,
-                        supplier_id=supplier["id"],
-                        rfq_id=esc_rfq_id,
-                        reason=args.get("reason", "Human review requested by agent"),
-                        category=args.get("category", "other"),
-                        raw_message=message_text,
-                    )
-                    if esc_rfq_id:
-                        msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG, related_rfq_id=esc_rfq_id)
-                        await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, rfq_id=esc_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
-                    else:
-                        msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
-                        await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
-                    return {
-                        "status": "escalated",
-                        "reason": args.get("reason"),
-                        "category": args.get("category"),
-                    }
-
-        # Check for unresolved pending clarification (status = 'awaiting_reply') for this supplier
+        # 2. Check Pending Clarification (with 2-round cap check)
         pending = db.get_pending_clarification_for_supplier(supplier["id"])
-        if pending:
-            # Check clarification rounds cap directly on thread's round_number (max 2 rounds allowed)
-            current_round = pending.get("round_number", 1)
-            if current_round >= 2:
+        if pending and not isinstance(pending, dict):
+            pending = None
+
+        if pending and isinstance(pending, dict):
+            round_num = pending.get("round_number", 1)
+            if isinstance(round_num, (int, float)) and round_num >= 2:
                 db.abandon_pending_clarification(pending["id"])
                 reason = "Maximum clarification rounds (2) exceeded for supplier."
                 db.flag_for_human_review(
@@ -1016,317 +1012,159 @@ async def whatsapp_webhook(request: Request):
                 await enqueue_message(supplier["phone_number"], ack_msg, message_log_id=msg_log_id)
                 return {"status": "escalated", "reason": reason, "category": "unclear_intent"}
 
-            candidate_rfq_ids = pending.get("pending_rfq_ids", [])
-            candidate_rfqs = db.get_rfqs_by_ids(candidate_rfq_ids)
-            rfq_context = format_rfq_context(candidate_rfqs, current_supplier_id=supplier["id"])
+        # 3. Retrieve Open RFQs & Candidate RFQs
+        open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"]) or []
+        if matched_rfq_supplier and not any(
+            (e.get("rfqs", {}).get("id") or e.get("id")) == (matched_rfq_supplier.get("rfqs", {}).get("id") or matched_rfq_supplier.get("id"))
+            for e in open_rfqs
+        ):
+            open_rfqs.append(matched_rfq_supplier)
 
-            # Fetch prior quotes context for contradiction detection
-            prior_quotes = db.get_supplier_prior_quotes(supplier["id"], candidate_rfq_ids)
-            prior_quotes_context = format_prior_quotes_context(prior_quotes)
+        if pending:
+            candidate_ids = pending.get("pending_rfq_ids", [])
+            if candidate_ids:
+                cand_rfqs = db.get_rfqs_by_ids(candidate_ids)
+                for cr in cand_rfqs:
+                    cr_id = cr.get("rfqs", {}).get("id") or cr.get("id")
+                    if not any((e.get("rfqs", {}).get("id") or e.get("id")) == cr_id for e in open_rfqs):
+                        open_rfqs.append(cr)
 
-            try:
-                decision = groq_client.resolve_clarification(
-                    message_text=message_text,
-                    candidate_rfqs_context=rfq_context,
-                    previous_message=pending.get("raw_message", ""),
-                    prior_quotes_context=prior_quotes_context,
-                )
-            except Exception as groq_err:
-                tb_str = traceback.format_exc()
-                print(f"\n=== GROQ ERROR (resolve_clarification) ===\n{tb_str}\n=====================================\n")
-                db.log_webhook_error(f"Groq resolve_clarification error: {groq_err}", tb_str, payload)
-                reason = f"Groq AI service error during clarification resolution: {str(groq_err)}"
-                db.flag_for_human_review(
-                    client_id=client_id,
-                    supplier_id=supplier["id"],
-                    rfq_id=None,
-                    reason=reason,
-                    category="other",
-                    raw_message=message_text,
-                )
-                db.abandon_pending_clarification(pending["id"])
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
-                await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
-                return {"status": "escalated_due_to_groq_error", "reason": reason}
-
-            proposal = ActionProposal(
-                tool_name=decision.get("tool_name", ""),
-                arguments=decision.get("arguments", {}),
-                raw_message=message_text,
-            )
-            validation = validate_action(proposal, client_id=client_id, supplier_id=supplier["id"], context_rfqs=candidate_rfqs)
-
-            if not validation.is_valid:
-                print(f"[Policy Validator] Rejected clarification action '{proposal.tool_name}': {validation.reason}")
-                db.flag_for_human_review(
-                    client_id=client_id,
-                    supplier_id=supplier["id"],
-                    rfq_id=None,
-                    reason=f"Policy Validator rejection during clarification: {validation.reason}",
-                    category="other",
-                    raw_message=message_text,
-                )
-                db.abandon_pending_clarification(pending["id"])
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
-                await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
-                return {"status": "rejected_by_policy", "reason": validation.reason}
-
-            if validation.action == "record_quote":
-                args = validation.sanitized_args
-                db.record_quote(
-                    rfq_id=args["rfq_id"],
-                    supplier_id=supplier["id"],
-                    price=args["price"],
-                    delivery_time=args.get("delivery_time"),
-                    quality_notes=args.get("quality_notes"),
-                    raw_message=message_text,
-                )
-                db.resolve_pending_clarification(pending["id"])
-                db.revert_unresolved_candidates(
-                    supplier_id=supplier["id"],
-                    resolved_rfq_id=args["rfq_id"],
-                    candidate_rfq_ids=candidate_rfq_ids,
-                )
-
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", THANK_YOU_MSG, related_rfq_id=args["rfq_id"])
-                await enqueue_message(supplier["phone_number"], THANK_YOU_MSG, rfq_id=args["rfq_id"], supplier_id=supplier["id"], message_log_id=msg_log_id)
-
-                return {
-                    "status": "recorded_from_clarification",
-                    "rfq_id": args["rfq_id"],
-                    "clarification_id": pending["id"],
-                }
-            elif validation.action == "negotiate_price":
-                args = validation.sanitized_args
-                target_rfq_id = args["rfq_id"]
-                quoted_price = args["quoted_price"]
-                neg_msg = args["negotiation_message"]
-                delivery = args.get("delivery_time")
-                notes = args.get("quality_notes")
-
-                db.record_quote(
-                    rfq_id=target_rfq_id,
-                    supplier_id=supplier["id"],
-                    price=quoted_price,
-                    delivery_time=delivery,
-                    quality_notes=notes,
-                    raw_message=message_text,
-                )
-
-                attempts = db.increment_negotiation_attempts(target_rfq_id, supplier["id"])
-                if attempts <= 0:
-                    db.resolve_pending_clarification(pending["id"])
-                    db.revert_unresolved_candidates(
-                        supplier_id=supplier["id"],
-                        resolved_rfq_id=target_rfq_id,
-                        candidate_rfq_ids=candidate_rfq_ids,
-                    )
-                    msg_log_id = db.log_message(client_id, supplier["id"], "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
-                    await enqueue_message(supplier["phone_number"], THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
-                    return {"status": "rejected_by_policy", "reason": "Negotiation attempt limit reached."}
-
-                db.resolve_pending_clarification(pending["id"])
-                db.revert_unresolved_candidates(
-                    supplier_id=supplier["id"],
-                    resolved_rfq_id=target_rfq_id,
-                    candidate_rfq_ids=candidate_rfq_ids,
-                )
-
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", neg_msg, related_rfq_id=target_rfq_id)
-                await enqueue_message(supplier["phone_number"], neg_msg, rfq_id=target_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
-                return {"status": "negotiation_sent", "rfq_id": target_rfq_id, "attempts": attempts}
-
-            elif validation.action == "request_clarification":
-                args = validation.sanitized_args
-                next_round = current_round + 1
-                db.create_pending_clarification(
-                    client_id=client_id,
-                    supplier_id=supplier["id"],
-                    candidate_rfq_ids=args["candidate_rfq_ids"],
-                    raw_message=message_text,
-                    extracted_price=args.get("extracted_price"),
-                    extracted_delivery=args.get("extracted_delivery"),
-                    extracted_notes=args.get("extracted_notes"),
-                    round_number=next_round,
-                )
-                db.abandon_pending_clarification(pending["id"])
-                question = args["clarifying_question"]
-                cand_ids = args.get("candidate_rfq_ids") or []
-                single_rfq = cand_ids[0] if len(cand_ids) == 1 else None
-                if single_rfq:
-                    msg_log_id = db.log_message(client_id, supplier["id"], "outbound", question, related_rfq_id=single_rfq)
-                    await enqueue_message(supplier["phone_number"], question, rfq_id=single_rfq, supplier_id=supplier["id"], message_log_id=msg_log_id)
-                else:
-                    msg_log_id = db.log_message(client_id, supplier["id"], "outbound", question)
-                    await enqueue_message(supplier["phone_number"], question, message_log_id=msg_log_id)
-                return {"status": "clarification_needed", "question": question}
-
-            elif validation.action == "escalate_to_human":
-                args = validation.sanitized_args
-                esc_rfq_id = args.get("rfq_id")
-                db.flag_for_human_review(
-                    client_id=client_id,
-                    supplier_id=supplier["id"],
-                    rfq_id=esc_rfq_id,
-                    reason=args.get("reason", "Human review requested by agent"),
-                    category=args.get("category", "other"),
-                    raw_message=message_text,
-                )
-                db.abandon_pending_clarification(pending["id"])
-                if esc_rfq_id:
-                    msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG, related_rfq_id=esc_rfq_id)
-                    await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, rfq_id=esc_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
-                else:
-                    msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
-                    await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
-                return {
-                    "status": "escalated",
-                    "reason": args.get("reason"),
-                    "category": args.get("category"),
-                }
-
-        open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"])
-
-        if not open_rfqs:
+        if not open_rfqs and not matched_rfq_supplier and not pending:
             return {
                 "status": "no_open_rfq",
                 "note": "message received but no active RFQ to match",
             }
 
-        rfq_context = format_rfq_context(open_rfqs, current_supplier_id=supplier["id"])
-        open_rfq_ids = [entry["rfqs"]["id"] for entry in open_rfqs]
-        prior_quotes = db.get_supplier_prior_quotes(supplier["id"], open_rfq_ids)
-        prior_quotes_context = format_prior_quotes_context(prior_quotes)
+        # 4. Fetch Prior Quotes, Negotiation Attempts, and Competitive Context
+        open_rfq_ids = []
+        for e in open_rfqs:
+            rfq_obj = e.get("rfqs", e) if isinstance(e, dict) else e
+            if isinstance(rfq_obj, dict) and rfq_obj.get("id"):
+                open_rfq_ids.append(rfq_obj["id"])
 
+        prior_quotes = []
+        if open_rfq_ids:
+            try:
+                prior_quotes = db.get_supplier_prior_quotes(supplier["id"], open_rfq_ids)
+            except Exception as e:
+                logger.warning(f"Error loading prior quotes: {e}")
+
+        negotiation_attempts = {}
+        for r_id in open_rfq_ids:
+            try:
+                negotiation_attempts[r_id] = db.get_negotiation_attempts(r_id, supplier["id"])
+            except Exception as e:
+                logger.warning(f"Error loading negotiation attempts for RFQ {r_id}: {e}")
+                negotiation_attempts[r_id] = 0
+
+        competitive_context = {}
+        for r_id in open_rfq_ids:
+            try:
+                comp_ctx = db.get_competitive_pricing_context(r_id, supplier["id"])
+                if isinstance(comp_ctx, dict) and comp_ctx.get("has_competition"):
+                    competitive_context[r_id] = f"Best competing quote is AED {comp_ctx['best_competing_price']} (from {comp_ctx['competing_quotes_count']} other supplier(s))"
+            except Exception as e:
+                logger.warning(f"Error loading competitive context for RFQ {r_id}: {e}")
+
+        # 5. Fetch Bounded Chronological Conversation History (excluding current inbound turn)
         try:
-            decision = groq_client.route_supplier_message(message_text, rfq_context, prior_quotes_context)
+            conv_history = db.get_supplier_conversation_history(client_id, supplier["id"], limit=10, exclude_message_id=inbound_log_id)
+        except Exception as e:
+            logger.warning(f"Error loading conversation history: {e}")
+            conv_history = []
+
+        matched_rfq_id = None
+        if matched_rfq_supplier:
+            matched_rfq = matched_rfq_supplier.get("rfqs", matched_rfq_supplier)
+            matched_rfq_id = matched_rfq.get("id") if isinstance(matched_rfq, dict) else None
+
+        # 6. Build Single Unified AgentContext
+        context = AgentContext(
+            client_id=client_id,
+            supplier_id=supplier["id"],
+            supplier_name=supplier.get("name"),
+            supplier_phone=supplier.get("phone_number"),
+            input_origin="supplier",
+            matched_rfq_id=matched_rfq_id,
+            match_source=match_source,
+            open_rfqs=open_rfqs,
+            pending_clarification=pending,
+            prior_quotes=prior_quotes,
+            negotiation_attempts=negotiation_attempts,
+            competitive_context=competitive_context,
+            conversation_history=conv_history,
+        )
+
+        # 7. Unified Reasoning Execution
+        try:
+            decision = groq_client.reason_about_procurement_message(message_text, context, input_origin="supplier")
         except Exception as groq_err:
             tb_str = traceback.format_exc()
-            print(f"\n=== GROQ ERROR (route_supplier_message) ===\n{tb_str}\n===========================================\n")
-            db.log_webhook_error(f"Groq route_supplier_message error: {groq_err}", tb_str, payload)
-            reason = f"Groq AI service error during message routing: {str(groq_err)}"
+            print(f"\n=== GROQ ERROR (reason_about_procurement_message) ===\n{tb_str}\n======================================================\n")
+            db.log_webhook_error(f"Groq reason_about_procurement_message error: {groq_err}", tb_str, payload)
+            reason = f"Groq AI service error during message reasoning: {str(groq_err)}"
             db.flag_for_human_review(
                 client_id=client_id,
                 supplier_id=supplier["id"],
-                rfq_id=None,
+                rfq_id=matched_rfq_id,
                 reason=reason,
                 category="other",
                 raw_message=message_text,
             )
+            if pending:
+                db.abandon_pending_clarification(pending["id"])
             msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
             await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
             return {"status": "escalated_due_to_groq_error", "reason": reason}
 
+        decision_tool = decision.get("tool_name", "")
+        decision_args = dict(decision.get("arguments", {}))
+        if decision_tool in ("record_quote", "negotiate_price") and not decision_args.get("rfq_id") and matched_rfq_id:
+            decision_args["rfq_id"] = matched_rfq_id
+
         proposal = ActionProposal(
-            tool_name=decision.get("tool_name", ""),
-            arguments=decision.get("arguments", {}),
+            tool_name=decision_tool,
+            arguments=decision_args,
             raw_message=message_text,
         )
-        validation = validate_action(proposal, client_id=client_id, supplier_id=supplier["id"], context_rfqs=open_rfqs)
+
+        # 8. Policy Validator Execution (with Deterministic Stanza Lock)
+        validation = validate_action(
+            proposal,
+            client_id=client_id,
+            supplier_id=supplier["id"],
+            context_rfqs=open_rfqs,
+            matched_rfq_id=context.matched_rfq_id,
+        )
 
         if not validation.is_valid:
-            print(f"[Policy Validator] Rejected general route action '{proposal.tool_name}': {validation.reason}")
+            print(f"[Policy Validator] Rejected action '{proposal.tool_name}': {validation.reason}")
             db.flag_for_human_review(
                 client_id=client_id,
                 supplier_id=supplier["id"],
-                rfq_id=proposal.arguments.get("rfq_id"),
+                rfq_id=proposal.arguments.get("rfq_id") or matched_rfq_id,
                 reason=f"Policy Validator rejection: {validation.reason}",
                 category="other",
                 raw_message=message_text,
             )
-            msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
-            await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
-            return {"status": "rejected_by_policy", "reason": validation.reason}
-
-        if validation.action == "record_quote":
-            args = validation.sanitized_args
-            db.record_quote(
-                rfq_id=args["rfq_id"],
-                supplier_id=supplier["id"],
-                price=args["price"],
-                delivery_time=args.get("delivery_time"),
-                quality_notes=args.get("quality_notes"),
-                raw_message=message_text,
-            )
-
-            msg_log_id = db.log_message(client_id, supplier["id"], "outbound", THANK_YOU_MSG, related_rfq_id=args["rfq_id"])
-            await enqueue_message(supplier["phone_number"], THANK_YOU_MSG, rfq_id=args["rfq_id"], supplier_id=supplier["id"], message_log_id=msg_log_id)
-
-            return {"status": "recorded", "rfq_id": args["rfq_id"]}
-
-        elif validation.action == "negotiate_price":
-            args = validation.sanitized_args
-            target_rfq_id = args["rfq_id"]
-            quoted_price = args["quoted_price"]
-            neg_msg = args["negotiation_message"]
-            delivery = args.get("delivery_time")
-            notes = args.get("quality_notes")
-
-            db.record_quote(
-                rfq_id=target_rfq_id,
-                supplier_id=supplier["id"],
-                price=quoted_price,
-                delivery_time=delivery,
-                quality_notes=notes,
-                raw_message=message_text,
-            )
-
-            attempts = db.increment_negotiation_attempts(target_rfq_id, supplier["id"])
-            if attempts <= 0:
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
-                await enqueue_message(supplier["phone_number"], THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
-                return {"status": "rejected_by_policy", "reason": "Negotiation attempt limit reached."}
-
-            msg_log_id = db.log_message(client_id, supplier["id"], "outbound", neg_msg, related_rfq_id=target_rfq_id)
-            await enqueue_message(supplier["phone_number"], neg_msg, rfq_id=target_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
-            return {"status": "negotiation_sent", "rfq_id": target_rfq_id, "attempts": attempts}
-
-        elif validation.action == "request_clarification":
-            args = validation.sanitized_args
-            db.create_pending_clarification(
-                client_id=client_id,
-                supplier_id=supplier["id"],
-                candidate_rfq_ids=args["candidate_rfq_ids"],
-                raw_message=message_text,
-                extracted_price=args.get("extracted_price"),
-                extracted_delivery=args.get("extracted_delivery"),
-                extracted_notes=args.get("extracted_notes"),
-            )
-            question = args["clarifying_question"]
-            cand_ids = args.get("candidate_rfq_ids") or []
-            single_rfq = cand_ids[0] if len(cand_ids) == 1 else None
-            if single_rfq:
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", question, related_rfq_id=single_rfq)
-                await enqueue_message(supplier["phone_number"], question, rfq_id=single_rfq, supplier_id=supplier["id"], message_log_id=msg_log_id)
-            else:
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", question)
-                await enqueue_message(supplier["phone_number"], question, message_log_id=msg_log_id)
-            return {"status": "clarification_needed", "question": question}
-
-        elif validation.action == "escalate_to_human":
-            args = validation.sanitized_args
-            esc_rfq_id = args.get("rfq_id")
-            db.flag_for_human_review(
-                client_id=client_id,
-                supplier_id=supplier["id"],
-                rfq_id=esc_rfq_id,
-                reason=args.get("reason", "Human review requested by agent"),
-                category=args.get("category", "other"),
-                raw_message=message_text,
-            )
-            if esc_rfq_id:
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG, related_rfq_id=esc_rfq_id)
-                await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, rfq_id=esc_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
+            if pending:
+                db.abandon_pending_clarification(pending["id"])
+            if matched_rfq_id:
+                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG, related_rfq_id=matched_rfq_id)
+                await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, rfq_id=matched_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
             else:
                 msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
                 await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
-            return {
-                "status": "escalated",
-                "reason": args.get("reason"),
-                "category": args.get("category"),
-            }
+            return {"status": "rejected_by_policy", "reason": validation.reason}
 
-        return {"status": "unhandled", "decision": decision}
+        # 9. Consolidated Deterministic Execution
+        return await execute_validated_action(validation, context, message_text, supplier, client_id)
+
+    except Exception as e:
+        tb_str = traceback.format_exc()
+        print(f"\n=== WEBHOOK ERROR ===\n{tb_str}\n=====================\n")
+        db.log_webhook_error(str(e), tb_str, payload)
+        return {"status": "error_logged", "note": "internal error, logged for review"}
 
     except Exception as e:
         tb_str = traceback.format_exc()
