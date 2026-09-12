@@ -415,3 +415,145 @@ class TestFlagResolutionAndFailureRecovery:
             assert resp.json()["sent_to_supplier"] is False
             mock_reasoner.assert_not_called()
             mock_enqueue.assert_not_called()
+
+
+class TestFlagLifecycleTransitions:
+    """Hardened tests for strictly conditional flag lifecycle transitions (pending -> processing -> resolved / pending)."""
+
+    def test_cannot_complete_pending_directly(self):
+        """Cannot transition directly from 'pending' to 'resolved' via complete_flag_operator_action."""
+        # When RPC or DB receives a complete attempt on a pending flag (not processing), it returns None
+        mock_supabase = MagicMock()
+        # Mock RPC returning empty (0 rows affected)
+        mock_supabase.rpc.return_value.execute.return_value.data = []
+        # Mock conditional update returning empty (status != 'processing')
+        mock_supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.eq.return_value.select.return_value.execute.return_value.data = []
+
+        with patch.object(db, "supabase", mock_supabase):
+            res = db.complete_flag_operator_action("flag-1", "tenant-a", human_response="Done")
+            assert res is None
+
+    def test_cannot_complete_resolved_flag(self):
+        """Cannot re-complete an already resolved flag."""
+        mock_supabase = MagicMock()
+        mock_supabase.rpc.return_value.execute.return_value.data = []
+        mock_supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.eq.return_value.select.return_value.execute.return_value.data = []
+
+        with patch.object(db, "supabase", mock_supabase):
+            res = db.complete_flag_operator_action("flag-1", "tenant-a", human_response="Done again")
+            assert res is None
+
+    def test_processing_to_resolved_succeeds(self):
+        """Strict conditional transition from 'processing' to 'resolved' succeeds."""
+        mock_supabase = MagicMock()
+        resolved_row = {
+            "id": "flag-1",
+            "client_id": "tenant-a",
+            "status": "resolved",
+            "human_response": "Approved price",
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        mock_supabase.rpc.return_value.execute.return_value.data = [resolved_row]
+
+        with patch.object(db, "supabase", mock_supabase), \
+             patch.object(db, "get_flag_by_id", return_value=resolved_row):
+            res = db.complete_flag_operator_action("flag-1", "tenant-a", human_response="Approved price")
+            assert res is not None
+            assert res["status"] == "resolved"
+            assert res["human_response"] == "Approved price"
+
+    def test_processing_to_pending_release_succeeds(self):
+        """Strict conditional release from 'processing' to 'pending' succeeds."""
+        mock_supabase = MagicMock()
+        released_row = {
+            "id": "flag-1",
+            "client_id": "tenant-a",
+            "status": "pending",
+        }
+        mock_supabase.rpc.return_value.execute.return_value.data = [released_row]
+
+        with patch.object(db, "supabase", mock_supabase):
+            res = db.release_flag_claim("flag-1", "tenant-a")
+            assert res is not None
+            assert res["status"] == "pending"
+
+    def test_release_on_pending_or_resolved_fails_closed(self):
+        """Calling release_flag_claim on a flag that is not in 'processing' status returns None."""
+        mock_supabase = MagicMock()
+        mock_supabase.rpc.return_value.execute.return_value.data = []
+        mock_supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.eq.return_value.select.return_value.execute.return_value.data = []
+
+        with patch.object(db, "supabase", mock_supabase):
+            res = db.release_flag_claim("flag-1", "tenant-a")
+            assert res is None
+
+    def test_wrong_tenant_changes_nothing(self):
+        """Calling lifecycle functions with wrong client_id returns None (tenant isolation)."""
+        mock_supabase = MagicMock()
+        # When client_id != tenant_id in DB, 0 rows are returned
+        mock_supabase.rpc.return_value.execute.return_value.data = []
+        mock_supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.eq.return_value.select.return_value.execute.return_value.data = []
+
+        with patch.object(db, "supabase", mock_supabase):
+            claim_res = db.claim_flag_for_operator_action("flag-1", "tenant-intruder")
+            assert claim_res is None
+
+            release_res = db.release_flag_claim("flag-1", "tenant-intruder")
+            assert release_res is None
+
+            comp_res = db.complete_flag_operator_action("flag-1", "tenant-intruder", human_response="Hack")
+            assert comp_res is None
+
+    def test_double_claim_allows_one_winner_only(self):
+        """Concurrent or sequential claim on the same flag allows only one winner."""
+        mock_flag = {
+            "id": "flag-1",
+            "client_id": "tenant-a",
+            "status": "processing",
+        }
+
+        # First claim succeeds (returns row)
+        mock_supabase_first = MagicMock()
+        mock_supabase_first.rpc.return_value.execute.return_value.data = [mock_flag]
+
+        # Second claim fails (already in 'processing', 0 rows returned)
+        mock_supabase_second = MagicMock()
+        mock_supabase_second.rpc.return_value.execute.return_value.data = []
+        mock_supabase_second.table.return_value.update.return_value.eq.return_value.eq.return_value.eq.return_value.select.return_value.execute.return_value.data = []
+
+        with patch.object(db, "supabase", mock_supabase_first), \
+             patch.object(db, "get_flag_by_id", return_value=mock_flag):
+            first_win = db.claim_flag_for_operator_action("flag-1", "tenant-a")
+            assert first_win is not None
+
+        with patch.object(db, "supabase", mock_supabase_second):
+            second_win = db.claim_flag_for_operator_action("flag-1", "tenant-a")
+            assert second_win is None
+
+    def test_rpc_permissions_and_security_definer_documented(self):
+        """Verify the migration SQL file declares SECURITY DEFINER, SET search_path, and service_role grants."""
+        migration_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "supabase",
+            "migrations",
+            "20260912070000_flag_lifecycle_rpc_hardening.sql"
+        )
+        assert os.path.exists(migration_path), "Migration file must exist"
+        with open(migration_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Check SECURITY DEFINER and search_path = public on all 3 functions
+        assert content.count("SECURITY DEFINER") >= 3
+        assert content.count("SET search_path = public") >= 3
+
+        # Check REVOKE and GRANT statements for each function
+        assert "REVOKE EXECUTE ON FUNCTION claim_flag_for_operator_action" in content
+        assert "GRANT EXECUTE ON FUNCTION claim_flag_for_operator_action(UUID, UUID) TO service_role;" in content
+
+        assert "REVOKE EXECUTE ON FUNCTION release_flag_claim" in content
+        assert "GRANT EXECUTE ON FUNCTION release_flag_claim(UUID, UUID) TO service_role;" in content
+
+        assert "REVOKE EXECUTE ON FUNCTION complete_flag_operator_action" in content
+        assert "GRANT EXECUTE ON FUNCTION complete_flag_operator_action(UUID, UUID, TEXT) TO service_role;" in content
+

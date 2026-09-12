@@ -1035,7 +1035,21 @@ def claim_flag_for_operator_action(flag_id: str, client_id: str) -> dict | None:
 
 
 def release_flag_claim(flag_id: str, client_id: str) -> dict | None:
-    """Releases an operator claim on failure, reverting status from 'processing' back to 'pending'."""
+    """
+    Releases an operator claim on failure, strictly reverting status from 'processing' back to 'pending'.
+    Uses the database-authoritative RPC when available.
+    """
+    try:
+        res = supabase.rpc(
+            "release_flag_claim",
+            {"p_flag_id": flag_id, "p_client_id": client_id}
+        ).execute()
+        if res.data and len(res.data) > 0:
+            return res.data[0]
+    except Exception as e:
+        logger.warning(f"release_flag_claim RPC error: {e}")
+
+    # Fallback to direct strictly conditional update (processing -> pending only)
     try:
         res = (
             supabase.table("flagged_for_review")
@@ -1053,8 +1067,27 @@ def release_flag_claim(flag_id: str, client_id: str) -> dict | None:
 
 
 def complete_flag_operator_action(flag_id: str, client_id: str, human_response: str = None) -> dict | None:
-    """Marks a claimed flag as resolved after successful operator action execution."""
+    """
+    Marks a claimed flag as resolved after successful operator action execution.
+    Strictly transitions from 'processing' to 'resolved' only.
+    Uses the database-authoritative RPC when available.
+    """
     from datetime import datetime, timezone
+    try:
+        res = supabase.rpc(
+            "complete_flag_operator_action",
+            {
+                "p_flag_id": flag_id,
+                "p_client_id": client_id,
+                "p_human_response": human_response or "",
+            }
+        ).execute()
+        if res.data and len(res.data) > 0:
+            return get_flag_by_id(flag_id, client_id) or res.data[0]
+    except Exception as e:
+        logger.warning(f"complete_flag_operator_action RPC error: {e}")
+
+    # Fallback to direct strictly conditional update (processing -> resolved only)
     try:
         res = (
             supabase.table("flagged_for_review")
@@ -1065,6 +1098,7 @@ def complete_flag_operator_action(flag_id: str, client_id: str, human_response: 
             })
             .eq("id", flag_id)
             .eq("client_id", client_id)
+            .eq("status", "processing")
             .select("*, suppliers(*), rfqs(*)")
             .execute()
         )

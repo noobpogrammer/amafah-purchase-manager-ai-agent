@@ -258,3 +258,80 @@ create policy demo_anon_webhook_errors on webhook_errors for all to anon
   using (true)
   with check (true);
 
+-- ------------------------------------------------------------
+-- Phase 9: Operator Review Flag Lifecycle Functions
+-- ------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION claim_flag_for_operator_action(
+    p_flag_id UUID,
+    p_client_id UUID
+)
+RETURNS SETOF flagged_for_review
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    RETURN QUERY
+    UPDATE flagged_for_review
+    SET status = 'processing'
+    WHERE id = p_flag_id
+      AND client_id = p_client_id
+      AND status = 'pending'
+    RETURNING *;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION claim_flag_for_operator_action(UUID, UUID) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION claim_flag_for_operator_action(UUID, UUID) TO service_role;
+
+CREATE OR REPLACE FUNCTION release_flag_claim(
+    p_flag_id UUID,
+    p_client_id UUID
+)
+RETURNS SETOF flagged_for_review
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    RETURN QUERY
+    UPDATE flagged_for_review
+    SET status = 'pending'
+    WHERE id = p_flag_id
+      AND client_id = p_client_id
+      AND status = 'processing'
+    RETURNING *;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION release_flag_claim(UUID, UUID) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION release_flag_claim(UUID, UUID) TO service_role;
+
+CREATE OR REPLACE FUNCTION complete_flag_operator_action(
+    p_flag_id UUID,
+    p_client_id UUID,
+    p_human_response TEXT
+)
+RETURNS SETOF flagged_for_review
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    RETURN QUERY
+    UPDATE flagged_for_review
+    SET status = 'resolved',
+        human_response = p_human_response,
+        resolved_at = NOW()
+    WHERE id = p_flag_id
+      AND client_id = p_client_id
+      AND status = 'processing'
+    RETURNING *;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION complete_flag_operator_action(UUID, UUID, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION complete_flag_operator_action(UUID, UUID, TEXT) TO service_role;
+
+
