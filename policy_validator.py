@@ -94,7 +94,6 @@ def validate_action(
     if tool_name == "record_quote":
         args = proposal.arguments or {}
         rfq_id = args.get("rfq_id")
-        raw_price = args.get("price")
 
         if not rfq_id or not isinstance(rfq_id, str):
             return ValidationResult(
@@ -113,23 +112,155 @@ def validate_action(
                 reason=f"Proposed RFQ '{rfq_id}' does not match deterministically locked RFQ '{matched_rfq_id}'.",
             )
 
-        # Validate numeric price
-        try:
-            price = float(raw_price)
-            if math.isnan(price) or math.isinf(price) or price <= 0:
-                return ValidationResult(
-                    is_valid=False,
-                    action=tool_name,
-                    category=ActionCategory.MUTATION,
-                    reason=f"Invalid price value '{raw_price}'. Price must be a positive number.",
-                )
-        except (ValueError, TypeError):
+        # Backward compatibility / legacy adapter: normalize single price into variants list
+        variants_raw = args.get("variants")
+        if variants_raw is None and "price" in args:
+            variants_raw = [{
+                "variant_label": args.get("variant_label"),
+                "price": args.get("price"),
+                "delivery_time": args.get("delivery_time"),
+                "quality_notes": args.get("quality_notes"),
+                "is_available": args.get("is_available", True),
+            }]
+
+        if not isinstance(variants_raw, list) or len(variants_raw) < 1:
             return ValidationResult(
                 is_valid=False,
                 action=tool_name,
                 category=ActionCategory.MUTATION,
-                reason=f"Non-numeric price '{raw_price}' provided.",
+                reason="record_quote requires a non-empty list of variants (1-10 items).",
             )
+
+        if len(variants_raw) > 10:
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.MUTATION,
+                reason=f"Exceeded maximum variant limit: {len(variants_raw)} variants proposed (max 10 allowed).",
+            )
+
+        sanitized_variants = []
+        seen_normalized_labels = set()
+
+        for idx, item in enumerate(variants_raw):
+            if not isinstance(item, dict):
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.MUTATION,
+                    reason=f"Variant at index {idx} must be an object/dict.",
+                )
+
+            # 1. Sanitize & validate variant_label
+            raw_label = item.get("variant_label")
+            label = None
+            if raw_label is not None:
+                if not isinstance(raw_label, str):
+                    raw_label = str(raw_label)
+                # Check for raw control characters
+                if any(ord(c) < 32 and c not in ('\t', '\n', '\r') for c in raw_label):
+                    return ValidationResult(
+                        is_valid=False,
+                        action=tool_name,
+                        category=ActionCategory.MUTATION,
+                        reason=f"Variant label '{raw_label}' contains illegal control characters.",
+                    )
+                label_clean = raw_label.strip()
+                if len(label_clean) > 100:
+                    return ValidationResult(
+                        is_valid=False,
+                        action=tool_name,
+                        category=ActionCategory.MUTATION,
+                        reason=f"Variant label '{label_clean[:30]}...' exceeds maximum length of 100 characters.",
+                    )
+                if label_clean != "":
+                    label = label_clean
+
+            norm_key = (label or "").strip().casefold()
+            if norm_key in seen_normalized_labels:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.MUTATION,
+                    reason=f"Duplicate normalized variant label '{label or 'default'}' in single quote batch. Ambiguity rejected.",
+                )
+            seen_normalized_labels.add(norm_key)
+
+            # 2. Validate is_available
+            raw_avail = item.get("is_available")
+            if raw_avail is None:
+                is_avail = True
+            elif isinstance(raw_avail, bool):
+                is_avail = raw_avail
+            elif isinstance(raw_avail, str) and raw_avail.lower() in ("true", "1"):
+                is_avail = True
+            elif isinstance(raw_avail, str) and raw_avail.lower() in ("false", "0"):
+                is_avail = False
+            else:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.MUTATION,
+                    reason=f"Invalid is_available boolean '{raw_avail}' for variant '{label or 'default'}'.",
+                )
+
+            # 3. Validate price
+            raw_price = item.get("price")
+            price_val = None
+            if is_avail:
+                if raw_price is None:
+                    return ValidationResult(
+                        is_valid=False,
+                        action=tool_name,
+                        category=ActionCategory.MUTATION,
+                        reason=f"Missing price for available variant '{label or 'default'}'. Available variants require a positive price.",
+                    )
+                try:
+                    price_val = float(raw_price)
+                    if math.isnan(price_val) or math.isinf(price_val) or price_val <= 0:
+                        return ValidationResult(
+                            is_valid=False,
+                            action=tool_name,
+                            category=ActionCategory.MUTATION,
+                            reason=f"Invalid price value '{raw_price}' for variant '{label or 'default'}'. Price must be a positive number.",
+                        )
+                except (ValueError, TypeError):
+                    return ValidationResult(
+                        is_valid=False,
+                        action=tool_name,
+                        category=ActionCategory.MUTATION,
+                        reason=f"Non-numeric price '{raw_price}' for variant '{label or 'default'}'.",
+                    )
+            else:
+                # For withdrawn/unavailable variants, price is optional
+                if raw_price is not None:
+                    try:
+                        price_val = float(raw_price)
+                        if math.isnan(price_val) or math.isinf(price_val) or price_val <= 0:
+                            price_val = None
+                    except (ValueError, TypeError):
+                        price_val = None
+
+            # 4. Delivery & notes bounded safe strings
+            deliv = item.get("delivery_time")
+            if deliv is not None and not isinstance(deliv, str):
+                deliv = str(deliv)
+            if deliv and len(deliv) > 500:
+                deliv = deliv[:500]
+
+            notes = item.get("quality_notes")
+            if notes is not None and not isinstance(notes, str):
+                notes = str(notes)
+            if notes and len(notes) > 500:
+                notes = notes[:500]
+
+            sanitized_variants.append({
+                "variant_label": label,
+                "price": price_val,
+                "delivery_time": deliv,
+                "quality_notes": notes,
+                "is_available": is_avail,
+            })
 
         # Validate RFQ against context / DB
         target_rfq = None
@@ -144,10 +275,12 @@ def validate_action(
                     break
 
         if not target_rfq:
-            # Query DB directly
-            rfq_res = db.supabase.table("rfqs").select("*").eq("id", rfq_id).execute()
-            if rfq_res.data:
-                target_rfq = rfq_res.data[0]
+            try:
+                rfq_res = db.supabase.table("rfqs").select("*").eq("id", rfq_id).execute()
+                if rfq_res.data:
+                    target_rfq = rfq_res.data[0]
+            except Exception as e:
+                logger.debug(f"Direct RFQ lookup failed in validator: {e}")
 
         if not target_rfq:
             return ValidationResult(
@@ -169,21 +302,24 @@ def validate_action(
 
         # Supplier relationship check
         if not target_rfq_supplier:
-            rs_res = (
-                db.supabase.table("rfq_suppliers")
-                .select("*")
-                .eq("rfq_id", rfq_id)
-                .eq("supplier_id", supplier_id)
-                .execute()
-            )
-            if not rs_res.data:
-                return ValidationResult(
-                    is_valid=False,
-                    action=tool_name,
-                    category=ActionCategory.MUTATION,
-                    reason=f"Supplier '{supplier_id}' is not associated with RFQ '{rfq_id}'.",
+            try:
+                rs_res = (
+                    db.supabase.table("rfq_suppliers")
+                    .select("*")
+                    .eq("rfq_id", rfq_id)
+                    .eq("supplier_id", supplier_id)
+                    .execute()
                 )
-            target_rfq_supplier = rs_res.data[0]
+                if not rs_res.data:
+                    return ValidationResult(
+                        is_valid=False,
+                        action=tool_name,
+                        category=ActionCategory.MUTATION,
+                        reason=f"Supplier '{supplier_id}' is not associated with RFQ '{rfq_id}'.",
+                    )
+                target_rfq_supplier = rs_res.data[0]
+            except Exception as e:
+                logger.debug(f"Direct supplier-RFQ lookup failed in validator: {e}")
 
         # Lifecycle & Deadline check
         if not db.is_rfq_open(target_rfq):
@@ -194,23 +330,17 @@ def validate_action(
                 reason=f"RFQ '{rfq_id}' is closed or deadline has passed.",
             )
 
-        sanitized_delivery = args.get("delivery_time")
-        if sanitized_delivery is not None and not isinstance(sanitized_delivery, str):
-            sanitized_delivery = str(sanitized_delivery)
-
-        sanitized_notes = args.get("quality_notes")
-        if sanitized_notes is not None and not isinstance(sanitized_notes, str):
-            sanitized_notes = str(sanitized_notes)
-
         return ValidationResult(
             is_valid=True,
             action=tool_name,
             category=ActionCategory.MUTATION,
             sanitized_args={
                 "rfq_id": rfq_id,
-                "price": price,
-                "delivery_time": sanitized_delivery,
-                "quality_notes": sanitized_notes,
+                "variants": sanitized_variants,
+                # Legacy compatibility fields
+                "price": sanitized_variants[0]["price"] if sanitized_variants else None,
+                "delivery_time": sanitized_variants[0].get("delivery_time") if sanitized_variants else None,
+                "quality_notes": sanitized_variants[0].get("quality_notes") if sanitized_variants else None,
             },
         )
 

@@ -99,16 +99,21 @@ create table quotes (
     id                  uuid primary key default gen_random_uuid(),
     rfq_id              uuid not null references rfqs(id) on delete cascade,
     supplier_id         uuid not null references suppliers(id) on delete cascade,
+    quote_group_id      uuid,
+    variant_label       text,
     price               numeric(12, 2),
     delivery_time       text,
     quality_notes       text,
     raw_message         text,
     confidence          text check (confidence in ('high', 'low')),
+    is_available        boolean not null default true,
+    source_message_id   uuid references message_log(id) on delete set null,
     created_at          timestamptz not null default now()
 );
 
 create index idx_quotes_rfq on quotes(rfq_id);
 create index idx_quotes_supplier on quotes(supplier_id);
+create index idx_quotes_effective_variant on quotes(rfq_id, supplier_id, variant_label, created_at desc);
 
 -- ------------------------------------------------------------
 -- PENDING_CLARIFICATIONS
@@ -333,5 +338,95 @@ $$;
 
 REVOKE EXECUTE ON FUNCTION complete_flag_operator_action(UUID, UUID, TEXT) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION complete_flag_operator_action(UUID, UUID, TEXT) TO service_role;
+
+-- ------------------------------------------------------------
+-- Phase 10: Multi-Variant Quote Batch Recording Function
+-- ------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION record_quote_variants(
+    p_rfq_id UUID,
+    p_supplier_id UUID,
+    p_quote_group_id UUID,
+    p_raw_message TEXT,
+    p_source_message_id UUID,
+    p_confidence TEXT,
+    p_variants JSONB
+)
+RETURNS SETOF quotes
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_rfq_status TEXT;
+    v_has_available_priced_variant BOOLEAN := FALSE;
+    v_item JSONB;
+    v_price NUMERIC;
+    v_avail BOOLEAN;
+BEGIN
+    SELECT status INTO v_rfq_status
+    FROM rfqs
+    WHERE id = p_rfq_id;
+
+    IF v_rfq_status IS NULL OR v_rfq_status != 'active' THEN
+        RETURN;
+    END IF;
+
+    FOR v_item IN SELECT * FROM jsonb_array_elements(p_variants)
+    LOOP
+        v_price := CASE 
+            WHEN v_item->>'price' IS NOT NULL AND v_item->>'price' != '' 
+            THEN (v_item->>'price')::NUMERIC 
+            ELSE NULL 
+        END;
+        
+        v_avail := COALESCE((v_item->>'is_available')::BOOLEAN, TRUE);
+
+        IF v_avail = TRUE AND v_price IS NOT NULL AND v_price > 0 THEN
+            v_has_available_priced_variant := TRUE;
+        END IF;
+
+        RETURN QUERY
+        INSERT INTO quotes (
+            rfq_id,
+            supplier_id,
+            quote_group_id,
+            variant_label,
+            price,
+            delivery_time,
+            quality_notes,
+            raw_message,
+            confidence,
+            is_available,
+            source_message_id
+        ) VALUES (
+            p_rfq_id,
+            p_supplier_id,
+            p_quote_group_id,
+            NULLIF(TRIM(v_item->>'variant_label'), ''),
+            v_price,
+            v_item->>'delivery_time',
+            v_item->>'quality_notes',
+            p_raw_message,
+            COALESCE(p_confidence, 'high'),
+            v_avail,
+            p_source_message_id
+        )
+        RETURNING *;
+    END LOOP;
+
+    IF v_has_available_priced_variant THEN
+        UPDATE rfq_suppliers
+        SET status = 'responded'
+        WHERE rfq_id = p_rfq_id
+          AND supplier_id = p_supplier_id;
+    END IF;
+
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION record_quote_variants(UUID, UUID, UUID, TEXT, UUID, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION record_quote_variants(UUID, UUID, UUID, TEXT, UUID, TEXT, JSONB) TO service_role;
+
 
 

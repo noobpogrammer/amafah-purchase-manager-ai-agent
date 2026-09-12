@@ -14,6 +14,8 @@ client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
 MODEL = "openai/gpt-oss-120b"  # cheap/fast — good for classification + tool routing
 
+MAX_QUOTE_VARIANTS = 10
+
 # ------------------------------------------------------------
 # Tool definitions (OpenAI-compatible schema, Groq supports this format)
 # ------------------------------------------------------------
@@ -23,20 +25,48 @@ TOOLS = [
         "function": {
             "name": "record_quote",
             "description": (
-                "Record a supplier's quote for a specific RFQ. Use this when the "
-                "supplier's message clearly gives a price (and optionally delivery "
-                "time / notes) for a product you are confident matches one specific "
-                "open RFQ."
+                "Record one or more quote variants for an open RFQ from a supplier message. "
+                "Use this when the supplier's message provides pricing, delivery, and/or specifications for a product "
+                "matching an open RFQ. If the supplier provides multiple options (e.g. origins, brands, grades, models), "
+                "include all options as distinct items in the variants list (1-10 items). If the supplier provides a single price "
+                "without options, provide 1 variant item with variant_label=null. If the supplier states a previous option is unavailable, "
+                "record that variant with is_available=false (price may be omitted)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "rfq_id": {"type": "string", "description": "The matched RFQ's ID"},
-                    "price": {"type": "number", "description": "Quoted price per piece"},
-                    "delivery_time": {"type": ["string", "null"], "description": "Stated delivery time, if given"},
-                    "quality_notes": {"type": ["string", "null"], "description": "Any warranty/quality notes mentioned"},
+                    "variants": {
+                        "type": "array",
+                        "description": "List of quote options/variants provided by the supplier (1-10 items)",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "variant_label": {
+                                    "type": ["string", "null"],
+                                    "description": "Variant discriminator (e.g., 'India', 'China', 'Schneider', 'Grade 304'). Null if single unlabelled quote.",
+                                },
+                                "price": {
+                                    "type": ["number", "null"],
+                                    "description": "Quoted unit price per piece. Required if is_available is true; may be omitted if is_available is false.",
+                                },
+                                "delivery_time": {
+                                    "type": ["string", "null"],
+                                    "description": "Delivery timeline for this variant (e.g. '2 days')",
+                                },
+                                "quality_notes": {
+                                    "type": ["string", "null"],
+                                    "description": "Warranty, quality, brand, or material specifications for this variant",
+                                },
+                                "is_available": {
+                                    "type": "boolean",
+                                    "description": "Whether this variant is available (true) or withdrawn/unavailable (false). Defaults to true.",
+                                },
+                            },
+                        },
+                    },
                 },
-                "required": ["rfq_id", "price"],
+                "required": ["rfq_id", "variants"],
             },
         },
     },
@@ -217,6 +247,9 @@ class AgentContext(BaseModel):
 
     conversation_history: List[Dict[str, Any]] = Field(default_factory=list)
 
+    # Inbound message log provenance
+    source_message_id: Optional[Any] = None
+
     # Operator review flag context
     review_flag_id: Optional[str] = None
     review_reason: Optional[str] = None
@@ -284,15 +317,22 @@ PENDING CLARIFICATIONS:
   * If the follow-up resolves to a specific candidate product, call record_quote or negotiate_price for that RFQ.
   * If still ambiguous, ask a narrowed clarification question or escalate if max rounds reached.
 
-QUOTE RECORDING & REVISIONS:
-- Call record_quote when the supplier gives a clear price (and optional delivery/notes) for an open RFQ, and either no negotiation
-  is appropriate (price is at/below minimum acceptable price) or negotiation attempt limit (3/3) has been reached.
-- Revisions: If the supplier already quoted previously and now provides an updated price/delivery, process it as an intentional quote revision.
-- Small price variance (<= 10%) or intentional supplier revisions: Record quote or negotiate.
-- Explicitly explained changes: Record quote or negotiate.
-- Large unexplained jump (> 10%) or unexplainable term conflict without reason: Call escalate_to_human with category "contradictory_information".
+QUOTE RECORDING & MULTI-VARIANT QUOTES:
+- Call record_quote when the supplier gives clear price(s) and/or delivery/notes for an open RFQ.
+- Multi-Variant Offers: When a message contains multiple options (e.g. origins: 'India 45 AED, China 38 AED'; brands: 'Schneider 120 AED, ABB 110 AED'; or grades: 'Grade A 50, Grade B 40'):
+  * Extract all options as items in the `variants` list (up to 10 items).
+  * Set `variant_label` to the option name (e.g. 'India', 'China', 'Schneider', 'Grade A').
+  * Shared delivery/spec terms (e.g. 'Delivery 2 days for both') should be copied into each variant object.
+  * Specific delivery/spec terms (e.g. 'India 2 days, China 5 days') should be assigned to their respective variant objects.
+- Simple Unlabelled Quotes: When the message contains a single quote without options (e.g. '50 AED, 2 days delivery'), provide 1 variant item with `variant_label: null`.
+- Withdrawn / Unavailable Options: If the supplier states an option is discontinued/unavailable (e.g. 'China is no longer available, India is 45'),
+  include that variant with `is_available: false` (price may be omitted).
+- Mixed / Incomplete Statements: If one variant has a price and another is pending (e.g. 'India 45 AED, China price tomorrow'), record the complete variant ('India') and preserve notes. Do not fabricate prices.
+- Revisions: If the supplier previously quoted and now provides an updated rate for a variant, provide the revised variant.
 
 NEGOTIATION RULES:
+- If a supplier offers a single quote and negotiation attempts remain (< 3/3), call negotiate_price if within or above target range.
+- If a supplier offers multiple distinct variants with differing specs/origins and intent to negotiate is unclear, do NOT automatically negotiate the cheapest option; record the variants or escalate/clarify.
 - Call negotiate_price if the quote is clear, negotiation attempts remain (< 3/3), and the price is within, at max, or above the acceptable range:
   * At or below min: Record directly with record_quote or simple confirmation. Do not pressure favorable quotes.
   * Within range / near max: Polite, light nudge toward a better price if useful.
@@ -396,8 +436,11 @@ def format_agent_context_for_prompt(context: AgentContext) -> str:
         pq_lines = ["PRIOR QUOTES ON RECORD:"]
         for q in context.prior_quotes:
             prod = q.get("rfqs", {}).get("product_name", "Unknown Product") if isinstance(q.get("rfqs"), dict) else "Unknown Product"
+            v_label = f" [Variant: {q.get('variant_label')}]" if q.get("variant_label") else ""
+            status_str = " (Available)" if q.get("is_available", True) else " (Unavailable/Withdrawn)"
+            price_str = f"AED {q.get('price')}" if q.get("price") is not None else "No Price"
             pq_lines.append(
-                f"- Product: {prod} | RFQ ID: {q.get('rfq_id')} | Price: AED {q.get('price')} | "
+                f"- Product: {prod}{v_label} | RFQ ID: {q.get('rfq_id')} | Price: {price_str}{status_str} | "
                 f"Delivery: {q.get('delivery_time', '-')} | Notes: {q.get('quality_notes', '-')}"
             )
         sections.append("\n".join(pq_lines))

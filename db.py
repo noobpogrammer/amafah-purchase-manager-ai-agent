@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import secrets
+import uuid
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 load_dotenv()
@@ -253,10 +254,110 @@ def get_open_rfqs_for_supplier(supplier_id: str):
     return [entry for entry in (res.data or []) if is_rfq_open(entry.get("rfqs"))]
 
 
-def record_quote(rfq_id: str, supplier_id: str, price: float,
+def record_quotes_batch(rfq_id: str, supplier_id: str, variants: list[dict],
+                        raw_message: str = None, source_message_id: str = None,
+                        confidence: str = "high", quote_group_id: str = None) -> list[dict]:
+    """
+    Atomically records one or more quote variants for an open RFQ from a supplier message.
+    1. Verifies RFQ exists and is open.
+    2. Assigns a single shared quote_group_id across all variants in the batch.
+    3. Persists all variant rows via the database-authoritative RPC (or atomic table insert).
+    4. Updates rfq_suppliers.status = 'responded' if at least one available priced variant is recorded.
+    5. Returns all inserted quote rows.
+    """
+    if not rfq_id or not supplier_id or not variants:
+        return []
+
+    rfq_res = supabase.table("rfqs").select("*").eq("id", rfq_id).execute()
+    if not rfq_res.data or not is_rfq_open(rfq_res.data[0]):
+        logger.warning(
+            "record_quotes_batch rejected for rfq %s from supplier %s: RFQ is not active or deadline passed",
+            rfq_id, supplier_id
+        )
+        return []
+
+    group_id = quote_group_id or str(uuid.uuid4())
+
+    # Try RPC first for transaction-authoritative persistence
+    try:
+        rpc_payload = {
+            "p_rfq_id": rfq_id,
+            "p_supplier_id": supplier_id,
+            "p_quote_group_id": group_id,
+            "p_raw_message": raw_message,
+            "p_source_message_id": source_message_id,
+            "p_confidence": confidence or "high",
+            "p_variants": variants,
+        }
+        res = supabase.rpc("record_quote_variants", rpc_payload).execute()
+        if res.data and len(res.data) > 0:
+            return res.data
+    except Exception as e:
+        logger.warning(f"record_quote_variants RPC error: {e}")
+
+    # Fallback to direct batch insert
+    try:
+        rows_to_insert = []
+        has_available_priced_variant = False
+        for v in variants:
+            price = v.get("price")
+            avail = v.get("is_available", True)
+            if avail and price is not None and float(price) > 0:
+                has_available_priced_variant = True
+            rows_to_insert.append({
+                "rfq_id": rfq_id,
+                "supplier_id": supplier_id,
+                "quote_group_id": group_id,
+                "variant_label": v.get("variant_label"),
+                "price": price,
+                "delivery_time": v.get("delivery_time"),
+                "quality_notes": v.get("quality_notes"),
+                "raw_message": raw_message,
+                "confidence": confidence or "high",
+                "is_available": avail,
+                "source_message_id": source_message_id,
+            })
+
+        insert_res = supabase.table("quotes").insert(rows_to_insert).execute()
+        if insert_res.data and has_available_priced_variant:
+            supabase.table("rfq_suppliers").update({"status": "responded"}).eq(
+                "rfq_id", rfq_id
+            ).eq("supplier_id", supplier_id).execute()
+        return insert_res.data or []
+    except Exception as e:
+        logger.error(f"Fallback record_quotes_batch error: {e}")
+        return []
+
+
+def record_quote(rfq_id: str, supplier_id: str, price: float = None,
                  delivery_time: str = None, quality_notes: str = None,
-                 raw_message: str = None, confidence: str = "high"):
-    # Enforce deadline check directly inside db layer
+                 raw_message: str = None, confidence: str = "high",
+                 variant_label: str = None, is_available: bool = True,
+                 source_message_id: str = None, quote_group_id: str = None):
+    """
+    Backward-compatible quote recording.
+    If variant metadata or group/source IDs are provided, routes through record_quotes_batch.
+    Otherwise executes single-row insert with exact legacy payload structure.
+    """
+    if variant_label is not None or not is_available or source_message_id is not None or quote_group_id is not None:
+        variants = [{
+            "variant_label": variant_label,
+            "price": price,
+            "delivery_time": delivery_time,
+            "quality_notes": quality_notes,
+            "is_available": is_available,
+        }]
+        res = record_quotes_batch(
+            rfq_id=rfq_id,
+            supplier_id=supplier_id,
+            variants=variants,
+            raw_message=raw_message,
+            source_message_id=source_message_id,
+            confidence=confidence,
+            quote_group_id=quote_group_id,
+        )
+        return res[0] if res else None
+
     rfq_res = supabase.table("rfqs").select("*").eq("id", rfq_id).execute()
     if not rfq_res.data or not is_rfq_open(rfq_res.data[0]):
         logger.warning(
@@ -637,8 +738,11 @@ def log_message(client_id: str, supplier_id: str, direction: str,
     return None
 
 
-def get_quotes_for_rfq(rfq_id: str) -> list:
-    """Returns only the most recent (effective) quote per supplier for an RFQ, sorted newest first with id tie-breaker."""
+def get_quotes_for_rfq(rfq_id: str, include_unavailable: bool = False) -> list:
+    """
+    Returns the latest effective quote per supplier + variant_label for an RFQ, sorted newest first with id tie-breaker.
+    By default, returns only currently available effective variants (is_available=True, price is not None).
+    """
     res = (
         supabase.table("quotes")
         .select("*, suppliers(name)")
@@ -648,12 +752,21 @@ def get_quotes_for_rfq(rfq_id: str) -> list:
         .execute()
     )
     latest_quotes = []
-    seen_suppliers = set()
+    seen_variant_keys = set()
     for q in (res.data or []):
         supplier_id = q.get("supplier_id")
-        if supplier_id and supplier_id not in seen_suppliers:
-            seen_suppliers.add(supplier_id)
-            latest_quotes.append(q)
+        if not supplier_id:
+            continue
+        v_label_norm = (q.get("variant_label") or "").strip().casefold()
+        key = (supplier_id, v_label_norm)
+        if key not in seen_variant_keys:
+            seen_variant_keys.add(key)
+            if include_unavailable:
+                latest_quotes.append(q)
+            else:
+                # Include only if active / available and priced
+                if q.get("is_available", True) is True and q.get("price") is not None:
+                    latest_quotes.append(q)
     return latest_quotes
 
 

@@ -749,25 +749,55 @@ async def execute_validated_action(
     if validation.action == "record_quote":
         args = validation.sanitized_args
         target_rfq_id = args["rfq_id"]
+        variants = args.get("variants")
+        if not variants:
+            variants = [{
+                "variant_label": args.get("variant_label"),
+                "price": args.get("price"),
+                "delivery_time": args.get("delivery_time"),
+                "quality_notes": args.get("quality_notes"),
+                "is_available": args.get("is_available", True),
+            }]
+
         # Ensure quote provenance reflects supplier's original message, not operator instruction
         quote_raw = context.review_raw_message if (context.input_origin == "operator" and context.review_raw_message) else raw_message
 
-        # Check if existing quote already recorded at this price to avoid duplicate quote records from operator hold commands
+        # Check if existing quotes already match to avoid duplicate records from operator hold commands
         should_record = True
         if context.input_origin == "operator":
             existing_quotes = [q for q in context.prior_quotes if q.get("rfq_id") == target_rfq_id]
-            if existing_quotes and existing_quotes[0].get("price") == args["price"]:
+            all_match = True
+            for v in variants:
+                matching = [
+                    q for q in existing_quotes
+                    if (q.get("variant_label") or "").strip().casefold() == (v.get("variant_label") or "").strip().casefold()
+                    and q.get("price") == v.get("price")
+                    and q.get("is_available", True) == v.get("is_available", True)
+                ]
+                if not matching:
+                    all_match = False
+                    break
+            if existing_quotes and all_match:
                 should_record = False
 
         if should_record:
-            db.record_quote(
-                rfq_id=target_rfq_id,
-                supplier_id=supplier_id,
-                price=args["price"],
-                delivery_time=args.get("delivery_time"),
-                quality_notes=args.get("quality_notes"),
-                raw_message=quote_raw,
-            )
+            if len(variants) == 1 and variants[0].get("variant_label") is None and variants[0].get("is_available", True) is True:
+                db.record_quote(
+                    rfq_id=target_rfq_id,
+                    supplier_id=supplier_id,
+                    price=variants[0].get("price"),
+                    delivery_time=variants[0].get("delivery_time"),
+                    quality_notes=variants[0].get("quality_notes"),
+                    raw_message=quote_raw,
+                )
+            else:
+                db.record_quotes_batch(
+                    rfq_id=target_rfq_id,
+                    supplier_id=supplier_id,
+                    variants=variants,
+                    raw_message=quote_raw,
+                    source_message_id=context.source_message_id,
+                )
 
         # Resolve pending clarification if one was active for this supplier
         if context.pending_clarification:
@@ -1144,6 +1174,7 @@ async def whatsapp_webhook(request: Request):
             negotiation_attempts=negotiation_attempts,
             competitive_context=competitive_context,
             conversation_history=conv_history,
+            source_message_id=inbound_log_id,
         )
 
         # 7. Unified Reasoning Execution
