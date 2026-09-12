@@ -320,10 +320,10 @@ class TestAgentContextAndHistory:
 
 
 class TestStanzaLockEnforcement:
-    """Tests 15-17: Policy Validator deterministic stanza lock enforcement."""
+    """Tests 15-17 & Focused Stanza-Lock Tests 1-10: Policy Validator deterministic stanza lock enforcement."""
 
     def test_15_proposal_for_matched_rfq_succeeds(self):
-        """15. Proposal targeting matched_rfq_id passes Policy Validator."""
+        """15 / Test 1. Exact stanza + record_quote matching RFQ -> PASS."""
         matched_rfq = {"id": "rfq-locked-1", "client_id": "c-1", "status": "active", "due_by": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()}
         proposal = ActionProposal(
             tool_name="record_quote",
@@ -341,7 +341,7 @@ class TestStanzaLockEnforcement:
             assert val.sanitized_args["rfq_id"] == "rfq-locked-1"
 
     def test_16_proposal_attempting_different_rfq_is_rejected_deterministically(self):
-        """16. Proposal attempting to route to RFQ B when matched to RFQ A is rejected by Policy Validator."""
+        """16 / Test 2. Exact stanza + record_quote different RFQ -> REJECT."""
         proposal = ActionProposal(
             tool_name="record_quote",
             arguments={"rfq_id": "rfq-other-unmatched", "price": 50.0},
@@ -355,6 +355,134 @@ class TestStanzaLockEnforcement:
         )
         assert val.is_valid is False
         assert "does not match deterministically locked RFQ" in val.reason
+
+    def test_stanza_3_exact_stanza_negotiate_price_different_rfq_rejected(self):
+        """Test 3. Exact stanza + negotiate_price different RFQ -> REJECT."""
+        proposal = ActionProposal(
+            tool_name="negotiate_price",
+            arguments={"rfq_id": "rfq-other-unmatched", "quoted_price": 50.0, "negotiation_message": "Can you do 45?"},
+        )
+        val = validate_action(
+            proposal,
+            client_id="c-1",
+            supplier_id="s-1",
+            context_rfqs=[],
+            matched_rfq_id="rfq-locked-1",
+        )
+        assert val.is_valid is False
+        assert "does not match deterministically locked RFQ" in val.reason
+
+    def test_stanza_4_exact_stanza_request_clarification_matching_rfq_passes(self):
+        """Test 4. Exact stanza + request_clarification([matched_rfq]) -> PASS."""
+        proposal = ActionProposal(
+            tool_name="request_clarification",
+            arguments={"candidate_rfq_ids": ["rfq-locked-1"], "clarifying_question": "Does this include delivery?"},
+        )
+        val = validate_action(
+            proposal,
+            client_id="c-1",
+            supplier_id="s-1",
+            context_rfqs=[],
+            matched_rfq_id="rfq-locked-1",
+        )
+        assert val.is_valid is True
+        assert val.sanitized_args["candidate_rfq_ids"] == ["rfq-locked-1"]
+
+    def test_stanza_5_exact_stanza_request_clarification_multiple_rfqs_rejected(self):
+        """Test 5. Exact stanza + request_clarification([matched_rfq, other_rfq]) -> REJECT."""
+        proposal = ActionProposal(
+            tool_name="request_clarification",
+            arguments={"candidate_rfq_ids": ["rfq-locked-1", "rfq-other-2"], "clarifying_question": "Which product?"},
+        )
+        val = validate_action(
+            proposal,
+            client_id="c-1",
+            supplier_id="s-1",
+            context_rfqs=[],
+            matched_rfq_id="rfq-locked-1",
+        )
+        assert val.is_valid is False
+        assert "Clarification candidates violate deterministic RFQ match lock" in val.reason
+
+    def test_stanza_6_exact_stanza_request_clarification_different_rfq_rejected(self):
+        """Test 6. Exact stanza + request_clarification([other_rfq]) -> REJECT."""
+        proposal = ActionProposal(
+            tool_name="request_clarification",
+            arguments={"candidate_rfq_ids": ["rfq-other-2"], "clarifying_question": "Which product?"},
+        )
+        val = validate_action(
+            proposal,
+            client_id="c-1",
+            supplier_id="s-1",
+            context_rfqs=[],
+            matched_rfq_id="rfq-locked-1",
+        )
+        assert val.is_valid is False
+        assert "Clarification candidates violate deterministic RFQ match lock" in val.reason
+
+    def test_stanza_7_exact_stanza_escalate_to_human_matching_rfq_passes(self):
+        """Test 7. Exact stanza + escalate_to_human(rfq_id=matched_rfq) -> PASS."""
+        proposal = ActionProposal(
+            tool_name="escalate_to_human",
+            arguments={"rfq_id": "rfq-locked-1", "reason": "Supplier needs custom warranty"},
+        )
+        val = validate_action(
+            proposal,
+            client_id="c-1",
+            supplier_id="s-1",
+            context_rfqs=[],
+            matched_rfq_id="rfq-locked-1",
+        )
+        assert val.is_valid is True
+        assert val.sanitized_args["rfq_id"] == "rfq-locked-1"
+
+    def test_stanza_8_exact_stanza_escalate_to_human_different_rfq_rejected(self):
+        """Test 8. Exact stanza + escalate_to_human(rfq_id=other_rfq) -> REJECT."""
+        proposal = ActionProposal(
+            tool_name="escalate_to_human",
+            arguments={"rfq_id": "rfq-other-2", "reason": "Supplier requested review"},
+        )
+        val = validate_action(
+            proposal,
+            client_id="c-1",
+            supplier_id="s-1",
+            context_rfqs=[],
+            matched_rfq_id="rfq-locked-1",
+        )
+        assert val.is_valid is False
+        assert "Escalation RFQ 'rfq-other-2' does not match deterministically locked RFQ 'rfq-locked-1'" in val.reason
+
+    def test_stanza_9_exact_stanza_escalate_to_human_no_rfq_injects_matched_rfq(self):
+        """Test 9. Exact stanza + escalation with no rfq_id -> sanitized output uses matched_rfq_id."""
+        proposal = ActionProposal(
+            tool_name="escalate_to_human",
+            arguments={"reason": "Complex question without rfq_id specified"},
+        )
+        val = validate_action(
+            proposal,
+            client_id="c-1",
+            supplier_id="s-1",
+            context_rfqs=[],
+            matched_rfq_id="rfq-locked-1",
+        )
+        assert val.is_valid is True
+        assert val.sanitized_args["rfq_id"] == "rfq-locked-1"
+
+    def test_stanza_10_no_matched_rfq_multi_rfq_clarification_valid(self):
+        """Test 10. No matched RFQ + multi-RFQ clarification -> existing behavior remains valid."""
+        proposal = ActionProposal(
+            tool_name="request_clarification",
+            arguments={"candidate_rfq_ids": ["rfq-A", "rfq-B"], "clarifying_question": "Which item is this quote for?"},
+        )
+        val = validate_action(
+            proposal,
+            client_id="c-1",
+            supplier_id="s-1",
+            context_rfqs=[],
+            matched_rfq_id=None,
+        )
+        assert val.is_valid is True
+        assert val.sanitized_args["candidate_rfq_ids"] == ["rfq-A", "rfq-B"]
 
     def test_17_unknown_stanza_behavior_ignored(self):
         """17. If stanzaId is not found among supplier's active RFQs, webhook safely ignores message."""

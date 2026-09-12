@@ -228,13 +228,13 @@ def validate_action(
                 reason="Missing or empty candidate_rfq_ids for clarification request.",
             )
 
-        # Deterministic stanza lock: clarification candidates cannot divert away from matched RFQ
-        if matched_rfq_id and (candidate_ids != [matched_rfq_id] and matched_rfq_id not in candidate_ids):
+        # Deterministic stanza lock: clarification candidates must strictly be [matched_rfq_id]
+        if matched_rfq_id and candidate_ids != [matched_rfq_id]:
             return ValidationResult(
                 is_valid=False,
                 action=tool_name,
                 category=ActionCategory.PROPOSE_COMMUNICATE,
-                reason=f"Clarification candidate RFQs do not include deterministically locked RFQ '{matched_rfq_id}'.",
+                reason=f"Clarification candidates violate deterministic RFQ match lock (expected '{matched_rfq_id}', got {candidate_ids}).",
             )
 
         if not question or not isinstance(question, str):
@@ -273,6 +273,18 @@ def validate_action(
         reason = args.get("reason", "Human review requested by agent")
         category = args.get("category", "other")
         rfq_id = args.get("rfq_id")
+
+        # Deterministic stanza lock: proposal cannot escalate against another RFQ when locked
+        if matched_rfq_id:
+            if rfq_id and rfq_id != matched_rfq_id:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=f"Escalation RFQ '{rfq_id}' does not match deterministically locked RFQ '{matched_rfq_id}'.",
+                )
+            # If missing or matching, lock to matched_rfq_id
+            rfq_id = matched_rfq_id
 
         allowed_categories = {
             "requires_business_knowledge",
