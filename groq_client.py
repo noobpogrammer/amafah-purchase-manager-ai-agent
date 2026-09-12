@@ -133,6 +133,36 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "negotiate_price",
+            "description": (
+                "Record a supplier's quote and propose a polite, professional negotiation message "
+                "aiming for a better price. Use this when the quote is within or above the acceptable price range, "
+                "or when competitive context indicates room for improvement, and autonomous negotiation attempts remain. "
+                "Never invent target prices, never reveal competitor names/quotes, and keep requests polite and bounded."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rfq_id": {"type": "string", "description": "The matched RFQ's ID"},
+                    "quoted_price": {"type": "number", "description": "The price per piece quoted by the supplier"},
+                    "negotiation_message": {
+                        "type": "string",
+                        "description": (
+                            "The professional counter/negotiation message to send back to the supplier. "
+                            "Do NOT reveal competitor names or specific competitor pricing. "
+                            "Do NOT invent budgets or guarantee an order. Keep it polite, bounded, and constructive."
+                        ),
+                    },
+                    "delivery_time": {"type": ["string", "null"], "description": "Stated delivery time, if given"},
+                    "quality_notes": {"type": ["string", "null"], "description": "Any warranty/quality notes mentioned"},
+                },
+                "required": ["rfq_id", "quoted_price", "negotiation_message"],
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = """You are a procurement assistant for a hardware retail business.
@@ -156,21 +186,28 @@ Clarifications should focus specifically on Price, Product Quality/Warranty, and
 
 Your job: read the supplier's message plus the context of their currently open RFQ(s) and prior quotes, and decide the right action by calling exactly one tool:
 
-1. Call record_quote: if the reply clearly and unambiguously gives a price for ONE specific open RFQ (matching by product name/description).
-2. Call request_clarification: if the reply is ambiguous (e.g., multiple open RFQs and unclear which product, or missing key info like price/delivery).
+1. Call record_quote: if the reply clearly and unambiguously gives a price for ONE specific open RFQ (matching by product name/description) AND no negotiation is needed (e.g., price is at/below the minimum acceptable price, or negotiation attempts have already reached the limit 3/3).
+2. Call negotiate_price: if the reply gives a clear price for an open RFQ, negotiation attempts remain (< 3/3), and the price is inside, at maximum, or above the acceptable range, or competitive context indicates room for improvement:
+   - At or below min: Record directly with record_quote or at most send a simple confirmation. Do not pressure favorable quotes.
+   - Within range / near max: Polite, light nudge toward a better price if useful.
+   - Above range: Professional bounded request for their best revised rate.
+   - Significantly above range: Clear, polite notice that the rate is higher than our budget/market range, requesting a review.
+   - NEVER reveal competitor names or specific competitor pricing (never say 'Supplier X quoted AED 54' or 'Another supplier offered AED 54').
+   - NEVER invent a target price or budget, and never make a binding purchase commitment.
+3. Call request_clarification: if the reply is ambiguous (e.g., multiple open RFQs and unclear which product, or missing key info like price/delivery).
    CRITICAL NO-UUID RULE FOR CLARIFYING QUESTIONS:
    - NEVER include internal RFQ IDs, UUIDs, or database identifiers in the clarifying_question text sent to the supplier (e.g. NEVER write 'which RFQ (c8cc719d-19c0... or 57656d76...)' ).
    - Refer to candidate RFQs ONLY by product name, specs, or quantity — the way a human would describe them in conversation (e.g., 'the 5kg cement order' vs 'the 10kg cement order'), NEVER by ID.
-3. Call escalate_to_human: DO NOT request clarification or guess. Call escalate_to_human when:
+4. Call escalate_to_human: DO NOT request clarification or guess. Call escalate_to_human when:
    - requires_business_knowledge: The message asks for custom credit terms, payment schedules, or business decisions only a human manager knows (e.g., "Can we pay 50% upfront via bank transfer?" or "Can we exchange goods after 30 days?").
    - unclear_intent: The message is gibberish, irrelevant, or intent cannot be safely determined even after reviewing context. (Note: mentioning a product name or stem is valid intent, do NOT escalate for product name mentions).
-   - contradictory_information: The supplier gives a contradictory quote or term change vs a prior quote for the same RFQ.
+   - contradictory_information: The supplier gives an unexplained conflicting term change vs a prior quote for the same RFQ.
 
 QUOTE REVISIONS & PRICE UPDATES:
-- If the supplier already has a prior quote on record for an open RFQ and their new message clearly states an updated price, delivery time, or terms (e.g. "Actually let's change the price to AED 45", "Updated quote: AED 40", "We can deliver in 1 day now"), call record_quote with the new values. This is an intentional quote revision, NOT an automatic contradiction.
-- Small price variance (<= 10%) or intentional supplier revisions: Call record_quote with the updated price and terms.
-- Explicitly explained changes: If the supplier explicitly explains a price increase or term change (e.g. "Price is now AED 85 due to raw material cost increase"), it is NOT a contradiction — call record_quote with the new price (AED 85).
-- Large unexplained jump (> 10%) or unexplainable term conflict: Price changes > 10% without explanation (e.g., previously quoted AED 50, now states AED 85 without explanation in mid-conversation), or delivery/warranty terms that conflict with prior statements, are genuine contradictions — call escalate_to_human with category "contradictory_information".
+- If the supplier already has a prior quote on record for an open RFQ and their new message clearly states an updated price, delivery time, or terms (e.g. "Actually let's change the price to AED 45", "Updated quote: AED 40", "We can deliver in 1 day now"), process it as a revision with record_quote or negotiate_price as appropriate. This is an intentional quote revision, NOT an automatic contradiction.
+- Small price variance (<= 10%) or intentional supplier revisions: Record quote or negotiate.
+- Explicitly explained changes: If the supplier explicitly explains a price increase or term change (e.g. "Price is now AED 85 due to raw material cost increase"), it is NOT a contradiction — record the quote.
+- Large unexplained jump (> 10%) or unexplainable term conflict without reason: Escalate to human with category "contradictory_information".
 """
 
 

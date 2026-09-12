@@ -3,12 +3,16 @@ Supabase data access layer. Plain env-var config so credentials can be
 plugged in whenever the Supabase project is ready.
 """
 
+import logging
+import math
 import os
 import secrets
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 load_dotenv()
 from supabase import create_client, Client
+
+logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -206,6 +210,26 @@ def format_supplier_categories(categories) -> str:
     return str(categories)
 
 
+def is_rfq_open(rfq: dict) -> bool:
+    """
+    Returns True if an RFQ is strictly active and within its deadline window (now < due_by).
+    """
+    if not rfq or not isinstance(rfq, dict):
+        return False
+    if rfq.get("status") != "active":
+        return False
+    due_by_str = rfq.get("due_by")
+    if due_by_str:
+        try:
+            due_dt = datetime.fromisoformat(due_by_str.replace("Z", "+00:00"))
+            if due_dt.tzinfo is None:
+                due_dt = due_dt.replace(tzinfo=timezone.utc)
+            return datetime.now(timezone.utc) < due_dt
+        except Exception:
+            pass
+    return True
+
+
 def get_open_rfqs_for_supplier(supplier_id: str):
     """All active RFQs sent to this supplier, awaiting an initial reply or revision."""
     res = (
@@ -215,14 +239,23 @@ def get_open_rfqs_for_supplier(supplier_id: str):
         .in_("status", ["sent", "clarifying", "responded"])
         .execute()
     )
-    # Strictly filter only entries where the underlying RFQ is active
-    return [entry for entry in (res.data or []) if entry.get("rfqs", {}).get("status") == "active"]
+    # Strictly filter only entries where the underlying RFQ is active and open
+    return [entry for entry in (res.data or []) if is_rfq_open(entry.get("rfqs"))]
 
 
 def record_quote(rfq_id: str, supplier_id: str, price: float,
-                  delivery_time: str = None, quality_notes: str = None,
-                  raw_message: str = None, confidence: str = "high"):
-    supabase.table("quotes").insert({
+                 delivery_time: str = None, quality_notes: str = None,
+                 raw_message: str = None, confidence: str = "high"):
+    # Enforce deadline check directly inside db layer
+    rfq_res = supabase.table("rfqs").select("*").eq("id", rfq_id).execute()
+    if not rfq_res.data or not is_rfq_open(rfq_res.data[0]):
+        logger.warning(
+            "record_quote rejected for rfq %s from supplier %s: RFQ is not active or deadline passed",
+            rfq_id, supplier_id
+        )
+        return None
+
+    insert_res = supabase.table("quotes").insert({
         "rfq_id": rfq_id,
         "supplier_id": supplier_id,
         "price": price,
@@ -235,6 +268,8 @@ def record_quote(rfq_id: str, supplier_id: str, price: float,
     supabase.table("rfq_suppliers").update({"status": "responded"}).eq(
         "rfq_id", rfq_id
     ).eq("supplier_id", supplier_id).execute()
+
+    return insert_res.data[0] if insert_res.data else None
 
 
 def create_pending_clarification(client_id: str, supplier_id: str,
@@ -309,7 +344,7 @@ def get_rfqs_by_ids(rfq_ids: list):
         .in_("id", rfq_ids)
         .execute()
     )
-    return [{"rfqs": rfq} for rfq in res.data]
+    return [{"rfqs": rfq} for rfq in (res.data or []) if is_rfq_open(rfq)]
 
 
 def get_active_rfq_suppliers_with_deadlines():
@@ -348,7 +383,7 @@ def update_rfq_supplier_sent_message_id(rfq_id: str, supplier_id: str, sent_mess
 def get_rfq_supplier_by_sent_message_id(supplier_id: str, sent_message_id: str):
     """
     Looks up an active rfq_suppliers record for a supplier that matches sent_message_id.
-    Returns the entry joined with rfqs(*) if the underlying RFQ is active and supplier status in ('sent', 'clarifying').
+    Returns the entry joined with rfqs(*) if the underlying RFQ is active and supplier status in ('sent', 'clarifying', 'responded').
     """
     if not supplier_id or not sent_message_id:
         return None
@@ -357,10 +392,10 @@ def get_rfq_supplier_by_sent_message_id(supplier_id: str, sent_message_id: str):
         .select("*, rfqs(*)")
         .eq("supplier_id", supplier_id)
         .eq("sent_message_id", sent_message_id)
-        .in_("status", ["sent", "clarifying"])
+        .in_("status", ["sent", "clarifying", "responded"])
         .execute()
     )
-    active_entries = [entry for entry in res.data if entry.get("rfqs", {}).get("status") == "active"]
+    active_entries = [entry for entry in (res.data or []) if is_rfq_open(entry.get("rfqs"))]
     return active_entries[0] if active_entries else None
 
 
@@ -413,6 +448,47 @@ def revert_unresolved_candidates(supplier_id: str, resolved_rfq_id: str, candida
 
 
 
+def get_active_rfqs_past_deadline():
+    """
+    Returns active RFQs whose deadline has passed (due_by <= now, or created_at + deadline_hours <= now).
+    Joined with rfq_suppliers and suppliers so participating suppliers can be notified.
+    """
+    res = (
+        supabase.table("rfqs")
+        .select("*, rfq_suppliers(*, suppliers(*))")
+        .eq("status", "active")
+        .execute()
+    )
+    now_dt = datetime.now(timezone.utc)
+    expired_rfqs = []
+    for rfq in (res.data or []):
+        due_by_str = rfq.get("due_by")
+        if due_by_str:
+            try:
+                due_dt = datetime.fromisoformat(due_by_str.replace("Z", "+00:00"))
+                if due_dt.tzinfo is None:
+                    due_dt = due_dt.replace(tzinfo=timezone.utc)
+                if now_dt >= due_dt:
+                    expired_rfqs.append(rfq)
+                continue
+            except Exception:
+                pass
+
+        # Fallback to created_at + deadline_hours if due_by was missing
+        created_at_str = rfq.get("created_at")
+        deadline_hours = rfq.get("deadline_hours") or 24
+        if created_at_str:
+            try:
+                created_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+                if now_dt >= (created_dt + timedelta(hours=deadline_hours)):
+                    expired_rfqs.append(rfq)
+            except Exception:
+                pass
+    return expired_rfqs
+
+
 def is_rfq_fully_processed(rfq_id: str) -> bool:
     """Returns True if no suppliers for this RFQ remain in 'sent' or 'clarifying' status."""
     res = (
@@ -431,23 +507,50 @@ def ranking_exists(rfq_id: str) -> bool:
 
 
 def log_message(client_id: str, supplier_id: str, direction: str,
-                 body: str, related_rfq_id: str = None):
-    supabase.table("message_log").insert({
+                 body: str, related_rfq_id: str = None, status: str = None) -> str:
+    """Logs an inbound or outbound message in message_log and returns the inserted row ID."""
+    payload = {
         "client_id": client_id,
         "supplier_id": supplier_id,
         "direction": direction,
         "body": body,
         "related_rfq_id": related_rfq_id,
-    }).execute()
+    }
+    if status is not None:
+        payload["status"] = status
+    elif direction == "outbound":
+        payload["status"] = "queued"
+
+    try:
+        res = supabase.table("message_log").insert(payload).execute()
+        if res.data and isinstance(res.data, list) and len(res.data) > 0:
+            return res.data[0].get("id")
+    except Exception as ex:
+        # Fallback if status column is not yet deployed
+        logger.debug("log_message insert with status failed, trying base insert: %s", ex)
+        try:
+            res = supabase.table("message_log").insert({
+                "client_id": client_id,
+                "supplier_id": supplier_id,
+                "direction": direction,
+                "body": body,
+                "related_rfq_id": related_rfq_id,
+            }).execute()
+            if res.data and isinstance(res.data, list) and len(res.data) > 0:
+                return res.data[0].get("id")
+        except Exception as e2:
+            logger.error("log_message insert fallback failed: %s", e2)
+    return None
 
 
 def get_quotes_for_rfq(rfq_id: str) -> list:
-    """Returns only the most recent quote per supplier for an RFQ."""
+    """Returns only the most recent (effective) quote per supplier for an RFQ, sorted newest first with id tie-breaker."""
     res = (
         supabase.table("quotes")
         .select("*, suppliers(name)")
         .eq("rfq_id", rfq_id)
         .order("created_at", desc=True)
+        .order("id", desc=True)
         .execute()
     )
     latest_quotes = []
@@ -458,6 +561,18 @@ def get_quotes_for_rfq(rfq_id: str) -> list:
             seen_suppliers.add(supplier_id)
             latest_quotes.append(q)
     return latest_quotes
+
+
+def get_all_quotes_for_rfq(rfq_id: str) -> list:
+    """Returns all historical quotes for an RFQ in chronological order (created_at asc)."""
+    res = (
+        supabase.table("quotes")
+        .select("*, suppliers(name)")
+        .eq("rfq_id", rfq_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return res.data or []
 
 
 def save_ranking(rfq_id: str, best_supplier_id: str, reasoning: str, ranking_json: dict):
@@ -501,19 +616,195 @@ def get_suppliers_by_category(client_id: str, category: str) -> list:
     return res.data
 
 
+def classify_price_position(
+    quote_price: float,
+    acceptable_min: float = None,
+    acceptable_max: float = None,
+) -> str:
+    """
+    Deterministically classifies a supplier quote against the RFQ's negotiation price range.
+    Returns:
+      - 'NO_RANGE_SET' if neither boundary is provided
+      - 'AT_OR_BELOW_MIN' if quote_price <= acceptable_min
+      - 'AT_MAX' if quote_price == acceptable_max
+      - 'WITHIN_ACCEPTABLE_RANGE' if acceptable_min < quote_price < acceptable_max
+      - 'ABOVE_ACCEPTABLE_RANGE' if max < quote_price <= max * 1.15
+      - 'SIGNIFICANTLY_ABOVE_RANGE' if quote_price > max * 1.15
+    """
+    if quote_price is None:
+        return "UNKNOWN"
+    try:
+        quote_p = float(quote_price)
+        if math.isnan(quote_p) or math.isinf(quote_p):
+            return "UNKNOWN"
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+
+    if acceptable_min is None and acceptable_max is None:
+        return "NO_RANGE_SET"
+
+    min_p = float(acceptable_min) if acceptable_min is not None else None
+    max_p = float(acceptable_max) if acceptable_max is not None else None
+
+    if min_p is not None and quote_p <= min_p:
+        return "AT_OR_BELOW_MIN"
+    if max_p is not None and quote_p == max_p:
+        return "AT_MAX"
+    if min_p is not None and max_p is not None and min_p < quote_p < max_p:
+        return "WITHIN_ACCEPTABLE_RANGE"
+    if max_p is not None:
+        if quote_p <= max_p * 1.15:
+            return "ABOVE_ACCEPTABLE_RANGE"
+        else:
+            return "SIGNIFICANTLY_ABOVE_RANGE"
+    if min_p is not None:
+        if quote_p <= min_p * 1.15:
+            return "ABOVE_ACCEPTABLE_RANGE"
+        else:
+            return "SIGNIFICANTLY_ABOVE_RANGE"
+
+    return "WITHIN_ACCEPTABLE_RANGE"
+
+
+def get_competitive_pricing_context(rfq_id: str, current_supplier_id: str) -> dict:
+    """
+    Returns competitive pricing context from other suppliers for the SAME RFQ.
+    Strictly excludes the current supplier's own quotes and masks competitor identities.
+    """
+    if not rfq_id:
+        return {"competing_quotes_count": 0, "best_competing_price": None, "has_competition": False}
+
+    effective_quotes = get_quotes_for_rfq(rfq_id)
+    competing_quotes = [
+        q for q in (effective_quotes or [])
+        if q.get("supplier_id") != current_supplier_id and q.get("price") is not None
+    ]
+
+    if not competing_quotes:
+        return {
+            "competing_quotes_count": 0,
+            "best_competing_price": None,
+            "has_competition": False,
+        }
+
+    prices = []
+    for q in competing_quotes:
+        try:
+            p = float(q["price"])
+            if not math.isnan(p) and not math.isinf(p) and p > 0:
+                prices.append(p)
+        except (ValueError, TypeError):
+            pass
+
+    best_price = min(prices) if prices else None
+    return {
+        "competing_quotes_count": len(prices),
+        "best_competing_price": best_price,
+        "has_competition": best_price is not None,
+    }
+
+
+def get_negotiation_attempts(rfq_id: str, supplier_id: str) -> int:
+    """Returns the current number of autonomous negotiation attempts made to this supplier for this RFQ."""
+    if not rfq_id or not supplier_id:
+        return 0
+    try:
+        res = (
+            supabase.table("rfq_suppliers")
+            .select("negotiation_attempts")
+            .eq("rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .execute()
+        )
+        if res.data and isinstance(res.data, list) and len(res.data) > 0 and isinstance(res.data[0], dict):
+            val = res.data[0].get("negotiation_attempts")
+            if val is not None and isinstance(val, (int, float, str)):
+                return int(val)
+    except Exception:
+        return 0
+    return 0
+
+
+def increment_negotiation_attempts(rfq_id: str, supplier_id: str, max_attempts: int = 3) -> int:
+    """
+    Atomically increments the negotiation attempt counter on rfq_suppliers
+    only if current attempts < max_attempts.
+    Returns the new attempt count (e.g. 1, 2, 3) on success, or -1 if the limit was reached / update failed.
+    """
+    if not rfq_id or not supplier_id:
+        return -1
+
+    # 1. Try Supabase RPC for atomic PostgreSQL execution
+    try:
+        rpc_res = supabase.rpc("increment_negotiation_attempts", {
+            "p_rfq_id": rfq_id,
+            "p_supplier_id": supplier_id,
+            "p_max_attempts": max_attempts,
+        }).execute()
+        if rpc_res.data is not None:
+            val = int(rpc_res.data)
+            if val > 0:
+                return val
+            elif val == -1:
+                return -1
+    except Exception as e:
+        logger.debug("RPC increment_negotiation_attempts not available, using atomic CAS fallback: %s", e)
+
+    # 2. Fallback using optimistic concurrency control (Compare-And-Swap)
+    try:
+        res = (
+            supabase.table("rfq_suppliers")
+            .select("negotiation_attempts")
+            .eq("rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .execute()
+        )
+        if res.data and isinstance(res.data, list) and len(res.data) > 0:
+            current = int(res.data[0].get("negotiation_attempts") or 0)
+            if current >= max_attempts:
+                return -1
+            new_count = current + 1
+            upd = (
+                supabase.table("rfq_suppliers")
+                .update({"negotiation_attempts": new_count})
+                .eq("rfq_id", rfq_id)
+                .eq("supplier_id", supplier_id)
+                .eq("negotiation_attempts", current)
+                .execute()
+            )
+            if upd.data:
+                return new_count
+            return -1
+    except Exception as ex:
+        logger.error("increment_negotiation_attempts error: %s", ex)
+        return -1
+
+    return -1
+
+
 def create_rfq_and_match_suppliers(client_id: str, product_name: str, category: str,
                                    deadline_hours: int = 24, specs: str = None,
-                                   quantity: int = None):
+                                   quantity: int = None,
+                                   acceptable_price_min: float = None,
+                                   acceptable_price_max: float = None):
     """Creates a new RFQ row, queries matching active suppliers by category, and creates rfq_suppliers join records."""
-    rfq_res = supabase.table("rfqs").insert({
+    now_utc = datetime.now(timezone.utc)
+    due_by = (now_utc + timedelta(hours=deadline_hours)).isoformat()
+
+    insert_data = {
         "client_id": client_id,
         "product_name": product_name,
         "category": category,
         "specs": specs,
         "quantity": quantity,
         "deadline_hours": deadline_hours,
+        "due_by": due_by,
         "status": "active",
-    }).execute()
+        "acceptable_price_min": acceptable_price_min,
+        "acceptable_price_max": acceptable_price_max,
+    }
+
+    rfq_res = supabase.table("rfqs").insert(insert_data).execute()
 
     rfq = rfq_res.data[0]
 
@@ -693,3 +984,164 @@ def log_webhook_error(error_message: str, traceback_str: str, raw_payload: dict 
         }).execute()
     except Exception as ex:
         print(f"Failed to log webhook error to db: {ex}")
+
+
+def claim_webhook_message(client_id: str, message_id: str) -> bool:
+    """
+    Atomically attempts to claim an incoming WhatsApp webhook message for a specific client/tenant.
+    Uses PostgreSQL RPC or atomic insert on `processed_webhooks (client_id, message_id)`.
+    Returns True if successfully claimed (first arrival).
+    Returns False if already claimed (duplicate webhook).
+    """
+    if not client_id or not message_id:
+        return True
+
+    # 1. Try Supabase RPC for atomic PostgreSQL execution
+    try:
+        rpc_res = supabase.rpc("claim_webhook_message", {
+            "p_client_id": client_id,
+            "p_message_id": message_id,
+        }).execute()
+        if rpc_res.data is not None:
+            return bool(rpc_res.data)
+    except Exception as e:
+        logger.debug("RPC claim_webhook_message not available, fallback to table insert: %s", e)
+
+    # 2. Direct table insert fallback
+    try:
+        res = (
+            supabase.table("processed_webhooks")
+            .insert({"client_id": client_id, "message_id": message_id})
+            .execute()
+        )
+        if res.data:
+            return True
+        return False
+    except Exception as ex:
+        err_str = str(ex).lower()
+        if "duplicate" in err_str or "unique" in err_str or "conflict" in err_str or "primary key" in err_str or "23505" in err_str:
+            return False
+        logger.warning("claim_webhook_message error: %s", ex)
+        return True
+
+
+def is_webhook_message_claimed(client_id: str, message_id: str) -> bool:
+    """Checks whether a message has already been claimed for a client."""
+    if not client_id or not message_id:
+        return False
+    try:
+        res = (
+            supabase.table("processed_webhooks")
+            .select("message_id")
+            .eq("client_id", client_id)
+            .eq("message_id", message_id)
+            .execute()
+        )
+        return bool(res.data and len(res.data) > 0)
+    except Exception:
+        return False
+
+
+def mark_message_sending(message_log_id: str) -> bool:
+    """
+    Atomically claims authority to send an outbound message by transitioning
+    message_log status from 'queued' to 'sending' and incrementing retry_count
+    via the claim_outbound_message PostgreSQL RPC.
+
+    Returns True if acquisition succeeded (message was in 'queued' state and claimed),
+    or False if acquisition was rejected (not queued) or if an RPC/DB error occurred.
+    Fail-closed: strictly avoids non-atomic SELECT+UPDATE fallback to eliminate duplicate-send risk.
+    """
+    if not message_log_id:
+        return False
+
+    try:
+        rpc_res = supabase.rpc("claim_outbound_message", {"p_message_log_id": str(message_log_id)}).execute()
+        if rpc_res.data is not None:
+            return bool(rpc_res.data)
+        return False
+    except Exception as e:
+        logger.error("claim_outbound_message RPC error for id %s: %s", message_log_id, e)
+        return False
+
+
+def mark_message_sent(message_log_id: str, evolution_message_id: str = None) -> bool:
+    """Marks an outbound message as sent with timestamp and optional Evolution message ID."""
+    if not message_log_id:
+        return False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    upd_payload = {
+        "status": "sent",
+        "sent_at": now_iso,
+    }
+    if evolution_message_id:
+        upd_payload["evolution_message_id"] = str(evolution_message_id)
+    try:
+        upd = supabase.table("message_log").update(upd_payload).eq("id", message_log_id).execute()
+        return bool(upd.data)
+    except Exception as ex:
+        logger.warning("mark_message_sent error for id %s: %s", message_log_id, ex)
+        return False
+
+
+def mark_message_failed(message_log_id: str, error_message: str) -> bool:
+    """Marks an outbound message as definitely failed with sanitized error reason."""
+    if not message_log_id:
+        return False
+    clean_err = str(error_message)[:500] if error_message else "Send failed"
+    try:
+        upd = (
+            supabase.table("message_log")
+            .update({
+                "status": "failed",
+                "error_message": clean_err,
+            })
+            .eq("id", message_log_id)
+            .execute()
+        )
+        return bool(upd.data)
+    except Exception as ex:
+        logger.warning("mark_message_failed error for id %s: %s", message_log_id, ex)
+        return False
+
+
+def mark_message_unknown(message_log_id: str, error_message: str) -> bool:
+    """Marks an outbound message as unknown delivery state (timeout/network drop)."""
+    if not message_log_id:
+        return False
+    clean_err = str(error_message)[:500] if error_message else "Delivery unconfirmed (timeout/network error)"
+    try:
+        upd = (
+            supabase.table("message_log")
+            .update({
+                "status": "unknown",
+                "error_message": clean_err,
+            })
+            .eq("id", message_log_id)
+            .execute()
+        )
+        return bool(upd.data)
+    except Exception as ex:
+        logger.warning("mark_message_unknown error for id %s: %s", message_log_id, ex)
+        return False
+
+
+def get_queued_outbound_messages() -> list[dict]:
+    """
+    Fetches all outbound messages currently in 'queued' status on startup.
+    Joined with suppliers(phone_number) to retrieve recipient phone number for re-enqueuing.
+    """
+    try:
+        res = (
+            supabase.table("message_log")
+            .select("*, suppliers(phone_number)")
+            .eq("direction", "outbound")
+            .eq("status", "queued")
+            .order("created_at", desc=False)
+            .execute()
+        )
+        return res.data or []
+    except Exception as ex:
+        logger.warning("get_queued_outbound_messages error: %s", ex)
+        return []
+

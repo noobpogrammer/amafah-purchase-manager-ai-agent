@@ -1,7 +1,7 @@
 import os
 import sys
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock, AsyncMock, ANY
 
 # Ensure repo root is in python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -101,7 +101,8 @@ async def test_webhook_injection_attempt_escalates_not_complies(mock_supabase):
         assert "guardrail" in flag_kwargs["reason"].lower()
 
         # Confirm enqueue_message was called with HUMAN_ACK_MSG, NOT the injected code
-        mock_enqueue.assert_called_once_with("971501234567", main.HUMAN_ACK_MSG)
+        assert mock_enqueue.call_args[0][0] == "971501234567"
+        assert mock_enqueue.call_args[0][1] == main.HUMAN_ACK_MSG
         assert unsafe_question not in mock_enqueue.call_args[0][1]
 
 
@@ -158,4 +159,4 @@ async def test_legitimate_clarification_still_sends_normally(mock_supabase):
 
         assert response["status"] == "clarification_needed"
         assert response["question"] == legit_question
-        mock_enqueue.assert_called_once_with("971501234567", legit_question)
+        mock_enqueue.assert_called_once_with("971501234567", legit_question, message_log_id=ANY)

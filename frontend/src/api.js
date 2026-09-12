@@ -127,6 +127,8 @@ export async function createRFQ(payload) {
       specs: payload.specs,
       quantity: payload.quantity ? parseInt(payload.quantity) : null,
       last_quote: payload.last_quote !== undefined && payload.last_quote !== null && payload.last_quote !== '' ? Number(payload.last_quote) : null,
+      acceptable_price_min: payload.acceptable_price_min !== undefined && payload.acceptable_price_min !== null && payload.acceptable_price_min !== '' ? Number(payload.acceptable_price_min) : null,
+      acceptable_price_max: payload.acceptable_price_max !== undefined && payload.acceptable_price_max !== null && payload.acceptable_price_max !== '' ? Number(payload.acceptable_price_max) : null,
       deadline_hours: payload.deadline_hours ? parseInt(payload.deadline_hours) : 24,
     }),
   });

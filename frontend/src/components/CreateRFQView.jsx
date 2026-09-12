@@ -23,6 +23,8 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
   const [specs, setSpecs] = useState('');
   const [quantity, setQuantity] = useState('');
   const [lastQuote, setLastQuote] = useState('');
+  const [acceptablePriceMin, setAcceptablePriceMin] = useState('');
+  const [acceptablePriceMax, setAcceptablePriceMax] = useState('');
   const [deadlineHours, setDeadlineHours] = useState(24);
 
   const [showCustomCatInput, setShowCustomCatInput] = useState(false);
@@ -116,6 +118,19 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
       return;
     }
 
+    if (acceptablePriceMin && Number(acceptablePriceMin) <= 0) {
+      setErrorMsg('Acceptable Price Min must be a positive number.');
+      return;
+    }
+    if (acceptablePriceMax && Number(acceptablePriceMax) <= 0) {
+      setErrorMsg('Acceptable Price Max must be a positive number.');
+      return;
+    }
+    if (acceptablePriceMin && acceptablePriceMax && Number(acceptablePriceMin) > Number(acceptablePriceMax)) {
+      setErrorMsg('Acceptable Price Min cannot be greater than Acceptable Price Max.');
+      return;
+    }
+
     setLoading(true);
     setErrorMsg('');
     setMatchedResult(null);
@@ -127,6 +142,8 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
         specs: specs.trim(),
         quantity,
         last_quote: lastQuote ? Number(lastQuote) : null,
+        acceptable_price_min: acceptablePriceMin ? Number(acceptablePriceMin) : null,
+        acceptable_price_max: acceptablePriceMax ? Number(acceptablePriceMax) : null,
         deadline_hours: deadlineHours,
       });
 
@@ -421,16 +438,42 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                 </div>
               </div>
 
-              <div className="form-group">
-                <label className="form-label flex-items">Last Quote / Last Cost (AED)</label>
-                <input
-                  type="number"
-                  className="input-field"
-                  placeholder="e.g. 12.50"
-                  value={lastQuote}
-                  onChange={(e) => setLastQuote(e.target.value)}
-                  step="0.01"
-                />
+              <div className="form-row">
+                <div className="form-group">
+                  <label className="form-label flex-items">Last Quote / Last Cost (AED)</label>
+                  <input
+                    type="number"
+                    className="input-field"
+                    placeholder="e.g. 12.50"
+                    value={lastQuote}
+                    onChange={(e) => setLastQuote(e.target.value)}
+                    step="0.01"
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label flex-items">Acceptable Price Min (AED)</label>
+                  <input
+                    type="number"
+                    className="input-field"
+                    placeholder="e.g. 50.00"
+                    value={acceptablePriceMin}
+                    onChange={(e) => setAcceptablePriceMin(e.target.value)}
+                    step="0.01"
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label flex-items">Acceptable Price Max (AED)</label>
+                  <input
+                    type="number"
+                    className="input-field"
+                    placeholder="e.g. 60.00"
+                    value={acceptablePriceMax}
+                    onChange={(e) => setAcceptablePriceMax(e.target.value)}
+                    step="0.01"
+                  />
+                </div>
               </div>
 
               <div className="form-actions">
