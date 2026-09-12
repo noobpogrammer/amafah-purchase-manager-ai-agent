@@ -400,14 +400,98 @@ def check_and_auto_rank(rfq_id: str):
         generate_ranking(rfq_id)
 
 
+async def finalize_rfq_job(rfq: dict):
+    """
+    Executes idempotent finalization steps for an RFQ (after atomic claim or during recovery):
+    1. Generates and persists AI quote ranking if quotes exist and ranking is not yet saved.
+    2. Idempotently creates and enqueues closure notifications for participating suppliers using event_key.
+    3. Marks RFQ finalization as 'completed' with finalized_at timestamp.
+    """
+    rfq_id = rfq.get("id")
+    if not rfq_id:
+        return
+    prod = rfq.get("product_name") or "RFQ Item"
+    client_id = rfq.get("client_id")
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # 1. Idempotent Ranking
+    try:
+        quotes = db.get_quotes_for_rfq(rfq_id)
+        if quotes:
+            if not db.ranking_exists(rfq_id):
+                print(f"[{now_iso}] [Finalization] Generating ranking for RFQ '{prod}' (id: {rfq_id})...")
+                generate_ranking(rfq_id)
+            else:
+                print(f"[{now_iso}] [Finalization] Ranking already exists for RFQ {rfq_id}, skipping duplicate generation.")
+    except Exception as rank_err:
+        tb = traceback.format_exc()
+        print(f"[{now_iso}] [Finalization ERROR] Ranking generation failed for RFQ {rfq_id}: {rank_err}\n{tb}")
+        db.log_webhook_error(str(rank_err), tb, {"job": "finalize_rfq_job", "stage": "ranking", "rfq_id": rfq_id})
+        # Leave in 'processing' state so recovery can retry later
+        return
+
+    # 2. Idempotent Closure Notifications
+    try:
+        rfq_suppliers = rfq.get("rfq_suppliers") or []
+        if not rfq_suppliers:
+            rfq_suppliers = db.get_rfq_suppliers_for_rfq(rfq_id)
+
+        msg = f"RFQ for '{prod}' is now closed as the deadline has passed. Thank you!"
+        all_notifications_confirmed = True
+
+        for item in rfq_suppliers:
+            supplier = item.get("suppliers") or {}
+            supplier_id = supplier.get("id") or item.get("supplier_id")
+            phone = supplier.get("phone_number")
+            if not phone and supplier_id:
+                sup_row = db.get_supplier_by_id(supplier_id)
+                if sup_row:
+                    phone = sup_row.get("phone_number")
+                    if not client_id:
+                        client_id = sup_row.get("client_id")
+
+            if phone and supplier_id:
+                c_id = client_id or supplier.get("client_id")
+                event_key = f"rfq_closed:{rfq_id}:{supplier_id}"
+                existing_msg = db.get_message_by_event_key(event_key)
+                if not existing_msg:
+                    msg_log_id = db.log_message(c_id, supplier_id, "outbound", msg, related_rfq_id=rfq_id, event_key=event_key)
+                    if msg_log_id:
+                        await enqueue_message(phone, msg, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+                    else:
+                        print(f"[{now_iso}] [Finalization ERROR] Failed to establish durable closure message for supplier {supplier_id} (event_key: {event_key}).")
+                        all_notifications_confirmed = False
+                else:
+                    print(f"[{now_iso}] [Finalization] Closure notification already logged for supplier {supplier_id} (event_key: {event_key}), skipping.")
+
+        if not all_notifications_confirmed:
+            print(f"[{now_iso}] [Finalization] Incomplete notification persistence for RFQ {rfq_id}. Leaving in 'processing' state.")
+            return
+
+    except Exception as notif_err:
+        tb = traceback.format_exc()
+        print(f"[{now_iso}] [Finalization ERROR] Notification creation failed for RFQ {rfq_id}: {notif_err}\n{tb}")
+        db.log_webhook_error(str(notif_err), tb, {"job": "finalize_rfq_job", "stage": "notifications", "rfq_id": rfq_id})
+        return
+
+    # 3. Mark Finalization Completed
+    try:
+        marked = db.mark_rfq_finalization_completed(rfq_id)
+        if marked:
+            print(f"[{now_iso}] [Finalization] RFQ '{prod}' ({rfq_id}) marked finalization_status='completed'.")
+    except Exception as comp_err:
+        tb = traceback.format_exc()
+        print(f"[{now_iso}] [Finalization ERROR] Failed marking finalization completed for RFQ {rfq_id}: {comp_err}\n{tb}")
+        db.log_webhook_error(str(comp_err), tb, {"job": "finalize_rfq_job", "stage": "mark_completed", "rfq_id": rfq_id})
+
+
 async def check_deadlines_and_reminders():
     """Background cron job that checks active RFQs and handles deadline expiry & reminders."""
     now = datetime.now(timezone.utc)
     print(f"[{now.isoformat()}] [Scheduler] Running check_deadlines_and_reminders...")
 
     # =========================================================================
-    # Phase 1: RFQ-Level Deadline Expiration & Closure
-    # Evaluates master RFQ due_by deadline independently of supplier response status.
+    # Section A: Acquire Newly Expired Active RFQs
     # =========================================================================
     try:
         expired_rfqs = db.get_active_rfqs_past_deadline()
@@ -422,35 +506,39 @@ async def check_deadlines_and_reminders():
         rfq_id = rfq.get("id")
         prod = rfq.get("product_name") or "RFQ Item"
         try:
-            print(f"[{now.isoformat()}] [Scheduler] Master deadline expired for RFQ '{prod}' (id: {rfq_id}). Closing RFQ.")
-            
-            # 1. Notify participating suppliers
-            rfq_suppliers = rfq.get("rfq_suppliers") or []
-            msg = f"RFQ for '{prod}' is now closed as the deadline has passed. Thank you!"
-            
-            for item in rfq_suppliers:
-                supplier = item.get("suppliers") or {}
-                phone = supplier.get("phone_number")
-                if phone:
-                    client_id = rfq.get("client_id") or supplier.get("client_id")
-                    msg_log_id = db.log_message(client_id, supplier.get("id"), "outbound", msg, related_rfq_id=rfq_id)
-                    await enqueue_message(phone, msg, rfq_id=rfq_id, supplier_id=supplier.get("id"), message_log_id=msg_log_id)
-            
-            # 2. Close RFQ in DB (updates rfqs.status to 'closed' and transitions hanging suppliers to 'no_response')
-            db.close_rfq(rfq_id, "closed")
-            
-            # 3. Final evaluation / ranking using the latest quotes received
-            quotes = db.get_quotes_for_rfq(rfq_id)
-            if quotes:
-                print(f"[{now.isoformat()}] [Scheduler] Running final ranking for closed RFQ {rfq_id} ({len(quotes)} quote(s)).")
-                generate_ranking(rfq_id)
+            claimed = db.claim_rfq_for_finalization(rfq_id)
+            if claimed:
+                print(f"[{now.isoformat()}] [Scheduler] Successfully claimed finalization authority for RFQ '{prod}' (id: {rfq_id}).")
+                await finalize_rfq_job(rfq)
+            else:
+                print(f"[{now.isoformat()}] [Scheduler] Skipped RFQ '{prod}' (id: {rfq_id}): authority not acquired (already claimed or inactive).")
         except Exception as rfq_err:
             tb = traceback.format_exc()
-            print(f"[{now.isoformat()}] [Scheduler ERROR] Failed closing expired RFQ {rfq_id}: {rfq_err}\n{tb}")
+            print(f"[{now.isoformat()}] [Scheduler ERROR] Failed processing expired RFQ {rfq_id}: {rfq_err}\n{tb}")
             db.log_webhook_error(str(rfq_err), tb, {"job": "check_deadlines_and_reminders", "rfq_id": rfq_id})
 
     # =========================================================================
-    # Phase 2: Supplier Reminders (strictly for pending suppliers with status = 'sent')
+    # Section B: Recover Incomplete Finalizations (status='closed' & finalization_status='processing')
+    # =========================================================================
+    try:
+        processing_rfqs = db.get_rfqs_pending_finalization_recovery()
+        if processing_rfqs:
+            print(f"[{now.isoformat()}] [Scheduler] Found {len(processing_rfqs)} incomplete RFQ(s) in 'processing' state. Resuming recovery...")
+        for prfq in processing_rfqs:
+            prfq_id = prfq.get("id")
+            try:
+                await finalize_rfq_job(prfq)
+            except Exception as rec_err:
+                tb = traceback.format_exc()
+                print(f"[{now.isoformat()}] [Scheduler ERROR] Recovery failed for RFQ {prfq_id}: {rec_err}\n{tb}")
+                db.log_webhook_error(str(rec_err), tb, {"job": "check_deadlines_and_reminders", "stage": "recovery", "rfq_id": prfq_id})
+    except Exception as proc_err:
+        tb = traceback.format_exc()
+        print(f"[{now.isoformat()}] [Scheduler ERROR] Failed fetching processing RFQs for recovery: {proc_err}\n{tb}")
+        db.log_webhook_error(str(proc_err), tb, {"job": "check_deadlines_and_reminders", "stage": "fetch_processing_rfqs"})
+
+    # =========================================================================
+    # Section C: Supplier Reminders (strictly for active, open RFQs with percentage < 100)
     # =========================================================================
     try:
         active_items = db.get_active_rfq_suppliers_with_deadlines()
@@ -467,6 +555,10 @@ async def check_deadlines_and_reminders():
             rfq = item.get("rfqs") or {}
             supplier = item.get("suppliers") or {}
             sent_at_str = item.get("sent_at")
+
+            # 1. Strictly verify RFQ is active and open (deadline has not elapsed)
+            if not db.is_rfq_open(rfq):
+                continue
 
             if not sent_at_str:
                 print(f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: missing sent_at timestamp.")
@@ -487,6 +579,10 @@ async def check_deadlines_and_reminders():
                 continue
 
             percentage = (elapsed_seconds / total_seconds) * 100
+            if percentage >= 100:
+                # Never trigger reminders for RFQs that have reached or exceeded deadline
+                continue
+
             reminder_count = item.get("reminder_count") or 0
             phone = supplier.get("phone_number")
             prod = rfq.get("product_name") or "RFQ Item"

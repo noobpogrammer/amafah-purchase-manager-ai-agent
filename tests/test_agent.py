@@ -151,7 +151,7 @@ class TestFlagForHumanReviewAndResolve:
 
         result = db.update_rfq_status("rfq-100", "closed")
         assert result["status"] == "closed"
-        mock_rfq_table.update.assert_called_with({"status": "closed"})
+        assert mock_rfq_table.update.call_args[0][0]["status"] == "closed"
 
     def test_close_rfq_cascades_status_updates(self, mock_supabase):
         mock_rfq_table = MagicMock()
@@ -180,6 +180,7 @@ class TestFlagForHumanReviewAndResolve:
 
         result = db.close_rfq("rfq-100", "closed")
         assert result["id"] == "rfq-100"
+        assert mock_rfq_table.update.call_args[0][0]["status"] == "closed"
         # Assert rfq_suppliers updated sent/clarifying to no_response
         mock_supp_table.update.assert_called_with({"status": "no_response"})
         # Assert pending_clarification abandoned
@@ -520,9 +521,11 @@ class TestReminderSystemAudit:
 
         with patch.object(db, "get_active_rfqs_past_deadline", return_value=[mock_expired_rfq]), \
              patch.object(db, "get_active_rfq_suppliers_with_deadlines", return_value=[]), \
-             patch.object(db, "log_message") as mock_log, \
-             patch.object(db, "close_rfq") as mock_close_rfq, \
+             patch.object(db, "claim_rfq_for_finalization", return_value=True) as mock_claim_rfq, \
+             patch.object(db, "get_message_by_event_key", return_value=None), \
+             patch.object(db, "log_message", return_value="msg-log-123") as mock_log, \
              patch.object(db, "get_quotes_for_rfq", return_value=mock_quotes), \
+             patch.object(db, "ranking_exists", return_value=False), \
              patch.object(main, "generate_ranking") as mock_generate_ranking, \
              patch.object(main, "enqueue_message", new_callable=AsyncMock) as mock_enqueue:
 
@@ -532,8 +535,8 @@ class TestReminderSystemAudit:
             assert mock_enqueue.call_count == 2
             assert "closed as the deadline has passed" in mock_enqueue.call_args_list[0][0][1].lower()
 
-            # Verify master RFQ closed
-            mock_close_rfq.assert_called_once_with("rfq-100", "closed")
+            # Verify master RFQ claimed for finalization
+            mock_claim_rfq.assert_called_once_with("rfq-100")
 
             # Verify final evaluation/ranking ran with latest quotes
             mock_generate_ranking.assert_called_once_with("rfq-100")

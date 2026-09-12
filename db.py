@@ -216,7 +216,7 @@ def is_rfq_open(rfq: dict) -> bool:
     """
     if not rfq or not isinstance(rfq, dict):
         return False
-    if rfq.get("status") != "active":
+    if rfq.get("status") and rfq.get("status") not in ("active", "sent", "clarifying", "responded"):
         return False
     due_by_str = rfq.get("due_by")
     if due_by_str:
@@ -225,6 +225,16 @@ def is_rfq_open(rfq: dict) -> bool:
             if due_dt.tzinfo is None:
                 due_dt = due_dt.replace(tzinfo=timezone.utc)
             return datetime.now(timezone.utc) < due_dt
+        except Exception:
+            pass
+    created_at_str = rfq.get("created_at")
+    deadline_hours = rfq.get("deadline_hours")
+    if created_at_str and deadline_hours:
+        try:
+            created_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            return datetime.now(timezone.utc) < (created_dt + timedelta(hours=float(deadline_hours)))
         except Exception:
             pass
     return True
@@ -506,9 +516,51 @@ def ranking_exists(rfq_id: str) -> bool:
     return len(res.data) > 0
 
 
+def get_message_by_event_key(event_key: str) -> dict | None:
+    """Retrieves a message_log row matching event_key for idempotency checking."""
+    if not event_key:
+        return None
+    try:
+        res = supabase.table("message_log").select("*").eq("event_key", event_key).limit(1).execute()
+        if res and res.data and isinstance(res.data, list) and len(res.data) > 0 and isinstance(res.data[0], dict):
+            return res.data[0]
+        return None
+    except Exception as e:
+        logger.debug("get_message_by_event_key error for %s: %s", event_key, e)
+        return None
+
+
+def get_rfq_suppliers_for_rfq(rfq_id: str) -> list[dict]:
+    """Retrieves all rfq_suppliers records for an RFQ joined with suppliers."""
+    if not rfq_id:
+        return []
+    try:
+        res = (
+            supabase.table("rfq_suppliers")
+            .select("*, suppliers(*)")
+            .eq("rfq_id", rfq_id)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error("get_rfq_suppliers_for_rfq error for rfq %s: %s", rfq_id, e)
+        return []
+
+
 def log_message(client_id: str, supplier_id: str, direction: str,
-                 body: str, related_rfq_id: str = None, status: str = None) -> str:
-    """Logs an inbound or outbound message in message_log and returns the inserted row ID."""
+                 body: str, related_rfq_id: str = None, status: str = None,
+                 event_key: str = None) -> str:
+    """
+    Logs an inbound or outbound message in message_log and returns the inserted row ID.
+    If event_key is provided and already exists, returns the existing row ID (idempotency).
+    If event_key is provided and insert fails (e.g. race conflict), looks up the existing row ID
+    and strictly fails closed (returns None) without performing any unkeyed fallback insert.
+    """
+    if event_key:
+        existing = get_message_by_event_key(event_key)
+        if existing and existing.get("id"):
+            return existing.get("id")
+
     payload = {
         "client_id": client_id,
         "supplier_id": supplier_id,
@@ -521,13 +573,33 @@ def log_message(client_id: str, supplier_id: str, direction: str,
     elif direction == "outbound":
         payload["status"] = "queued"
 
+    if event_key is not None:
+        payload["event_key"] = event_key
+
+    # Case 1: Keyed business event (event_key is provided)
+    if event_key is not None:
+        try:
+            res = supabase.table("message_log").insert(payload).execute()
+            if res.data and isinstance(res.data, list) and len(res.data) > 0:
+                return res.data[0].get("id")
+        except Exception as ex:
+            logger.debug("log_message insert with event_key %s failed: %s", event_key, ex)
+            # Check if another process won the insert race
+            existing = get_message_by_event_key(event_key)
+            if existing and existing.get("id"):
+                return existing.get("id")
+            # Fail closed: NEVER perform fallback insert without event_key!
+            logger.error("log_message fail-closed for event_key %s: could not insert or confirm existing keyed row", event_key)
+            return None
+        return None
+
+    # Case 2: Unkeyed ordinary message (event_key is None)
     try:
         res = supabase.table("message_log").insert(payload).execute()
         if res.data and isinstance(res.data, list) and len(res.data) > 0:
             return res.data[0].get("id")
     except Exception as ex:
-        # Fallback if status column is not yet deployed
-        logger.debug("log_message insert with status failed, trying base insert: %s", ex)
+        logger.debug("log_message insert for unkeyed message failed, trying base insert: %s", ex)
         try:
             res = supabase.table("message_log").insert({
                 "client_id": client_id,
@@ -539,7 +611,7 @@ def log_message(client_id: str, supplier_id: str, direction: str,
             if res.data and isinstance(res.data, list) and len(res.data) > 0:
                 return res.data[0].get("id")
         except Exception as e2:
-            logger.error("log_message insert fallback failed: %s", e2)
+            logger.error("log_message unkeyed insert fallback failed: %s", e2)
     return None
 
 
@@ -576,12 +648,13 @@ def get_all_quotes_for_rfq(rfq_id: str) -> list:
 
 
 def save_ranking(rfq_id: str, best_supplier_id: str, reasoning: str, ranking_json: dict):
-    supabase.table("rfq_rankings").insert({
+    """Persists AI comparison ranking using upsert on rfq_id to guarantee idempotency."""
+    return supabase.table("rfq_rankings").upsert({
         "rfq_id": rfq_id,
         "best_supplier_id": best_supplier_id,
         "reasoning": reasoning,
         "ranking_json": ranking_json,
-    }).execute()
+    }, on_conflict="rfq_id").execute().data
 
 
 def get_ranking_for_rfq(rfq_id: str) -> dict | None:
@@ -800,6 +873,7 @@ def create_rfq_and_match_suppliers(client_id: str, product_name: str, category: 
         "deadline_hours": deadline_hours,
         "due_by": due_by,
         "status": "active",
+        "finalization_status": "pending",
         "acceptable_price_min": acceptable_price_min,
         "acceptable_price_max": acceptable_price_max,
     }
@@ -934,14 +1008,19 @@ def resolve_flag_with_response(flag_id: str, human_response: str = None):
 def close_rfq(rfq_id: str, target_status: str = "closed"):
     """
     Closes or cancels an RFQ and ensures all child records are resolved cleanly:
-    1. Updates rfqs.status to target_status ('closed' or 'cancelled').
+    1. Updates rfqs.status to target_status ('closed' or 'cancelled') and marks finalization_status='completed'.
     2. Updates any rfq_suppliers for this RFQ in ('sent', 'clarifying') to 'no_response'.
     3. Abandons any pending_clarifications for this RFQ currently in 'awaiting_reply' status.
     """
+    now_iso = datetime.now(timezone.utc).isoformat()
     # 1. Update RFQ status
     rfq_res = (
         supabase.table("rfqs")
-        .update({"status": target_status})
+        .update({
+            "status": target_status,
+            "finalization_status": "completed",
+            "finalized_at": now_iso,
+        })
         .eq("id", rfq_id)
         .execute()
     )
@@ -972,6 +1051,69 @@ def close_rfq(rfq_id: str, target_status: str = "closed"):
 def update_rfq_status(rfq_id: str, status: str):
     """Alias wrapping close_rfq for backward compatibility."""
     return close_rfq(rfq_id, status)
+
+
+def claim_rfq_for_finalization(rfq_id: str) -> bool:
+    """
+    Atomically acquires finalization authority for an expired active RFQ via PostgreSQL RPC.
+    Transitions status to 'closed' and finalization_status to 'processing', cascading child status cleanup.
+    Returns True if authority was acquired, False otherwise. Fail-closed.
+    """
+    if not rfq_id:
+        return False
+    try:
+        res = supabase.rpc("claim_rfq_for_finalization", {"p_rfq_id": str(rfq_id)}).execute()
+        if res.data is not None:
+            return bool(res.data)
+        return False
+    except Exception as e:
+        logger.error("claim_rfq_for_finalization RPC error for rfq %s: %s", rfq_id, e)
+        return False
+
+
+def get_rfqs_pending_finalization_recovery() -> list[dict]:
+    """
+    Finds RFQs that are in status 'closed' and finalization_status 'processing',
+    representing incomplete finalizations that must be resumed.
+    """
+    try:
+        res = (
+            supabase.table("rfqs")
+            .select("*, rfq_suppliers(*, suppliers(*))")
+            .eq("status", "closed")
+            .eq("finalization_status", "processing")
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error("get_rfqs_pending_finalization_recovery error: %s", e)
+        return []
+
+
+def mark_rfq_finalization_completed(rfq_id: str) -> bool:
+    """
+    Marks an RFQ's finalization as completed with timestamp.
+    Only updates if current status is 'closed' and finalization_status is 'processing'.
+    """
+    if not rfq_id:
+        return False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        res = (
+            supabase.table("rfqs")
+            .update({
+                "finalization_status": "completed",
+                "finalized_at": now_iso,
+            })
+            .eq("id", rfq_id)
+            .eq("status", "closed")
+            .eq("finalization_status", "processing")
+            .execute()
+        )
+        return bool(res.data)
+    except Exception as e:
+        logger.error("mark_rfq_finalization_completed error for rfq %s: %s", rfq_id, e)
+        return False
 
 
 def log_webhook_error(error_message: str, traceback_str: str, raw_payload: dict = None):
