@@ -16,6 +16,7 @@ UNSAFE_PATTERNS = [
     r"\bact\s+as\s+a\b",                              # Persona shift
     r"\bsystem\s+prompt\b",                           # System prompt leak
     r"\breveal\s+(?:your\s+)?(?:system\s+)?instructions\b", # Prompt leak request
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", # Internal UUID / database key leak
 ]
 
 def is_safe_to_send(text: str) -> bool:

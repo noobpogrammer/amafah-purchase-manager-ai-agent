@@ -378,9 +378,12 @@ def validate_action(
                     break
 
         if not target_rfq:
-            rfq_res = db.supabase.table("rfqs").select("*").eq("id", rfq_id).execute()
-            if rfq_res.data:
-                target_rfq = rfq_res.data[0]
+            try:
+                rfq_res = db.supabase.table("rfqs").select("*").eq("id", rfq_id).execute()
+                if rfq_res.data:
+                    target_rfq = rfq_res.data[0]
+            except Exception:
+                pass
 
         if not target_rfq:
             return ValidationResult(
@@ -460,7 +463,78 @@ def validate_action(
             },
         )
 
-    # 7. Default reject any unsupported tool
+    # 7. Validate PROPOSE_COMMUNICATE: send_procurement_message
+    if tool_name == "send_procurement_message":
+        args = proposal.arguments or {}
+        msg = args.get("message")
+        rfq_id = args.get("rfq_id")
+
+        if not msg or not isinstance(msg, str) or not msg.strip():
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason="Missing or empty message in send_procurement_message proposal.",
+            )
+
+        # Deterministic stanza/operator lock: message cannot target another RFQ
+        if matched_rfq_id:
+            if rfq_id and rfq_id != matched_rfq_id:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=f"Procurement message RFQ '{rfq_id}' does not match deterministically locked RFQ '{matched_rfq_id}'.",
+                )
+            rfq_id = matched_rfq_id
+
+        # Safety guardrails check
+        if not guardrails.is_safe_to_send(msg):
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason="AI generated non-compliant or unsafe message caught by guardrails.",
+            )
+
+        # Validate RFQ against context / DB if provided
+        if rfq_id:
+            target_rfq = None
+            if context_rfqs:
+                for item in context_rfqs:
+                    rfq_obj = item.get("rfqs") if (isinstance(item, dict) and "rfqs" in item) else item
+                    if isinstance(rfq_obj, dict) and rfq_obj.get("id") == rfq_id:
+                        target_rfq = rfq_obj
+                        break
+            if not target_rfq:
+                try:
+                    rfq_res = db.supabase.table("rfqs").select("*").eq("id", rfq_id).execute()
+                    if rfq_res.data:
+                        target_rfq = rfq_res.data[0]
+                except Exception:
+                    pass
+
+            if target_rfq:
+                rfq_client_id = target_rfq.get("client_id")
+                if rfq_client_id and rfq_client_id != client_id:
+                    return ValidationResult(
+                        is_valid=False,
+                        action=tool_name,
+                        category=ActionCategory.PROPOSE_COMMUNICATE,
+                        reason=f"Cross-tenant violation: RFQ '{rfq_id}' does not belong to client '{client_id}'.",
+                    )
+
+        return ValidationResult(
+            is_valid=True,
+            action=tool_name,
+            category=ActionCategory.PROPOSE_COMMUNICATE,
+            sanitized_args={
+                "rfq_id": rfq_id,
+                "message": msg.strip(),
+            },
+        )
+
+    # 8. Default reject any unsupported tool
     return ValidationResult(
         is_valid=False,
         action=tool_name,

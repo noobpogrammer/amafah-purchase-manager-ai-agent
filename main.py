@@ -749,14 +749,25 @@ async def execute_validated_action(
     if validation.action == "record_quote":
         args = validation.sanitized_args
         target_rfq_id = args["rfq_id"]
-        db.record_quote(
-            rfq_id=target_rfq_id,
-            supplier_id=supplier_id,
-            price=args["price"],
-            delivery_time=args.get("delivery_time"),
-            quality_notes=args.get("quality_notes"),
-            raw_message=raw_message,
-        )
+        # Ensure quote provenance reflects supplier's original message, not operator instruction
+        quote_raw = context.review_raw_message if (context.input_origin == "operator" and context.review_raw_message) else raw_message
+
+        # Check if existing quote already recorded at this price to avoid duplicate quote records from operator hold commands
+        should_record = True
+        if context.input_origin == "operator":
+            existing_quotes = [q for q in context.prior_quotes if q.get("rfq_id") == target_rfq_id]
+            if existing_quotes and existing_quotes[0].get("price") == args["price"]:
+                should_record = False
+
+        if should_record:
+            db.record_quote(
+                rfq_id=target_rfq_id,
+                supplier_id=supplier_id,
+                price=args["price"],
+                delivery_time=args.get("delivery_time"),
+                quality_notes=args.get("quality_notes"),
+                raw_message=quote_raw,
+            )
 
         # Resolve pending clarification if one was active for this supplier
         if context.pending_clarification:
@@ -768,6 +779,8 @@ async def execute_validated_action(
             )
 
         msg_log_id = db.log_message(client_id, supplier_id, "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
+        if not msg_log_id:
+            raise RuntimeError("Failed to log outbound thank-you message durably.")
         await enqueue_message(phone_number, THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
 
         if context.match_source:
@@ -789,14 +802,24 @@ async def execute_validated_action(
         delivery = args.get("delivery_time")
         notes = args.get("quality_notes")
 
-        db.record_quote(
-            rfq_id=target_rfq_id,
-            supplier_id=supplier_id,
-            price=quoted_price,
-            delivery_time=delivery,
-            quality_notes=notes,
-            raw_message=raw_message,
-        )
+        quote_raw = context.review_raw_message if (context.input_origin == "operator" and context.review_raw_message) else raw_message
+
+        # Check existing quote to avoid duplicate insertion on negotiation if quote price hasn't changed
+        should_record = True
+        if context.input_origin == "operator":
+            existing_quotes = [q for q in context.prior_quotes if q.get("rfq_id") == target_rfq_id]
+            if existing_quotes and existing_quotes[0].get("price") == quoted_price:
+                should_record = False
+
+        if should_record:
+            db.record_quote(
+                rfq_id=target_rfq_id,
+                supplier_id=supplier_id,
+                price=quoted_price,
+                delivery_time=delivery,
+                quality_notes=notes,
+                raw_message=quote_raw,
+            )
 
         attempts = db.increment_negotiation_attempts(target_rfq_id, supplier_id)
         if attempts <= 0:
@@ -808,6 +831,8 @@ async def execute_validated_action(
                     candidate_rfq_ids=context.pending_clarification.get("pending_rfq_ids", []),
                 )
             msg_log_id = db.log_message(client_id, supplier_id, "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
+            if not msg_log_id:
+                raise RuntimeError("Failed to log outbound message durably.")
             await enqueue_message(phone_number, THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
             return {"status": "rejected_by_policy", "reason": "Negotiation attempt limit reached."}
 
@@ -820,6 +845,8 @@ async def execute_validated_action(
             )
 
         msg_log_id = db.log_message(client_id, supplier_id, "outbound", neg_msg, related_rfq_id=target_rfq_id)
+        if not msg_log_id:
+            raise RuntimeError("Failed to log outbound negotiation message durably.")
         await enqueue_message(phone_number, neg_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
         return {"status": "negotiation_sent", "rfq_id": target_rfq_id, "attempts": attempts}
 
@@ -845,11 +872,31 @@ async def execute_validated_action(
         single_rfq = candidate_ids[0] if len(candidate_ids) == 1 else (context.matched_rfq_id or None)
         if single_rfq:
             msg_log_id = db.log_message(client_id, supplier_id, "outbound", question, related_rfq_id=single_rfq)
+            if not msg_log_id:
+                raise RuntimeError("Failed to log outbound clarification message durably.")
             await enqueue_message(phone_number, question, rfq_id=single_rfq, supplier_id=supplier_id, message_log_id=msg_log_id)
         else:
             msg_log_id = db.log_message(client_id, supplier_id, "outbound", question)
+            if not msg_log_id:
+                raise RuntimeError("Failed to log outbound clarification message durably.")
             await enqueue_message(phone_number, question, message_log_id=msg_log_id)
         return {"status": "clarification_needed", "question": question}
+
+    elif validation.action == "send_procurement_message":
+        args = validation.sanitized_args
+        msg = args["message"]
+        target_rfq_id = args.get("rfq_id") or context.matched_rfq_id
+        if target_rfq_id:
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", msg, related_rfq_id=target_rfq_id)
+            if not msg_log_id:
+                raise RuntimeError("Failed to log outbound procurement message durably.")
+            await enqueue_message(phone_number, msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+        else:
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", msg)
+            if not msg_log_id:
+                raise RuntimeError("Failed to log outbound procurement message durably.")
+            await enqueue_message(phone_number, msg, supplier_id=supplier_id, message_log_id=msg_log_id)
+        return {"status": "message_sent", "message": msg, "rfq_id": target_rfq_id}
 
     elif validation.action == "escalate_to_human":
         args = validation.sanitized_args
@@ -870,9 +917,13 @@ async def execute_validated_action(
 
         if esc_rfq_id:
             msg_log_id = db.log_message(client_id, supplier_id, "outbound", HUMAN_ACK_MSG, related_rfq_id=esc_rfq_id)
+            if not msg_log_id:
+                raise RuntimeError("Failed to log outbound human ack message durably.")
             await enqueue_message(phone_number, HUMAN_ACK_MSG, rfq_id=esc_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
         else:
             msg_log_id = db.log_message(client_id, supplier_id, "outbound", HUMAN_ACK_MSG)
+            if not msg_log_id:
+                raise RuntimeError("Failed to log outbound human ack message durably.")
             await enqueue_message(phone_number, HUMAN_ACK_MSG, message_log_id=msg_log_id)
         return {
             "status": "escalated",
@@ -1422,28 +1473,188 @@ async def get_flags_endpoint(current_user=Depends(get_current_user)):
 
 @app.post("/flags/{flag_id}/resolve")
 async def resolve_flag_endpoint(flag_id: str, current_user=Depends(get_current_user)):
-    """Marks a human escalation flag as resolved."""
-    # further checks (admin/member) could be added here
-    result = db.resolve_flag(flag_id)
+    """Marks a human escalation flag as resolved (explicit administrative dismissal, strictly tenant-scoped)."""
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=401, detail="Authentication missing client_id")
+
+    result = db.resolve_flag(flag_id, client_id=client_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Flagged item not found")
     return {"status": "resolved", "flag": result}
 
 
 @app.post("/flags/{flag_id}/respond")
 async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, current_user=Depends(get_current_user)):
-    """Stores human response on a flag, marks it resolved, and optionally sends message to supplier via WhatsApp."""
-    updated_flags = db.resolve_flag_with_response(flag_id, payload.response)
-    if not updated_flags:
-        raise HTTPException(status_code=404, detail="Flagged item not found")
+    """
+    Phase 9: Operator Instruction Reasoning Pipeline.
+    1. Authenticates user and verifies tenant flag ownership.
+    2. If send_to_supplier is False, performs administrative resolve without messaging.
+    3. If send_to_supplier is True:
+       - Atomically claims pending flag (pending -> processing).
+       - Derives trusted tenant, supplier, and locked RFQ from flag.
+       - Assembles full AgentContext(input_origin="operator").
+       - Invokes reason_about_procurement_message(payload.response, context).
+       - Validates proposal with Policy Validator (enforcing stanza/operator RFQ lock).
+       - Executes validated action and durable message persistence.
+       - Marks flag as resolved (processing -> resolved).
+       - On reasoning/validation/execution failure, safely releases claim (processing -> pending).
+    """
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=401, detail="Authentication missing client_id")
 
-    flag = updated_flags[0]
-    if payload.send_to_supplier and flag.get("suppliers"):
-        supplier = flag["suppliers"]
-        phone = supplier["phone_number"]
-        rfq_id = flag.get("rfq_id")
-        msg_log_id = db.log_message(current_user.get("client_id"), supplier["id"], "outbound", payload.response, related_rfq_id=rfq_id)
-        await enqueue_message(phone, payload.response, rfq_id=rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
+    # If operator requested administrative resolution without sending to supplier
+    if not payload.send_to_supplier:
+        updated = db.resolve_flag_with_response(flag_id, payload.response, client_id=client_id)
+        if not updated:
+            existing = db.get_flag_by_id(flag_id, client_id=client_id)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Flagged item not found")
+        return {"status": "resolved", "flag_id": flag_id, "sent_to_supplier": False}
 
-    return {"status": "resolved", "flag_id": flag_id, "sent_to_supplier": payload.send_to_supplier}
+    # Atomic claim: pending -> processing
+    flag = db.claim_flag_for_operator_action(flag_id, client_id)
+    if not flag:
+        existing = db.get_flag_by_id(flag_id, client_id=client_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Flagged item not found")
+        return JSONResponse(
+            status_code=409,
+            content={"status": "conflict", "detail": f"Flag is already {existing.get('status')}"},
+        )
+
+    supplier = flag.get("suppliers")
+    if not supplier:
+        db.release_flag_claim(flag_id, client_id)
+        raise HTTPException(status_code=400, detail="Supplier not associated with flag")
+
+    rfq_id = flag.get("rfq_id")
+
+    try:
+        # Load supplier open RFQs and context
+        open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"]) or []
+        open_rfq_ids = []
+        for e in open_rfqs:
+            rfq_obj = e.get("rfqs", e) if isinstance(e, dict) else e
+            if isinstance(rfq_obj, dict) and rfq_obj.get("id"):
+                open_rfq_ids.append(rfq_obj["id"])
+
+        prior_quotes = []
+        if open_rfq_ids:
+            try:
+                prior_quotes = db.get_supplier_prior_quotes(supplier["id"], open_rfq_ids)
+            except Exception as e:
+                logger.warning(f"Error loading prior quotes: {e}")
+
+        negotiation_attempts = {}
+        for r_id in open_rfq_ids:
+            try:
+                negotiation_attempts[r_id] = db.get_negotiation_attempts(r_id, supplier["id"])
+            except Exception as e:
+                logger.warning(f"Error loading negotiation attempts for RFQ {r_id}: {e}")
+                negotiation_attempts[r_id] = 0
+
+        competitive_context = {}
+        for r_id in open_rfq_ids:
+            try:
+                comp_ctx = db.get_competitive_pricing_context(r_id, supplier["id"])
+                if isinstance(comp_ctx, dict) and comp_ctx.get("has_competition"):
+                    competitive_context[r_id] = f"Best competing quote is AED {comp_ctx['best_competing_price']} (from {comp_ctx['competing_quotes_count']} other supplier(s))"
+            except Exception as e:
+                logger.warning(f"Error loading competitive context for RFQ {r_id}: {e}")
+
+        # Fetch pending clarification if any
+        pending_clarification = None
+        try:
+            pending_clarification = db.get_pending_clarification_for_supplier(supplier["id"])
+        except Exception as e:
+            logger.warning(f"Error loading pending clarification: {e}")
+
+        # Fetch conversation history
+        conv_history = []
+        try:
+            conv_history = db.get_supplier_conversation_history(client_id, supplier["id"], limit=10)
+        except Exception as e:
+            logger.warning(f"Error loading conversation history: {e}")
+
+        # Build single unified AgentContext with input_origin="operator" and operator flag lock
+        context = AgentContext(
+            client_id=client_id,
+            supplier_id=supplier["id"],
+            supplier_name=supplier.get("name"),
+            supplier_phone=supplier.get("phone_number"),
+            input_origin="operator",
+            matched_rfq_id=rfq_id,
+            match_source="operator_flag" if rfq_id else None,
+            open_rfqs=open_rfqs,
+            pending_clarification=pending_clarification,
+            prior_quotes=prior_quotes,
+            negotiation_attempts=negotiation_attempts,
+            competitive_context=competitive_context,
+            conversation_history=conv_history,
+            review_flag_id=flag.get("id"),
+            review_reason=flag.get("reason"),
+            review_category=flag.get("category"),
+            review_raw_message=flag.get("raw_message"),
+        )
+
+        # Unified LLM reasoning
+        proposal_dict = groq_client.reason_about_procurement_message(
+            payload.response,
+            context,
+            input_origin="operator",
+        )
+        action_proposal = ActionProposal(
+            tool_name=proposal_dict.get("tool_name", ""),
+            arguments=proposal_dict.get("arguments", {}),
+        )
+
+        # Policy Validator with operator RFQ lock
+        validation = validate_action(
+            proposal=action_proposal,
+            client_id=client_id,
+            supplier_id=supplier["id"],
+            context_rfqs=context.open_rfqs,
+            matched_rfq_id=rfq_id,
+        )
+
+        if not validation.is_valid:
+            logger.warning(f"[POLICY REJECTION] Operator instruction failed policy: {validation.reason}")
+            db.release_flag_claim(flag_id, client_id)
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "status": "rejected_by_policy",
+                    "reason": validation.reason,
+                    "proposal": action_proposal.model_dump(),
+                },
+            )
+
+        # Execute validated action
+        exec_result = await execute_validated_action(
+            validation=validation,
+            context=context,
+            raw_message=payload.response,
+            supplier=supplier,
+            client_id=client_id,
+        )
+
+        # Complete flag transition to resolved
+        db.complete_flag_operator_action(flag_id, client_id, payload.response)
+
+        return {
+            "status": "resolved",
+            "flag_id": flag_id,
+            "action": validation.action,
+            "result": exec_result,
+            "sent_to_supplier": True,
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing operator action for flag {flag_id}: {e}", exc_info=True)
+        db.release_flag_claim(flag_id, client_id)
+        raise HTTPException(status_code=500, detail=f"Failed to process operator instruction: {str(e)}")
 
 
 

@@ -134,8 +134,8 @@ def test_flags_endpoints_succeed_with_valid_jwt(monkeypatch):
     monkeypatch.setattr(auth, "verify_jwt", lambda token: {"sub": "user-123"})
     monkeypatch.setattr(db, "get_profile_by_id", lambda uid: {"id": uid, "client_id": "client-abc", "role": "member"})
     monkeypatch.setattr(db, "get_pending_flags", lambda cid: [{"id": "flag-1", "category": "other"}])
-    monkeypatch.setattr(db, "resolve_flag", lambda fid: {"id": fid, "status": "resolved"})
-    monkeypatch.setattr(db, "resolve_flag_with_response", lambda fid, resp: [{"id": fid, "status": "resolved", "suppliers": {"id": "s1", "phone_number": "123"}}])
+    monkeypatch.setattr(db, "resolve_flag", lambda fid, client_id=None: {"id": fid, "status": "resolved"})
+    monkeypatch.setattr(db, "resolve_flag_with_response", lambda fid, resp, client_id=None: [{"id": fid, "status": "resolved", "suppliers": {"id": "s1", "phone_number": "123"}}])
     monkeypatch.setattr(db, "log_message", lambda *a, **k: None)
 
     headers = {"Authorization": "Bearer faketoken"}

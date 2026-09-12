@@ -181,7 +181,7 @@ create table flagged_for_review (
     reason              text not null,
     category            text not null check (category in ('requires_business_knowledge', 'unclear_intent', 'contradictory_information', 'other')),
     raw_message         text not null,
-    status              text not null default 'pending' check (status in ('pending', 'resolved')),
+    status              text not null default 'pending' check (status in ('pending', 'processing', 'resolved', 'dismissed')),
     created_at          timestamptz not null default now(),
     resolved_at         timestamptz
 );

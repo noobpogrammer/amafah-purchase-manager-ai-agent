@@ -137,11 +137,11 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                       {/* Human Response Input Section */}
                       <div className="human-response-section" style={{ marginTop: '0.85rem', paddingTop: '0.85rem', borderTop: '1px solid var(--panel-border)' }}>
                         <label className="form-label flex-items" style={{ marginBottom: '0.4rem' }}>
-                          <FileText size={14} /> <strong>Human Instruction / Reply:</strong>
+                          <FileText size={14} /> <strong>Agent Instruction / Guidance:</strong>
                         </label>
                         <textarea
                           className="input-field textarea-input"
-                          placeholder="Type instruction or direct reply for supplier (e.g., 'We accept payment terms at $45/unit')..."
+                          placeholder="Type instruction for AI agent to execute (e.g., 'We accept 50% advance against PI', 'Offer 48 AED')..."
                           rows={2}
                           value={responseTexts[flag.id] || ''}
                           onChange={(e) => setResponseTexts({ ...responseTexts, [flag.id]: e.target.value })}
@@ -153,7 +153,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               checked={sendToSupplierState[flag.id] !== false}
                               onChange={(e) => setSendToSupplierState({ ...sendToSupplierState, [flag.id]: e.target.checked })}
                             />
-                            <span>Send response to supplier via WhatsApp</span>
+                            <span>Send agent-interpreted message to supplier via WhatsApp</span>
                           </label>
 
                           <div style={{ display: 'flex', gap: '0.5rem' }}>
@@ -171,7 +171,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               disabled={resolvingId === flag.id || !(responseTexts[flag.id] || '').trim()}
                             >
                               <Send size={14} />
-                              <span>{resolvingId === flag.id ? 'Sending...' : 'Send & Resolve'}</span>
+                              <span>{resolvingId === flag.id ? 'Processing...' : 'Send Instruction & Resolve'}</span>
                             </button>
                           </div>
                         </div>

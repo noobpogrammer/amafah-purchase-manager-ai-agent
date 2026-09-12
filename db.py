@@ -992,27 +992,111 @@ def get_pending_flags(client_id: str):
     return res.data
 
 
-def resolve_flag(flag_id: str):
-    """Marks a flagged_for_review item as resolved."""
+def get_flag_by_id(flag_id: str, client_id: str = None) -> dict | None:
+    """Returns a single flagged_for_review item with joined supplier and rfq details, optionally scoped by client_id."""
+    query = supabase.table("flagged_for_review").select("*, suppliers(*), rfqs(*)").eq("id", flag_id)
+    if client_id:
+        query = query.eq("client_id", client_id)
+    res = query.execute()
+    return res.data[0] if res.data else None
+
+
+def claim_flag_for_operator_action(flag_id: str, client_id: str) -> dict | None:
+    """
+    Atomically claims a pending flag for operator reasoning by transitioning status from 'pending' to 'processing'.
+    Returns the claimed flag dict with joined supplier and RFQ details if successful, or None if already claimed/resolved.
+    """
+    try:
+        res = supabase.rpc(
+            "claim_flag_for_operator_action",
+            {"p_flag_id": flag_id, "p_client_id": client_id}
+        ).execute()
+        if res.data and len(res.data) > 0:
+            # Re-fetch joined details
+            return get_flag_by_id(flag_id, client_id)
+    except Exception as e:
+        logger.warning(f"claim_flag_for_operator_action RPC error: {e}")
+
+    # Fallback to direct atomic conditional update
+    try:
+        res = (
+            supabase.table("flagged_for_review")
+            .update({"status": "processing"})
+            .eq("id", flag_id)
+            .eq("client_id", client_id)
+            .eq("status", "pending")
+            .select("*, suppliers(*), rfqs(*)")
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.error(f"Fallback claim_flag_for_operator_action error: {e}")
+        return None
+
+
+def release_flag_claim(flag_id: str, client_id: str) -> dict | None:
+    """Releases an operator claim on failure, reverting status from 'processing' back to 'pending'."""
+    try:
+        res = (
+            supabase.table("flagged_for_review")
+            .update({"status": "pending"})
+            .eq("id", flag_id)
+            .eq("client_id", client_id)
+            .eq("status", "processing")
+            .select("*")
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.error(f"Error releasing flag claim for {flag_id}: {e}")
+        return None
+
+
+def complete_flag_operator_action(flag_id: str, client_id: str, human_response: str = None) -> dict | None:
+    """Marks a claimed flag as resolved after successful operator action execution."""
+    from datetime import datetime, timezone
+    try:
+        res = (
+            supabase.table("flagged_for_review")
+            .update({
+                "status": "resolved",
+                "human_response": human_response,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("id", flag_id)
+            .eq("client_id", client_id)
+            .select("*, suppliers(*), rfqs(*)")
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.error(f"Error completing flag action for {flag_id}: {e}")
+        return None
+
+
+def resolve_flag(flag_id: str, client_id: str = None):
+    """Marks a flagged_for_review item as resolved (administrative dismissal)."""
     from datetime import datetime, timezone
 
-    res = (
+    query = (
         supabase.table("flagged_for_review")
         .update({
             "status": "resolved",
             "resolved_at": datetime.now(timezone.utc).isoformat(),
         })
         .eq("id", flag_id)
-        .execute()
     )
+    if client_id:
+        query = query.eq("client_id", client_id)
+    res = query.execute()
     return res.data[0] if res.data else None
 
 
-def resolve_flag_with_response(flag_id: str, human_response: str = None):
-    """Stores human response and marks a flagged_for_review item as resolved."""
+def resolve_flag_with_response(flag_id: str, human_response: str = None, client_id: str = None):
+    """Stores human response and marks a flagged_for_review item as resolved (tenant-scoped)."""
     from datetime import datetime, timezone
 
-    res = (
+    query = (
         supabase.table("flagged_for_review")
         .update({
             "status": "resolved",
@@ -1020,9 +1104,10 @@ def resolve_flag_with_response(flag_id: str, human_response: str = None):
             "resolved_at": datetime.now(timezone.utc).isoformat(),
         })
         .eq("id", flag_id)
-        .select("*, suppliers(*), rfqs(*)")
-        .execute()
     )
+    if client_id:
+        query = query.eq("client_id", client_id)
+    res = query.select("*, suppliers(*), rfqs(*)").execute()
     return res.data if res.data else []
 
 
