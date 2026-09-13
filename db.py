@@ -414,6 +414,51 @@ def create_pending_clarification(client_id: str, supplier_id: str,
     return res.data[0].get("id") if res and res.data else None
 
 
+def advance_pending_clarification(
+    previous_id: str,
+    client_id: str,
+    supplier_id: str,
+    candidate_rfq_ids: list,
+    raw_message: str,
+    extracted_price: float = None,
+    extracted_delivery: str = None,
+    extracted_notes: str = None,
+    round_number: int = 2,
+    no_progress_count: int = 0,
+    last_question: str = None,
+) -> dict | None:
+    """
+    Database-authoritative atomic replacement of an active pending clarification.
+    Calls PostgreSQL RPC advance_pending_clarification to guarantee atomic transition
+    (abandon old row + insert new row + update rfq_suppliers) in a single transaction.
+    Fails closed (returns None) on any RPC or database error.
+    """
+    if not previous_id or not client_id or not supplier_id or not candidate_rfq_ids:
+        return None
+
+    try:
+        params = {
+            "p_previous_id": previous_id,
+            "p_client_id": client_id,
+            "p_supplier_id": supplier_id,
+            "p_candidate_rfq_ids": candidate_rfq_ids,
+            "p_raw_message": raw_message,
+            "p_extracted_price": extracted_price,
+            "p_extracted_delivery": extracted_delivery,
+            "p_extracted_notes": extracted_notes,
+            "p_round_number": round_number,
+            "p_no_progress_count": no_progress_count,
+            "p_last_question": last_question,
+        }
+        res = supabase.rpc("advance_pending_clarification", params).execute()
+        if res and res.data and isinstance(res.data, list) and len(res.data) > 0 and isinstance(res.data[0], dict):
+            return res.data[0]
+        return None
+    except Exception as e:
+        logger.error("Failed to advance pending clarification %s: %s", previous_id, e)
+        return None
+
+
 def get_pending_clarification_for_supplier(supplier_id: str):
     """Queries pending_clarifications for an unresolved ('awaiting_reply') row."""
     res = (

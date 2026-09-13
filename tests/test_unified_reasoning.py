@@ -372,8 +372,8 @@ class TestStanzaLockEnforcement:
         assert val.is_valid is False
         assert "does not match deterministically locked RFQ" in val.reason
 
-    def test_stanza_4_exact_stanza_request_clarification_matching_rfq_passes(self):
-        """Test 4. Exact stanza + request_clarification([matched_rfq]) -> PASS."""
+    def test_stanza_4_exact_stanza_request_clarification_matching_rfq_rejected_as_unnecessary(self):
+        """Test 4. Exact stanza + request_clarification([matched_rfq]) -> REJECT (identity already resolved)."""
         proposal = ActionProposal(
             tool_name="request_clarification",
             arguments={"candidate_rfq_ids": ["rfq-locked-1"], "clarifying_question": "Does this include delivery?"},
@@ -385,8 +385,8 @@ class TestStanzaLockEnforcement:
             context_rfqs=[],
             matched_rfq_id="rfq-locked-1",
         )
-        assert val.is_valid is True
-        assert val.sanitized_args["candidate_rfq_ids"] == ["rfq-locked-1"]
+        assert val.is_valid is False
+        assert "single candidate is unnecessary" in val.reason.lower()
 
     def test_stanza_5_exact_stanza_request_clarification_multiple_rfqs_rejected(self):
         """Test 5. Exact stanza + request_clarification([matched_rfq, other_rfq]) -> REJECT."""
@@ -557,14 +557,14 @@ class TestClarificationIntegration:
         )
         supplier = {"id": "s-1", "phone_number": "+971500000001"}
 
-        with patch("db.create_pending_clarification") as mock_create, \
-             patch("db.abandon_pending_clarification") as mock_abandon, \
+        with patch("db.advance_pending_clarification", return_value={"id": "clarif-advanced"}) as mock_advance, \
              patch("db.log_message", return_value="log-1"), \
              patch("main.enqueue_message", new_callable=AsyncMock):
 
             res = asyncio.run(main.execute_validated_action(val, context, "cement", supplier, "c-1"))
             assert res["status"] == "clarification_needed"
-            mock_create.assert_called_once_with(
+            mock_advance.assert_called_once_with(
+                previous_id="clarif-100",
                 client_id="c-1",
                 supplier_id="s-1",
                 candidate_rfq_ids=["rfq-A", "rfq-B"],
@@ -576,7 +576,6 @@ class TestClarificationIntegration:
                 no_progress_count=1,
                 last_question="5kg or 10kg?",
             )
-            mock_abandon.assert_called_once_with("clarif-100")
 
     def test_20_two_consecutive_no_progress_turns_escalates_to_human(self):
         """20. When pending clarification no_progress_count reaches MAX_NO_PROGRESS_ATTEMPTS (2), escalates to human."""

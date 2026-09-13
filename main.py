@@ -1003,7 +1003,7 @@ async def execute_validated_action(
             # 1. New clarification session
             round_number = 1
             no_progress_count = 0
-            db.create_pending_clarification(
+            created_id = db.create_pending_clarification(
                 client_id=client_id,
                 supplier_id=supplier_id,
                 candidate_rfq_ids=candidate_ids,
@@ -1015,6 +1015,17 @@ async def execute_validated_action(
                 no_progress_count=no_progress_count,
                 last_question=question,
             )
+            if not created_id:
+                logger.error("Failed to create initial pending clarification for supplier %s", supplier_id)
+                db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=candidate_ids[0] if candidate_ids else (context.matched_rfq_id or None),
+                    reason="Database error: Failed to create pending clarification.",
+                    category="other",
+                    raw_message=raw_message,
+                )
+                return {"status": "failed_creation", "reason": "Failed to create pending clarification."}
         else:
             prev_pc = context.pending_clarification
             prev_candidates = set(prev_pc.get("pending_rfq_ids") or [])
@@ -1078,7 +1089,8 @@ async def execute_validated_action(
                 )
                 return {"status": "escalated_to_human", "reason": reason, "category": "clarification_stalled"}
 
-            db.create_pending_clarification(
+            advanced = db.advance_pending_clarification(
+                previous_id=prev_pc["id"],
                 client_id=client_id,
                 supplier_id=supplier_id,
                 candidate_rfq_ids=candidate_ids,
@@ -1090,7 +1102,17 @@ async def execute_validated_action(
                 no_progress_count=no_progress_count,
                 last_question=question,
             )
-            db.abandon_pending_clarification(prev_pc["id"])
+            if not advanced:
+                logger.error("Failed to atomically advance pending clarification %s", prev_pc["id"])
+                db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=candidate_ids[0] if candidate_ids else (context.matched_rfq_id or None),
+                    reason="Database error: Failed to atomically advance pending clarification.",
+                    category="other",
+                    raw_message=raw_message,
+                )
+                return {"status": "failed_advancement", "reason": "Failed to atomically advance pending clarification."}
 
         single_rfq = candidate_ids[0] if len(candidate_ids) == 1 else (context.matched_rfq_id or None)
         if single_rfq:

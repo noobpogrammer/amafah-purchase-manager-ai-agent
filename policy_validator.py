@@ -359,23 +359,26 @@ def validate_action(
                 reason="Clarification requires at least 2 candidate RFQs. Missing or empty candidate_rfq_ids.",
             )
 
-        # Single candidate rejection: If only 1 candidate remains and not in exact stanza match,
-        # reasoner should have proposed the direct business action instead.
-        if len(candidate_ids) == 1 and not matched_rfq_id:
-            return ValidationResult(
-                is_valid=False,
-                action=tool_name,
-                category=ActionCategory.PROPOSE_COMMUNICATE,
-                reason="Clarification with a single candidate is unnecessary. Propose the direct business action instead.",
-            )
-
-        # Deterministic stanza lock: clarification candidates must strictly be [matched_rfq_id]
+        # Deterministic stanza lock: clarification candidates cannot violate matched_rfq_id
         if matched_rfq_id and candidate_ids != [matched_rfq_id]:
             return ValidationResult(
                 is_valid=False,
                 action=tool_name,
                 category=ActionCategory.PROPOSE_COMMUNICATE,
                 reason=f"Clarification candidates violate deterministic RFQ match lock (expected '{matched_rfq_id}', got {candidate_ids}).",
+            )
+
+        # Single candidate rejection: If only 1 candidate exists (even if matched), RFQ identity is resolved.
+        # Clarification is unnecessary; reasoner must propose the direct business action instead.
+        if len(candidate_ids) == 1:
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=(
+                    "Clarification with a single candidate is unnecessary. "
+                    "RFQ identity is already resolved; propose the direct business action instead."
+                ),
             )
 
         # Candidate subset rule: If a pending clarification already exists, candidates cannot expand
