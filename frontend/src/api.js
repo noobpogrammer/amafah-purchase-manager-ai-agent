@@ -462,4 +462,22 @@ export async function downloadDailyReport(dateStr) {
   return { type: 'blob', blob, filename: `Daily_Procurement_Report_${dateStr}.docx` };
 }
 
+export async function fetchRFQActivity(rfqId) {
+  const response = await authorizedFetch(`/rfq/${encodeURIComponent(rfqId)}/activity`);
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || `Failed to fetch activity (${response.status})`);
+  }
+  return await response.json();
+}
+
+export async function fetchDeliveryIssues(page = 1, limit = 50) {
+  const response = await authorizedFetch(`/admin/delivery-issues?page=${page}&limit=${limit}`);
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || `Failed to fetch delivery issues (${response.status})`);
+  }
+  return await response.json();
+}
+
 

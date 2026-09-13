@@ -520,5 +520,51 @@ REVOKE EXECUTE ON FUNCTION advance_pending_clarification(UUID, UUID, UUID, UUID[
 GRANT EXECUTE ON FUNCTION advance_pending_clarification(UUID, UUID, UUID, UUID[], TEXT, NUMERIC, TEXT, TEXT, INTEGER, INTEGER, TEXT) TO service_role;
 
 
+-- ============================================================
+-- Phase 14: Decision Auditability & Operational Hardening
+-- ============================================================
 
+CREATE TABLE IF NOT EXISTS agent_decisions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client_id UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    rfq_id UUID REFERENCES rfqs(id) ON DELETE SET NULL,
+    supplier_id UUID REFERENCES suppliers(id) ON DELETE SET NULL,
+    inbound_message_id UUID REFERENCES message_log(id) ON DELETE SET NULL,
+    outbound_message_id UUID REFERENCES message_log(id) ON DELETE SET NULL,
+    flag_id UUID REFERENCES flagged_for_review(id) ON DELETE SET NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('supplier', 'operator', 'system')),
+    tool_name TEXT NOT NULL,
+    arguments JSONB NOT NULL DEFAULT '{}'::jsonb,
+    validation_status TEXT NOT NULL CHECK (validation_status IN ('approved', 'rejected')),
+    validation_reason TEXT,
+    execution_status TEXT NOT NULL DEFAULT 'pending' CHECK (execution_status IN ('pending', 'executed', 'failed', 'not_executed')),
+    execution_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    executed_at TIMESTAMPTZ
+);
 
+CREATE INDEX IF NOT EXISTS idx_agent_decisions_rfq_id ON agent_decisions(rfq_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_decisions_client_id ON agent_decisions(client_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_decisions_inbound_msg ON agent_decisions(inbound_message_id);
+
+ALTER TABLE agent_decisions ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS agent_decisions_admin_select ON agent_decisions;
+CREATE POLICY agent_decisions_admin_select ON agent_decisions
+    FOR SELECT TO authenticated
+    USING (
+        client_id = public.get_auth_user_client_id()
+        AND EXISTS (
+            SELECT 1 FROM public.profiles 
+            WHERE id = auth.uid() AND role = 'admin'
+        )
+    );
+
+DROP POLICY IF EXISTS agent_decisions_anon_deny ON agent_decisions;
+CREATE POLICY agent_decisions_anon_deny ON agent_decisions
+    FOR ALL TO anon
+    USING (false) WITH CHECK (false);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_quotes_source_msg_variant
+ON quotes (rfq_id, supplier_id, source_message_id, COALESCE(variant_label, ''))
+WHERE source_message_id IS NOT NULL;

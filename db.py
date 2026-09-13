@@ -1123,13 +1123,38 @@ def get_incomplete_rfqs_audit(client_id: str = None):
     }
 
 
-def get_quote_by_id(quote_id: str) -> dict | None:
-    """Fetches a single quote row by ID joined with its RFQ details."""
+def get_rfq_by_id(rfq_id: str, client_id: str = None) -> dict | None:
+    """Fetches a single RFQ by ID, optionally scoped by client_id."""
+    if not rfq_id:
+        return None
+    try:
+        query = supabase.table("rfqs").select("*").eq("id", rfq_id)
+        if client_id:
+            query = query.eq("client_id", client_id)
+        res = query.execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.warning("get_rfq_by_id error for %s: %s", rfq_id, e)
+        return None
+
+
+def get_quote_by_id(quote_id: str, client_id: str = None, supplier_id: str = None, rfq_id: str = None) -> dict | None:
+    """Fetches a single quote row by ID joined with its RFQ details, optionally scoped by client/supplier/rfq."""
     if not quote_id:
         return None
     try:
-        res = supabase.table("quotes").select("*, rfqs(*)").eq("id", quote_id).execute()
-        return res.data[0] if res and res.data else None
+        query = supabase.table("quotes").select("*, rfqs(*)").eq("id", quote_id)
+        if supplier_id:
+            query = query.eq("supplier_id", supplier_id)
+        if rfq_id:
+            query = query.eq("rfq_id", rfq_id)
+        res = query.execute()
+        row = res.data[0] if res and res.data else None
+        if row and client_id:
+            rfq_obj = row.get("rfqs") or {}
+            if str(rfq_obj.get("client_id")) != str(client_id):
+                return None
+        return row
     except Exception as e:
         logger.warning(f"get_quote_by_id error for {quote_id}: {e}")
         return None
@@ -1608,4 +1633,455 @@ def get_queued_outbound_messages() -> list[dict]:
     except Exception as ex:
         logger.warning("get_queued_outbound_messages error: %s", ex)
         return []
+
+
+# ============================================================
+# Phase 14: Decision Auditability & Operational Hardening
+# ============================================================
+
+DISALLOWED_ARG_KEYS = {
+    "system_prompt", "prompt", "internal_prompt", "chain_of_thought",
+    "thought", "reasoning", "model_scratchpad", "api_key", "token",
+    "secret", "authorization", "password"
+}
+
+
+def sanitize_decision_arguments(args: dict) -> dict:
+    """Sanitizes arguments dictionary by stripping prompts, tokens, and secrets."""
+    if not isinstance(args, dict):
+        return {}
+    clean = {}
+    for k, v in args.items():
+        if str(k).lower() in DISALLOWED_ARG_KEYS:
+            continue
+        if isinstance(v, (str, int, float, bool, list)) or v is None:
+            clean[k] = v
+        elif isinstance(v, dict):
+            clean[k] = sanitize_decision_arguments(v)
+    return clean
+
+
+def record_agent_decision(
+    client_id: str,
+    origin: str,
+    tool_name: str,
+    arguments: dict,
+    validation_status: str,
+    validation_reason: str = None,
+    execution_status: str = "pending",
+    execution_error: str = None,
+    rfq_id: str = None,
+    supplier_id: str = None,
+    inbound_message_id: str = None,
+    outbound_message_id: str = None,
+    flag_id: str = None,
+    executed_at: str = None,
+) -> dict:
+    """Inserts a structured agent decision record into agent_decisions without storing chain-of-thought."""
+    clean_args = sanitize_decision_arguments(arguments)
+    payload = {
+        "client_id": client_id,
+        "origin": origin,
+        "tool_name": tool_name,
+        "arguments": clean_args,
+        "validation_status": validation_status,
+        "validation_reason": validation_reason,
+        "execution_status": execution_status,
+        "execution_error": execution_error,
+        "rfq_id": rfq_id,
+        "supplier_id": supplier_id,
+        "inbound_message_id": inbound_message_id,
+        "outbound_message_id": outbound_message_id,
+        "flag_id": flag_id,
+    }
+    if executed_at:
+        payload["executed_at"] = executed_at
+
+    try:
+        res = supabase.table("agent_decisions").insert(payload).execute()
+        if res.data and len(res.data) > 0:
+            return res.data[0]
+        return {"id": "mock-decision-id", **payload}
+    except Exception as e:
+        logger.warning("record_agent_decision error: %s", e)
+        return {"id": "fallback-decision-id", **payload}
+
+
+def update_agent_decision(decision_id: str, **updates) -> dict | None:
+    """Updates an existing agent_decision record."""
+    if not decision_id or decision_id.startswith("mock") or decision_id.startswith("fallback"):
+        return None
+    allowed_fields = {
+        "validation_status", "validation_reason", "execution_status",
+        "execution_error", "outbound_message_id", "executed_at",
+        "rfq_id", "supplier_id", "arguments", "flag_id"
+    }
+    payload = {k: v for k, v in updates.items() if k in allowed_fields}
+    if "arguments" in payload:
+        payload["arguments"] = sanitize_decision_arguments(payload["arguments"])
+    try:
+        res = supabase.table("agent_decisions").update(payload).eq("id", decision_id).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.warning("update_agent_decision error for %s: %s", decision_id, e)
+        return None
+
+
+def get_agent_decisions_for_rfq(rfq_id: str, client_id: str) -> list[dict]:
+    """Fetches agent decisions for a specific RFQ and client."""
+    try:
+        res = (
+            supabase.table("agent_decisions")
+            .select("*, suppliers(name, phone_number)")
+            .eq("client_id", client_id)
+            .eq("rfq_id", rfq_id)
+            .order("created_at", desc=False)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.warning("get_agent_decisions_for_rfq error: %s", e)
+        return []
+
+
+def complete_webhook_message(client_id: str, message_id: str) -> bool:
+    """Marks a webhook message as completed in processed_webhooks."""
+    if not client_id or not message_id:
+        return True
+    try:
+        res = supabase.rpc("complete_webhook_message", {
+            "p_client_id": client_id,
+            "p_message_id": message_id,
+        }).execute()
+        return bool(res.data)
+    except Exception as e:
+        logger.debug("RPC complete_webhook_message error, fallback to table update: %s", e)
+        try:
+            upd = (
+                supabase.table("processed_webhooks")
+                .update({"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat()})
+                .eq("client_id", client_id)
+                .eq("message_id", message_id)
+                .execute()
+            )
+            return bool(upd.data)
+        except Exception as ex:
+            logger.warning("complete_webhook_message fallback error: %s", ex)
+            return False
+
+
+def fail_webhook_message(client_id: str, message_id: str, error_message: str) -> bool:
+    """Marks a webhook message as failed in processed_webhooks to allow controlled retry."""
+    if not client_id or not message_id:
+        return True
+    clean_err = str(error_message)[:500] if error_message else "Processing failed"
+    try:
+        res = supabase.rpc("fail_webhook_message", {
+            "p_client_id": client_id,
+            "p_message_id": message_id,
+            "p_error": clean_err,
+        }).execute()
+        return bool(res.data)
+    except Exception as e:
+        logger.debug("RPC fail_webhook_message error, fallback to table update: %s", e)
+        try:
+            upd = (
+                supabase.table("processed_webhooks")
+                .update({"status": "failed", "last_error": clean_err})
+                .eq("client_id", client_id)
+                .eq("message_id", message_id)
+                .execute()
+            )
+            return bool(upd.data)
+        except Exception as ex:
+            logger.warning("fail_webhook_message fallback error: %s", ex)
+            return False
+
+
+def get_delivery_issues(client_id: str, page: int = 1, limit: int = 50) -> dict:
+    """Returns paginated outbound messages with status 'failed' or 'unknown' for a client."""
+    if not client_id:
+        return {"items": [], "total": 0, "page": page, "limit": limit}
+    try:
+        offset = max(0, (page - 1) * limit)
+        query = (
+            supabase.table("message_log")
+            .select("*, suppliers(name, phone_number), rfqs(product_name)", count="exact")
+            .eq("client_id", client_id)
+            .eq("direction", "outbound")
+            .in_("status", ["failed", "unknown"])
+            .order("created_at", desc=True)
+            .range(offset, offset + limit - 1)
+        )
+        res = query.execute()
+        return {
+            "items": res.data or [],
+            "total": res.count if res.count is not None else len(res.data or []),
+            "page": page,
+            "limit": limit
+        }
+    except Exception as e:
+        logger.warning("get_delivery_issues error: %s", e)
+        return {"items": [], "total": 0, "page": page, "limit": limit}
+
+
+def get_rfq_activity(rfq_id: str, client_id: str) -> list[dict] | None:
+    """
+    Constructs a presentation-ready chronological activity and decision audit timeline
+    for an RFQ, strictly isolated to the caller's client_id.
+    """
+    if not rfq_id or not client_id:
+        return None
+
+    # 1. Fetch and verify RFQ tenant ownership
+    rfq = get_rfq_by_id(rfq_id)
+    if not rfq or str(rfq.get("client_id")) != str(client_id):
+        return None
+
+    timeline = []
+
+    # RFQ Created event
+    timeline.append({
+        "id": f"rfq-created-{rfq_id}",
+        "timestamp": rfq.get("created_at"),
+        "event_type": "rfq_created",
+        "title": "RFQ Created",
+        "summary": f"Created RFQ for '{rfq.get('product_name')}' (Specs: {rfq.get('specs') or 'Standard'}, Qty: {rfq.get('quantity') or 'N/A'}, Deadline: {rfq.get('deadline_hours') or 24}h).",
+        "status": rfq.get("status"),
+        "origin": "system",
+        "details": {
+            "rfq_id": rfq_id,
+            "product_name": rfq.get("product_name"),
+            "deadline_hours": rfq.get("deadline_hours"),
+            "status": rfq.get("status"),
+        }
+    })
+
+    # 2. Outbound Broadcast Messages
+    try:
+        outbound_msgs = (
+            supabase.table("message_log")
+            .select("*, suppliers(name, phone_number)")
+            .eq("client_id", client_id)
+            .eq("related_rfq_id", rfq_id)
+            .eq("direction", "outbound")
+            .order("created_at", desc=False)
+            .execute()
+            .data or []
+        )
+        for msg in outbound_msgs:
+            supp_name = msg.get("suppliers", {}).get("name") if isinstance(msg.get("suppliers"), dict) else "Supplier"
+            msg_status = msg.get("status") or "sent"
+            timeline.append({
+                "id": f"msg-out-{msg['id']}",
+                "timestamp": msg.get("created_at"),
+                "event_type": "outbound_message",
+                "title": f"Message Sent to {supp_name}",
+                "summary": f"Outbound message dispatched ({msg_status}).",
+                "supplier_name": supp_name,
+                "status": msg_status,
+                "origin": "system",
+                "details": {
+                    "message_log_id": msg["id"],
+                    "delivery_status": msg_status,
+                    "error_message": msg.get("error_message"),
+                    "retry_count": msg.get("retry_count"),
+                }
+            })
+    except Exception as e:
+        logger.warning("Error fetching outbound messages for activity: %s", e)
+
+    # 3. Quotes Recorded
+    try:
+        quotes = (
+            supabase.table("quotes")
+            .select("*, suppliers(name, phone_number)")
+            .eq("rfq_id", rfq_id)
+            .order("created_at", desc=False)
+            .execute()
+            .data or []
+        )
+        for q in quotes:
+            supp_name = q.get("suppliers", {}).get("name") if isinstance(q.get("suppliers"), dict) else "Supplier"
+            variant_str = f" ({q.get('variant_label')})" if q.get("variant_label") else ""
+            deliv_str = f", Delivery: {q.get('delivery_time')}" if q.get("delivery_time") else ""
+            timeline.append({
+                "id": f"quote-{q['id']}",
+                "timestamp": q.get("created_at"),
+                "event_type": "quote_recorded",
+                "title": f"Quote Received from {supp_name}",
+                "summary": f"Quoted AED {q['price']}{variant_str}{deliv_str}.",
+                "supplier_name": supp_name,
+                "status": "recorded",
+                "origin": "supplier",
+                "details": {
+                    "quote_id": q["id"],
+                    "price": q.get("price"),
+                    "variant_label": q.get("variant_label"),
+                    "delivery_time": q.get("delivery_time"),
+                    "quality_notes": q.get("quality_notes"),
+                    "source_message_id": q.get("source_message_id"),
+                    "raw_message": q.get("raw_message"),
+                }
+            })
+    except Exception as e:
+        logger.warning("Error fetching quotes for activity: %s", e)
+
+    # 4. Agent Decisions
+    try:
+        decisions = (
+            supabase.table("agent_decisions")
+            .select("*, suppliers(name, phone_number)")
+            .eq("client_id", client_id)
+            .eq("rfq_id", rfq_id)
+            .order("created_at", desc=False)
+            .execute()
+            .data or []
+        )
+        for d in decisions:
+            tool = d.get("tool_name", "")
+            val_status = d.get("validation_status", "approved")
+            exec_status = d.get("execution_status", "executed")
+            orig = d.get("origin", "supplier")
+            args = d.get("arguments") or {}
+            supp_name = d.get("suppliers", {}).get("name") if isinstance(d.get("suppliers"), dict) else "Supplier"
+
+            if val_status == "rejected":
+                event_type = "decision_rejected"
+                title = f"Agent Action Blocked ({tool})"
+                summary = f"Blocked by Policy Validator: {d.get('validation_reason') or 'Policy rule violated'}."
+                status = "rejected"
+            elif tool == "negotiate_price":
+                event_type = "negotiation_sent"
+                variant_part = f" for '{args.get('variant_label')}'" if args.get("variant_label") else ""
+                quoted_part = f"AED {args.get('quoted_price')}" if args.get('quoted_price') is not None else "Quote"
+                counter_part = f"AED {args.get('counter_price')}" if args.get('counter_price') is not None else "Counter"
+                title = f"Negotiation Counteroffer to {supp_name}"
+                summary = f"Countered offer{variant_part} from {quoted_part} to {counter_part}."
+                status = exec_status
+            elif tool == "request_clarification":
+                event_type = "clarification_requested"
+                title = f"Clarification Requested from {supp_name}"
+                summary = f"Requested supplier clarification on ambiguous quote."
+                status = exec_status
+            elif tool == "flag_for_human_review":
+                event_type = "human_review_created"
+                title = f"Escalated to Human Review for {supp_name}"
+                summary = f"Reason: {args.get('reason') or d.get('validation_reason') or 'Review required'}."
+                status = "escalated"
+            else:
+                event_type = "agent_decision"
+                title = f"Agent Action: {tool}"
+                summary = f"Proposed {tool} ({val_status}, {exec_status})."
+                status = exec_status
+
+            timeline.append({
+                "id": f"decision-{d['id']}",
+                "timestamp": d.get("created_at"),
+                "event_type": event_type,
+                "title": title,
+                "summary": summary,
+                "supplier_name": supp_name,
+                "status": status,
+                "origin": orig,
+                "details": {
+                    "decision_id": d["id"],
+                    "tool_name": tool,
+                    "arguments": args,
+                    "validation_status": val_status,
+                    "validation_reason": d.get("validation_reason"),
+                    "execution_status": exec_status,
+                    "execution_error": d.get("execution_error"),
+                    "inbound_message_id": d.get("inbound_message_id"),
+                    "outbound_message_id": d.get("outbound_message_id"),
+                    "flag_id": d.get("flag_id"),
+                }
+            })
+    except Exception as e:
+        logger.warning("Error fetching agent decisions for activity: %s", e)
+
+    # 5. Operator Interventions (from flagged_for_review)
+    try:
+        flags = (
+            supabase.table("flagged_for_review")
+            .select("*, suppliers(name, phone_number)")
+            .eq("client_id", client_id)
+            .eq("rfq_id", rfq_id)
+            .eq("status", "resolved")
+            .order("created_at", desc=False)
+            .execute()
+            .data or []
+        )
+        for flg in flags:
+            if flg.get("human_response"):
+                supp_name = flg.get("suppliers", {}).get("name") if isinstance(flg.get("suppliers"), dict) else "Supplier"
+                timeline.append({
+                    "id": f"operator-flag-{flg['id']}",
+                    "timestamp": flg.get("resolved_at") or flg.get("created_at"),
+                    "event_type": "operator_response",
+                    "title": f"Operator Instruction for {supp_name}",
+                    "summary": f"Operator Response: \"{flg['human_response']}\"",
+                    "supplier_name": supp_name,
+                    "status": "resolved",
+                    "origin": "operator",
+                    "details": {
+                        "flag_id": flg["id"],
+                        "category": flg.get("category"),
+                        "reason": flg.get("reason"),
+                        "human_response": flg.get("human_response"),
+                    }
+                })
+    except Exception as e:
+        logger.warning("Error fetching flags for activity: %s", e)
+
+    # 6. AI Ranking & Finalization
+    try:
+        rankings = (
+            supabase.table("rfq_rankings")
+            .select("*, suppliers(name, phone_number)")
+            .eq("rfq_id", rfq_id)
+            .order("created_at", desc=False)
+            .execute()
+            .data or []
+        )
+        if rankings:
+            rk = rankings[0]
+            best_supp = rk.get("suppliers", {}).get("name") if isinstance(rk.get("suppliers"), dict) else "Selected Supplier"
+            timeline.append({
+                "id": f"ranking-{rk['id']}",
+                "timestamp": rk.get("created_at"),
+                "event_type": "ranking_generated",
+                "title": "AI Quote Ranking Generated",
+                "summary": f"Evaluated supplier quotes. Selected best supplier: {best_supp}.",
+                "supplier_name": best_supp,
+                "status": "completed",
+                "origin": "system",
+                "details": {
+                    "ranking_id": rk["id"],
+                    "best_supplier_id": rk.get("best_supplier_id"),
+                    "best_quote_id": rk.get("best_quote_id"),
+                    "ranking_json": rk.get("ranking_json"),
+                }
+            })
+    except Exception as e:
+        logger.warning("Error fetching rankings for activity: %s", e)
+
+    if rfq.get("finalization_status") == "completed" and rfq.get("finalized_at"):
+        timeline.append({
+            "id": f"rfq-finalized-{rfq_id}",
+            "timestamp": rfq.get("finalized_at"),
+            "event_type": "rfq_finalized",
+            "title": "RFQ Finalization Completed",
+            "summary": "RFQ closed and finalization workflow completed.",
+            "status": "completed",
+            "origin": "system",
+            "details": {
+                "finalization_status": "completed",
+                "finalized_at": rfq.get("finalized_at"),
+            }
+        })
+
+    # Sort chronological by timestamp
+    timeline.sort(key=lambda x: str(x.get("timestamp") or ""))
+    return timeline
 
