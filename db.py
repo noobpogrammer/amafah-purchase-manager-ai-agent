@@ -388,8 +388,10 @@ def create_pending_clarification(client_id: str, supplier_id: str,
                                   extracted_price: float = None,
                                   extracted_delivery: str = None,
                                   extracted_notes: str = None,
-                                  round_number: int = 1):
-    supabase.table("pending_clarifications").insert({
+                                  round_number: int = 1,
+                                  no_progress_count: int = 0,
+                                  last_question: str = None):
+    payload = {
         "client_id": client_id,
         "supplier_id": supplier_id,
         "pending_rfq_ids": candidate_rfq_ids,
@@ -398,12 +400,18 @@ def create_pending_clarification(client_id: str, supplier_id: str,
         "extracted_delivery": extracted_delivery,
         "extracted_notes": extracted_notes,
         "round_number": round_number,
-    }).execute()
+        "no_progress_count": no_progress_count,
+    }
+    if last_question:
+        payload["last_question"] = last_question
+    res = supabase.table("pending_clarifications").insert(payload).execute()
 
     for rfq_id in candidate_rfq_ids:
         supabase.table("rfq_suppliers").update({"status": "clarifying"}).eq(
             "rfq_id", rfq_id
         ).eq("supplier_id", supplier_id).execute()
+
+    return res.data[0].get("id") if res and res.data else None
 
 
 def get_pending_clarification_for_supplier(supplier_id: str):

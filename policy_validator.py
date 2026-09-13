@@ -56,6 +56,7 @@ def validate_action(
     supplier_id: str,
     context_rfqs: Optional[List[Dict[str, Any]]] = None,
     matched_rfq_id: Optional[str] = None,
+    pending_clarification: Optional[Dict[str, Any]] = None,
 ) -> ValidationResult:
     """
     Deterministic validation of an LLM action proposal.
@@ -350,12 +351,22 @@ def validate_action(
         candidate_ids = args.get("candidate_rfq_ids") or []
         question = args.get("clarifying_question", "")
 
-        if not isinstance(candidate_ids, list) or not candidate_ids:
+        if not isinstance(candidate_ids, list) or len(candidate_ids) == 0:
             return ValidationResult(
                 is_valid=False,
                 action=tool_name,
                 category=ActionCategory.PROPOSE_COMMUNICATE,
-                reason="Missing or empty candidate_rfq_ids for clarification request.",
+                reason="Clarification requires at least 2 candidate RFQs. Missing or empty candidate_rfq_ids.",
+            )
+
+        # Single candidate rejection: If only 1 candidate remains and not in exact stanza match,
+        # reasoner should have proposed the direct business action instead.
+        if len(candidate_ids) == 1 and not matched_rfq_id:
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason="Clarification with a single candidate is unnecessary. Propose the direct business action instead.",
             )
 
         # Deterministic stanza lock: clarification candidates must strictly be [matched_rfq_id]
@@ -366,6 +377,36 @@ def validate_action(
                 category=ActionCategory.PROPOSE_COMMUNICATE,
                 reason=f"Clarification candidates violate deterministic RFQ match lock (expected '{matched_rfq_id}', got {candidate_ids}).",
             )
+
+        # Candidate subset rule: If a pending clarification already exists, candidates cannot expand
+        if pending_clarification:
+            prev_candidates = set(pending_clarification.get("pending_rfq_ids") or [])
+            new_candidates = set(candidate_ids)
+            if prev_candidates and not new_candidates.issubset(prev_candidates):
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason="Clarification candidates cannot expand outside active pending candidates.",
+                )
+
+        # Candidate membership check: ensure all candidates belong to active open context_rfqs
+        if context_rfqs:
+            valid_open_ids = {
+                str(r.get("rfqs", r).get("id"))
+                for r in context_rfqs
+                if isinstance(r.get("rfqs", r), dict)
+                and r.get("rfqs", r).get("id")
+                and db.is_rfq_open(r.get("rfqs", r))
+            }
+            for cid in candidate_ids:
+                if str(cid) not in valid_open_ids:
+                    return ValidationResult(
+                        is_valid=False,
+                        action=tool_name,
+                        category=ActionCategory.PROPOSE_COMMUNICATE,
+                        reason=f"Candidate RFQ '{cid}' is not an open RFQ for this supplier/client.",
+                    )
 
         if not question or not isinstance(question, str):
             return ValidationResult(

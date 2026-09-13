@@ -573,53 +573,47 @@ class TestClarificationIntegration:
                 extracted_delivery=None,
                 extracted_notes=None,
                 round_number=2,
+                no_progress_count=1,
+                last_question="5kg or 10kg?",
             )
             mock_abandon.assert_called_once_with("clarif-100")
 
-    def test_20_two_round_cap_escalates_to_human_without_llm_call(self):
-        """20. When pending clarification round_number >= 2, webhook escalates to human without calling LLM."""
-        client = TestClient(main.app)
-        payload = {
-            "instance": "inst-1",
-            "data": {
-                "key": {"fromMe": False, "remoteJid": "971500000001@s.whatsapp.net", "id": "msg-in-cap"},
-                "message": {"conversation": "still cement"}
-            }
-        }
-        mock_client = {"id": "c-1", "name": "Client 1", "whatsapp_instance": "inst-1"}
-        mock_supp = {"id": "s-1", "name": "Supplier 1", "phone_number": "971500000001", "client_id": "c-1"}
-        mock_pending_round_2 = {
-            "id": "clarif-round-2",
-            "client_id": "c-1",
-            "supplier_id": "s-1",
-            "status": "awaiting_reply",
-            "round_number": 2,
-            "pending_rfq_ids": ["rfq-A", "rfq-B"],
-        }
+    def test_20_two_consecutive_no_progress_turns_escalates_to_human(self):
+        """20. When pending clarification no_progress_count reaches MAX_NO_PROGRESS_ATTEMPTS (2), escalates to human."""
+        context = AgentContext(
+            client_id="c-1",
+            supplier_id="s-1",
+            pending_clarification={
+                "id": "clarif-round-2",
+                "client_id": "c-1",
+                "supplier_id": "s-1",
+                "round_number": 2,
+                "no_progress_count": 1,
+                "pending_rfq_ids": ["rfq-A", "rfq-B"],
+                "last_question": "5kg or 10kg?",
+            },
+        )
+        val = ValidationResult(
+            is_valid=True,
+            action="request_clarification",
+            category=ActionCategory.PROPOSE_COMMUNICATE,
+            sanitized_args={"candidate_rfq_ids": ["rfq-A", "rfq-B"], "clarifying_question": "5kg or 10kg?"},
+        )
+        supplier = {"id": "s-1", "phone_number": "+971500000001"}
 
-        with patch("db.get_client_by_instance", return_value=mock_client), \
-             patch("db.get_supplier_by_phone", return_value=mock_supp), \
-             patch("db.get_pending_clarification_for_supplier", return_value=mock_pending_round_2), \
-             patch("db.abandon_pending_clarification") as mock_abandon, \
+        with patch("db.abandon_pending_clarification") as mock_abandon, \
              patch("db.flag_for_human_review") as mock_flag, \
              patch("db.log_message", return_value="log-1"), \
-             patch("main.enqueue_message", new_callable=AsyncMock), \
-             patch("groq_client.reason_about_procurement_message") as mock_reasoner:
+             patch("main.enqueue_message", new_callable=AsyncMock):
 
-            resp = client.post("/webhook/whatsapp", json=payload)
-            assert resp.status_code == 200
-            assert resp.json()["status"] == "escalated"
+            res = asyncio.run(main.execute_validated_action(val, context, "still cement", supplier, "c-1"))
+            assert res["status"] == "escalated_to_human"
+            assert res["category"] == "clarification_stalled"
             mock_abandon.assert_called_once_with("clarif-round-2")
-            mock_flag.assert_called_once_with(
-                client_id="c-1",
-                supplier_id="s-1",
-                rfq_id=None,
-                reason="Maximum clarification rounds (2) exceeded for supplier.",
-                category="unclear_intent",
-                raw_message="still cement",
-            )
-            # Reasoner was NOT called
-            mock_reasoner.assert_not_called()
+            mock_flag.assert_called_once()
+            flag_call = mock_flag.call_args.kwargs
+            assert flag_call["category"] == "clarification_stalled"
+            assert "stalled after 2" in flag_call["reason"].lower()
 
 
 class TestExecutionConsolidation:

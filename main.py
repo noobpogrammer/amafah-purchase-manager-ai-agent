@@ -44,6 +44,9 @@ DEMO_CLIENT_ID = "d88c52ad-3d0b-42e9-86f1-b9f70018856b"
 THANK_YOU_MSG = "Thanks for the quote! We'll be in touch if we move forward."
 HUMAN_ACK_MSG = "Thanks! We'll review your response and get back to you shortly."
 
+MAX_NO_PROGRESS_ATTEMPTS = 2
+MAX_TOTAL_CLARIFICATION_TURNS = 5
+
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
@@ -993,22 +996,102 @@ async def execute_validated_action(
     elif validation.action == "request_clarification":
         args = validation.sanitized_args
         candidate_ids = args.get("candidate_rfq_ids") or []
-        next_round = (context.pending_clarification.get("round_number", 1) + 1) if context.pending_clarification else 1
-
-        db.create_pending_clarification(
-            client_id=client_id,
-            supplier_id=supplier_id,
-            candidate_rfq_ids=candidate_ids,
-            raw_message=raw_message,
-            extracted_price=args.get("extracted_price"),
-            extracted_delivery=args.get("extracted_delivery"),
-            extracted_notes=args.get("extracted_notes"),
-            round_number=next_round,
-        )
-        if context.pending_clarification:
-            db.abandon_pending_clarification(context.pending_clarification["id"])
-
         question = args["clarifying_question"]
+        norm_question = " ".join((question or "").lower().split())
+
+        if not context.pending_clarification:
+            # 1. New clarification session
+            round_number = 1
+            no_progress_count = 0
+            db.create_pending_clarification(
+                client_id=client_id,
+                supplier_id=supplier_id,
+                candidate_rfq_ids=candidate_ids,
+                raw_message=raw_message,
+                extracted_price=args.get("extracted_price"),
+                extracted_delivery=args.get("extracted_delivery"),
+                extracted_notes=args.get("extracted_notes"),
+                round_number=round_number,
+                no_progress_count=no_progress_count,
+                last_question=question,
+            )
+        else:
+            prev_pc = context.pending_clarification
+            prev_candidates = set(prev_pc.get("pending_rfq_ids") or [])
+            new_candidates = set(candidate_ids)
+            prev_round = prev_pc.get("round_number", 1)
+            prev_no_prog = prev_pc.get("no_progress_count", 0)
+            prev_question = prev_pc.get("last_question") or ""
+            norm_prev_question = " ".join((prev_question or "").lower().split())
+
+            next_round = prev_round + 1
+
+            # Check absolute turn ceiling
+            if next_round > MAX_TOTAL_CLARIFICATION_TURNS:
+                db.abandon_pending_clarification(prev_pc["id"])
+                cand_prods = []
+                for rfq_id in (candidate_ids or list(prev_candidates)):
+                    cand_rfq = next((r.get("rfqs", r) for r in (context.open_rfqs or []) if str(r.get("rfqs", r).get("id")) == str(rfq_id)), None)
+                    if cand_rfq and isinstance(cand_rfq, dict):
+                        cand_prods.append(cand_rfq.get("product_name") or str(rfq_id))
+                    else:
+                        cand_prods.append(str(rfq_id))
+                prods_str = ", ".join(cand_prods)
+                reason = f"Clarification session reached maximum turn limit ({MAX_TOTAL_CLARIFICATION_TURNS} turns). Remaining candidates: {prods_str}"
+                db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=candidate_ids[0] if candidate_ids else (context.matched_rfq_id or None),
+                    reason=reason,
+                    category="clarification_stalled",
+                    raw_message=raw_message,
+                )
+                return {"status": "escalated_to_human", "reason": reason, "category": "clarification_stalled"}
+
+            # Calculate semantic delta: Progress vs No Progress
+            is_narrowed = len(new_candidates) < len(prev_candidates) and new_candidates.issubset(prev_candidates)
+            is_same_question = bool(norm_prev_question and norm_question == norm_prev_question)
+
+            if is_narrowed and not is_same_question:
+                no_progress_count = 0
+            else:
+                no_progress_count = prev_no_prog + 1
+
+            if no_progress_count >= MAX_NO_PROGRESS_ATTEMPTS:
+                db.abandon_pending_clarification(prev_pc["id"])
+                cand_prods = []
+                for rfq_id in (candidate_ids or list(prev_candidates)):
+                    cand_rfq = next((r.get("rfqs", r) for r in (context.open_rfqs or []) if str(r.get("rfqs", r).get("id")) == str(rfq_id)), None)
+                    if cand_rfq and isinstance(cand_rfq, dict):
+                        cand_prods.append(cand_rfq.get("product_name") or str(rfq_id))
+                    else:
+                        cand_prods.append(str(rfq_id))
+                prods_str = ", ".join(cand_prods)
+                reason = f"Clarification stalled after {no_progress_count} uninformative replies. Remaining candidates: {prods_str}"
+                db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=candidate_ids[0] if candidate_ids else (context.matched_rfq_id or None),
+                    reason=reason,
+                    category="clarification_stalled",
+                    raw_message=raw_message,
+                )
+                return {"status": "escalated_to_human", "reason": reason, "category": "clarification_stalled"}
+
+            db.create_pending_clarification(
+                client_id=client_id,
+                supplier_id=supplier_id,
+                candidate_rfq_ids=candidate_ids,
+                raw_message=raw_message,
+                extracted_price=args.get("extracted_price"),
+                extracted_delivery=args.get("extracted_delivery"),
+                extracted_notes=args.get("extracted_notes"),
+                round_number=next_round,
+                no_progress_count=no_progress_count,
+                last_question=question,
+            )
+            db.abandon_pending_clarification(prev_pc["id"])
+
         single_rfq = candidate_ids[0] if len(candidate_ids) == 1 else (context.matched_rfq_id or None)
         if single_rfq:
             msg_log_id = db.log_message(client_id, supplier_id, "outbound", question, related_rfq_id=single_rfq)
@@ -1180,28 +1263,10 @@ async def whatsapp_webhook(request: Request):
             if matched_rfq_supplier:
                 match_source = "quoted_text"
 
-        # 2. Check Pending Clarification (with 2-round cap check)
+        # 2. Check Pending Clarification
         pending = db.get_pending_clarification_for_supplier(supplier["id"])
         if pending and not isinstance(pending, dict):
             pending = None
-
-        if pending and isinstance(pending, dict):
-            round_num = pending.get("round_number", 1)
-            if isinstance(round_num, (int, float)) and round_num >= 2:
-                db.abandon_pending_clarification(pending["id"])
-                reason = "Maximum clarification rounds (2) exceeded for supplier."
-                db.flag_for_human_review(
-                    client_id=client_id,
-                    supplier_id=supplier["id"],
-                    rfq_id=None,
-                    reason=reason,
-                    category="unclear_intent",
-                    raw_message=message_text,
-                )
-                ack_msg = "Thanks! We will have a team member follow up with you directly."
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", ack_msg)
-                await enqueue_message(supplier["phone_number"], ack_msg, message_log_id=msg_log_id)
-                return {"status": "escalated", "reason": reason, "category": "unclear_intent"}
 
         # 3. Retrieve Open RFQs & Candidate RFQs
         open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"]) or []
@@ -1320,13 +1385,14 @@ async def whatsapp_webhook(request: Request):
             raw_message=message_text,
         )
 
-        # 8. Policy Validator Execution (with Deterministic Stanza Lock)
+        # 8. Policy Validator Execution (with Deterministic Stanza Lock & Semantic Clarification Context)
         validation = validate_action(
             proposal,
             client_id=client_id,
             supplier_id=supplier["id"],
             context_rfqs=open_rfqs,
             matched_rfq_id=context.matched_rfq_id,
+            pending_clarification=context.pending_clarification,
         )
 
         if not validation.is_valid:
@@ -1751,13 +1817,14 @@ async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, cu
             arguments=proposal_dict.get("arguments", {}),
         )
 
-        # Policy Validator with operator RFQ lock
+        # Policy Validator with operator RFQ lock & clarification context
         validation = validate_action(
             proposal=action_proposal,
             client_id=client_id,
             supplier_id=supplier["id"],
             context_rfqs=context.open_rfqs,
             matched_rfq_id=rfq_id,
+            pending_clarification=context.pending_clarification,
         )
 
         if not validation.is_valid:

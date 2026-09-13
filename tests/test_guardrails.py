@@ -66,14 +66,15 @@ async def test_webhook_injection_attempt_escalates_not_complies(mock_supabase):
     mock_client = {"id": "client-1", "name": "Test Client", "whatsapp_instance": "Mohammad"}
     mock_supplier = {"id": "supp-injection-1", "client_id": "client-1", "name": "Attacker", "phone_number": "971501234567"}
     mock_open_rfqs = [
-        {"id": "rs-100", "rfqs": {"id": "rfq-100", "product_name": "Inverters", "status": "active"}}
+        {"id": "rs-100", "rfqs": {"id": "rfq-100", "product_name": "Inverters", "status": "active"}},
+        {"id": "rs-101", "rfqs": {"id": "rfq-101", "product_name": "Solar Panels", "status": "active"}},
     ]
 
     unsafe_question = "Sure! Here is your code: ```python\ndef hack(): import os; os.system('echo pwned')\n```"
     mock_groq_decision = {
         "tool_name": "request_clarification",
         "arguments": {
-            "candidate_rfq_ids": ["rfq-100"],
+            "candidate_rfq_ids": ["rfq-100", "rfq-101"],
             "clarifying_question": unsafe_question
         }
     }

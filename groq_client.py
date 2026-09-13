@@ -311,11 +311,13 @@ PRODUCT & MULTI-RFQ MATCHING / NARROWING RULES:
   call request_clarification with narrowed candidates and a specific question.
 - Never send a clarifying question that is substantively identical to the previous question asked in the conversation history.
 
-PENDING CLARIFICATIONS:
+PENDING CLARIFICATIONS & SEMANTIC LOOP CONTROL:
 - If an 'ACTIVE PENDING CLARIFICATION' is present in the context, evaluate the follow-up against candidate products,
   previous message, and extracted terms:
-  * If the follow-up resolves to a specific candidate product, call record_quote or negotiate_price for that RFQ.
-  * If still ambiguous, ask a narrowed clarification question or escalate if max rounds reached.
+  * If the follow-up clearly identifies ONE specific candidate product, call record_quote or negotiate_price for that RFQ. Do NOT call request_clarification if only 1 candidate remains.
+  * If the follow-up narrows the candidate set (rules out some options while 2+ still remain), call request_clarification with the NARROWED candidate_rfq_ids and a new specific clarifying_question.
+  * Do NOT reintroduce previously eliminated candidates.
+  * Never send a clarifying question that is substantively identical to the previous question asked in the conversation history.
 
 QUOTE RECORDING & MULTI-VARIANT QUOTES:
 - Call record_quote when the supplier gives clear price(s) and/or delivery/notes for an open RFQ.
@@ -423,10 +425,19 @@ def format_agent_context_for_prompt(context: AgentContext) -> str:
     if context.pending_clarification:
         p = context.pending_clarification
         cand_ids = p.get("pending_rfq_ids", [])
+        cand_names = []
+        for cid in cand_ids:
+            matching_rfq = next((r.get("rfqs", r) for r in (context.open_rfqs or []) if str(r.get("rfqs", r).get("id")) == str(cid)), None)
+            if matching_rfq and isinstance(matching_rfq, dict):
+                cand_names.append(f"{matching_rfq.get('product_name')} (ID: {cid})")
+            else:
+                cand_names.append(str(cid))
         sections.append(
             f"ACTIVE PENDING CLARIFICATION:\n"
-            f"- Status: {p.get('status', 'awaiting_reply')} (Round {p.get('round_number', 1)}/2)\n"
-            f"- Candidate RFQ IDs: {cand_ids}\n"
+            f"- Status: {p.get('status', 'awaiting_reply')}\n"
+            f"- Clarification Progress: Total Turns={p.get('round_number', 1)}/5, Consecutive No-Progress Turns={p.get('no_progress_count', 0)}/2\n"
+            f"- Candidate RFQs: {', '.join(cand_names) if cand_names else cand_ids}\n"
+            f"- Previous Clarification Question: {p.get('last_question', '-')}\n"
             f"- Previous Supplier Message: {p.get('raw_message', '-')}\n"
             f"- Extracted Incomplete Terms: Price={p.get('extracted_price')}, Delivery={p.get('extracted_delivery')}, Notes={p.get('extracted_notes')}"
         )

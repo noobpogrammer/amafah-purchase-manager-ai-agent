@@ -131,6 +131,8 @@ create table pending_clarifications (
     extracted_delivery  text,
     extracted_notes     text,
     round_number        integer not null default 1,
+    no_progress_count   integer not null default 0,
+    last_question       text,
     status              text not null default 'awaiting_reply'
                             check (status in ('awaiting_reply', 'resolved', 'abandoned')),
     created_at          timestamptz not null default now(),

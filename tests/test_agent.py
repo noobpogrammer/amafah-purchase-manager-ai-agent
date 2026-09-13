@@ -358,6 +358,7 @@ class TestClarificationRoundsCap:
             "extracted_delivery": "5 days",
             "extracted_notes": "warranty included",
             "round_number": 2,
+            "no_progress_count": 0,
         })
 
 
