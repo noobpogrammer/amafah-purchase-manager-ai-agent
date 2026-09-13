@@ -374,26 +374,136 @@ def format_prior_quotes_context(prior_quotes: list) -> str:
 
 
 def generate_ranking(rfq_id: str) -> dict:
-    """Generates comparison ranking for quotes received on an RFQ and saves to DB."""
+    """Generates comparison ranking for commercial offers (variants) received on an RFQ and saves to DB."""
     quotes = db.get_quotes_for_rfq(rfq_id)
     if not quotes:
         return {"error": "No quotes found for this RFQ"}
-    quotes_summary = "\n".join(
-        f"- Supplier ID: {q['supplier_id']} (Name: {q['suppliers']['name']}): AED {q['price']}, delivery: {q.get('delivery_time', '-')}, "
-        f"notes: {q.get('quality_notes', '-')}"
-        for q in quotes
-    )
-    result = groq_client.rank_quotes(rfq_details=f"RFQ ID: {rfq_id}", quotes_summary=quotes_summary)
-    
-    # Ensure best_supplier_id is a valid supplier UUID from quotes
-    best_supplier_id = result.get("best_supplier_id")
-    quote_supplier_ids = [q["supplier_id"] for q in quotes]
-    if best_supplier_id not in quote_supplier_ids:
-        # Fallback to first quote's supplier_id if LLM returned supplier name instead of ID
-        best_supplier_id = quote_supplier_ids[0]
 
-    db.save_ranking(rfq_id, best_supplier_id, result.get("reasoning", ""), result)
-    return result
+    valid_quotes = {str(q["id"]): q for q in quotes}
+
+    offers_lines = []
+    for q in quotes:
+        supp_name = (
+            q.get("suppliers", {}).get("name", "Unknown Supplier")
+            if isinstance(q.get("suppliers"), dict)
+            else "Unknown Supplier"
+        )
+        v_label = f", Variant: '{q['variant_label']}'" if q.get("variant_label") else ""
+        offers_lines.append(
+            f"- Quote ID: {q['id']} | Supplier: {supp_name}{v_label} | Price: AED {q['price']} | "
+            f"Delivery: {q.get('delivery_time', '-')} | Notes: {q.get('quality_notes', '-')}"
+        )
+    quotes_summary = "\n".join(offers_lines)
+
+    result = groq_client.rank_quotes(rfq_details=f"RFQ ID: {rfq_id}", quotes_summary=quotes_summary)
+
+    # 1. Deterministic Winner Validation
+    best_quote_id = result.get("best_quote_id")
+    if not best_quote_id or str(best_quote_id) not in valid_quotes:
+        # Check if ranking list has a valid quote_id in item 0
+        ranking_list = result.get("ranking") or []
+        if ranking_list and isinstance(ranking_list, list):
+            first_item = ranking_list[0] if isinstance(ranking_list[0], dict) else {}
+            first_item_qid = first_item.get("quote_id")
+            if first_item_qid and str(first_item_qid) in valid_quotes:
+                best_quote_id = str(first_item_qid)
+            elif first_item.get("supplier_id"):
+                s_id = str(first_item.get("supplier_id"))
+                matching_quotes = [q for q in quotes if str(q.get("supplier_id")) == s_id]
+                if matching_quotes:
+                    best_quote_id = str(matching_quotes[0]["id"])
+
+    if not best_quote_id or str(best_quote_id) not in valid_quotes:
+        # Check if best_supplier_id was returned and matches a quote
+        legacy_supp_id = result.get("best_supplier_id") or (result.get("best_quote_id") if result.get("best_quote_id") else None)
+        if legacy_supp_id:
+            matching_quotes = [q for q in quotes if str(q.get("supplier_id")) == str(legacy_supp_id)]
+            if matching_quotes:
+                best_quote_id = str(matching_quotes[0]["id"])
+
+    # Strict check: Do NOT arbitrarily pick an unrelated quote row if no valid match exists
+    if not best_quote_id or str(best_quote_id) not in valid_quotes:
+        raise ValueError(
+            f"Invalid ranking result: best_quote_id '{best_quote_id}' does not match any valid candidate quote for RFQ {rfq_id}"
+        )
+
+    best_quote_id = str(best_quote_id)
+    winning_quote = valid_quotes[best_quote_id]
+    best_supplier_id = winning_quote.get("supplier_id")
+
+    # 2. Enrich and validate ranking list deterministically
+    raw_ranking_items = result.get("ranking") or []
+    enriched_ranking = []
+    seen_qids = set()
+
+    for item in raw_ranking_items:
+        if not isinstance(item, dict):
+            continue
+        qid = str(item.get("quote_id")) if item.get("quote_id") else None
+        if not qid and item.get("supplier_id"):
+            s_id = str(item.get("supplier_id"))
+            matching_quotes = [q for q in quotes if str(q.get("supplier_id")) == s_id and str(q["id"]) not in seen_qids]
+            if matching_quotes:
+                qid = str(matching_quotes[0]["id"])
+
+        if qid and qid in valid_quotes and qid not in seen_qids:
+            seen_qids.add(qid)
+            q_row = valid_quotes[qid]
+            supp_name = (
+                q_row.get("suppliers", {}).get("name", "Unknown Supplier")
+                if isinstance(q_row.get("suppliers"), dict)
+                else "Unknown Supplier"
+            )
+            enriched_ranking.append({
+                "rank": int(item.get("rank", len(enriched_ranking) + 1)),
+                "quote_id": qid,
+                "supplier_id": q_row.get("supplier_id"),
+                "supplier_name": supp_name,
+                "variant_label": q_row.get("variant_label"),
+                "price": q_row.get("price"),
+                "delivery_time": q_row.get("delivery_time"),
+                "quality_notes": q_row.get("quality_notes"),
+                "summary": item.get("summary", ""),
+            })
+
+    # Append any valid candidate quotes omitted by LLM
+    for qid, q_row in valid_quotes.items():
+        if qid not in seen_qids:
+            seen_qids.add(qid)
+            supp_name = (
+                q_row.get("suppliers", {}).get("name", "Unknown Supplier")
+                if isinstance(q_row.get("suppliers"), dict)
+                else "Unknown Supplier"
+            )
+            enriched_ranking.append({
+                "rank": len(enriched_ranking) + 1,
+                "quote_id": qid,
+                "supplier_id": q_row.get("supplier_id"),
+                "supplier_name": supp_name,
+                "variant_label": q_row.get("variant_label"),
+                "price": q_row.get("price"),
+                "delivery_time": q_row.get("delivery_time"),
+                "quality_notes": q_row.get("quality_notes"),
+                "summary": f"AED {q_row.get('price')}",
+            })
+
+    enriched_ranking.sort(key=lambda x: x["rank"])
+
+    enriched_ranking_json = {
+        "best_quote_id": best_quote_id,
+        "best_supplier_id": best_supplier_id,
+        "reasoning": result.get("reasoning", ""),
+        "ranking": enriched_ranking,
+    }
+
+    db.save_ranking(
+        rfq_id=rfq_id,
+        best_supplier_id=best_supplier_id,
+        reasoning=result.get("reasoning", ""),
+        ranking_json=enriched_ranking_json,
+        best_quote_id=best_quote_id,
+    )
+    return enriched_ranking_json
 
 
 def check_and_auto_rank(rfq_id: str):
@@ -1808,15 +1918,16 @@ def generate_daily_procurement_docx(date_str: str, rfq_data_list: list) -> bytes
         if not quotes:
             doc.add_paragraph("No one responded to this RFQ.")
         else:
-            table = doc.add_table(rows=1, cols=5)
+            table = doc.add_table(rows=1, cols=6)
             table.alignment = WD_TABLE_ALIGNMENT.CENTER
 
             hdr_cells = table.rows[0].cells
             hdr_cells[0].text = "Rank"
             hdr_cells[1].text = "Supplier"
-            hdr_cells[2].text = "Price"
-            hdr_cells[3].text = "Delivery Time"
-            hdr_cells[4].text = "Quality / Warranty Notes"
+            hdr_cells[2].text = "Variant"
+            hdr_cells[3].text = "Price"
+            hdr_cells[4].text = "Delivery Time"
+            hdr_cells[5].text = "Quality / Warranty Notes"
 
             for cell in hdr_cells:
                 for paragraph in cell.paragraphs:
@@ -1828,9 +1939,10 @@ def generate_daily_procurement_docx(date_str: str, rfq_data_list: list) -> bytes
                 rank_val = q.get("rank") if q.get("rank") is not None else q_idx
                 row_cells[0].text = f"#{rank_val}"
                 row_cells[1].text = str(q.get("supplier_name") or "Unknown")
-                row_cells[2].text = f"AED {q.get('price')}" if q.get('price') is not None else "N/A"
-                row_cells[3].text = str(q.get("delivery_time") or "Not specified")
-                row_cells[4].text = str(q.get("quality_notes") or "Standard")
+                row_cells[2].text = str(q.get("variant_label") or "—")
+                row_cells[3].text = f"AED {q.get('price')}" if q.get('price') is not None else "N/A"
+                row_cells[4].text = str(q.get("delivery_time") or "Not specified")
+                row_cells[5].text = str(q.get("quality_notes") or "Standard")
 
             if item.get("reasoning"):
                 p = doc.add_paragraph()
@@ -1897,14 +2009,19 @@ async def get_daily_report_endpoint(
             rank_map = {}
             if ranking_data and isinstance(ranking_data, dict) and ranking_data.get("ranking"):
                 for item in ranking_data["ranking"]:
-                    s_id = item.get("supplier_id")
-                    if s_id:
-                        rank_map[s_id] = item
+                    q_id = str(item.get("quote_id")) if item.get("quote_id") else None
+                    if q_id:
+                        rank_map[q_id] = item
+                    elif item.get("supplier_id"):  # backward compatibility with legacy rankings
+                        rank_map[str(item.get("supplier_id"))] = item
 
             if rank_map:
                 sorted_quotes = sorted(
                     quotes,
-                    key=lambda q: rank_map.get(q.get("supplier_id"), {}).get("rank", 999)
+                    key=lambda q: (
+                        rank_map.get(str(q.get("id")), {}).get("rank")
+                        or rank_map.get(str(q.get("supplier_id")), {}).get("rank", 999)
+                    )
                 )
             else:
                 sorted_quotes = sorted(
@@ -1913,10 +2030,12 @@ async def get_daily_report_endpoint(
                 )
 
             for q in sorted_quotes[:5]:
-                rank_item = rank_map.get(q.get("supplier_id"), {})
+                rank_item = rank_map.get(str(q.get("id"))) or rank_map.get(str(q.get("supplier_id")), {})
                 top_quotes.append({
                     "rank": rank_item.get("rank"),
+                    "quote_id": q.get("id"),
                     "supplier_name": q.get("suppliers", {}).get("name") if isinstance(q.get("suppliers"), dict) else "Supplier",
+                    "variant_label": q.get("variant_label"),
                     "price": q.get("price"),
                     "delivery_time": q.get("delivery_time"),
                     "quality_notes": q.get("quality_notes"),

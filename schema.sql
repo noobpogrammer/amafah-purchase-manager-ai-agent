@@ -166,6 +166,7 @@ create index idx_message_log_supplier on message_log(supplier_id);
 create table rfq_rankings (
     id                  uuid primary key default gen_random_uuid(),
     rfq_id              uuid not null references rfqs(id) on delete cascade,
+    best_quote_id       uuid references quotes(id) on delete set null,
     best_supplier_id    uuid references suppliers(id),
     reasoning           text,
     ranking_json        jsonb not null,
@@ -173,6 +174,7 @@ create table rfq_rankings (
 );
 
 create index idx_rfq_rankings_rfq on rfq_rankings(rfq_id);
+create index idx_rfq_rankings_best_quote on rfq_rankings(best_quote_id);
 
 -- ------------------------------------------------------------
 -- FLAGGED_FOR_REVIEW

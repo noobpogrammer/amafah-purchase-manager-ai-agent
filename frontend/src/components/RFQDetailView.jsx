@@ -349,19 +349,38 @@ export default function RFQDetailView({
                   <div className="empty-state">No quotes received yet. Replies via WhatsApp will automatically appear here.</div>
                 ) : (
                   <div className="quotes-grid">
-                    {detailData.quotes.map((q) => (
-                      <div key={q.id} className="quote-summary-card">
-                        <div className="quote-header">
-                          <strong>{q.suppliers?.name || 'Supplier'}</strong>
-                          <span className="price-tag">AED {q.price}</span>
+                    {detailData.quotes.map((q) => {
+                      const bestQuoteId = detailData.ranking?.best_quote_id || detailData.ranking?.ranking_json?.best_quote_id;
+                      const isBest = bestQuoteId
+                        ? bestQuoteId === q.id
+                        : (detailData.ranking?.best_supplier_id === q.supplier_id && detailData.quotes.filter((x) => x.supplier_id === detailData.ranking.best_supplier_id).length === 1);
+
+                      return (
+                        <div key={q.id} className={`quote-summary-card ${isBest ? 'row-highlight' : ''}`}>
+                          <div className="quote-header">
+                            <div>
+                              <strong>{q.suppliers?.name || 'Supplier'}</strong>
+                              {q.variant_label && (
+                                <span className="badge badge-category" style={{ marginLeft: '0.4rem' }}>
+                                  {q.variant_label}
+                                </span>
+                              )}
+                              {isBest && (
+                                <span className="badge badge-best" style={{ marginLeft: '0.4rem' }}>
+                                  <CheckCircle size={12} /> Best Offer
+                                </span>
+                              )}
+                            </div>
+                            <span className="price-tag">AED {q.price}</span>
+                          </div>
+                          <div className="quote-body">
+                            <p><strong>Delivery:</strong> {q.delivery_time || '-'}</p>
+                            <p><strong>Notes:</strong> {q.quality_notes || '-'}</p>
+                            <p className="raw-msg"><em>"{q.raw_message}"</em></p>
+                          </div>
                         </div>
-                        <div className="quote-body">
-                          <p><strong>Delivery:</strong> {q.delivery_time || '-'}</p>
-                          <p><strong>Notes:</strong> {q.quality_notes || '-'}</p>
-                          <p className="raw-msg"><em>"{q.raw_message}"</em></p>
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>

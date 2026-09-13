@@ -136,15 +136,17 @@ def test_daily_report_generates_docx_with_mix_of_responded_and_unresponded_rfqs(
         assert len(doc.tables) == 1
         table = doc.tables[0]
         rows = [[c.text for c in row.cells] for row in table.rows]
-        assert rows[0] == ["Rank", "Supplier", "Price", "Delivery Time", "Quality / Warranty Notes"]
+        assert rows[0] == ["Rank", "Supplier", "Variant", "Price", "Delivery Time", "Quality / Warranty Notes"]
         # Rank #1 should be BuildPro Supplies (AED 110.0)
         assert rows[1][0] == "#1"
         assert rows[1][1] == "BuildPro Supplies"
-        assert rows[1][2] == "AED 110.0"
+        assert rows[1][2] == "—"
+        assert rows[1][3] == "AED 110.0"
         # Rank #2 should be Ace Hardware (AED 120.0)
         assert rows[2][0] == "#2"
         assert rows[2][1] == "Ace Hardware"
-        assert rows[2][2] == "AED 120.0"
+        assert rows[2][2] == "—"
+        assert rows[2][3] == "AED 120.0"
 
         # Verify AI Reasoning paragraph is present for RFQ 1
         assert "AI Reasoning: BuildPro Supplies offers the lowest price (AED 110.0) with fastest delivery (1 day)." in doc_text

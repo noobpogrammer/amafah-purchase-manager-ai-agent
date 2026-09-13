@@ -80,12 +80,22 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
     return null;
   };
 
-  // Find best supplier name from ranking
-  let bestSupplierName = 'Best Supplier';
-  if (ranking?.best_supplier_id) {
+  // Find best offer details from ranking
+  const bestQuoteId = ranking?.best_quote_id || ranking?.ranking_json?.best_quote_id || null;
+  const winningQuote = bestQuoteId ? quotes.find((q) => q.id === bestQuoteId) : null;
+
+  let bestOfferTitle = 'Best Offer';
+  let bestOfferSub = null;
+
+  if (winningQuote) {
+    const suppName = winningQuote.suppliers?.name || getSupplierName(winningQuote.supplier_id) || 'Supplier';
+    const varText = winningQuote.variant_label ? ` — ${winningQuote.variant_label}` : '';
+    bestOfferTitle = `${suppName}${varText}`;
+    bestOfferSub = `AED ${winningQuote.price} | Delivery: ${winningQuote.delivery_time || 'Not specified'}${winningQuote.quality_notes ? ` | Notes: ${winningQuote.quality_notes}` : ''}`;
+  } else if (ranking?.best_supplier_id) {
     const matched = getSupplierName(ranking.best_supplier_id);
     if (matched) {
-      bestSupplierName = matched;
+      bestOfferTitle = matched;
     }
   }
 
@@ -95,7 +105,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
         <div>
           <h2 className="view-title">Quotes Comparison & AI Recommendation Report</h2>
           <p className="view-description">
-            Evaluates price, delivery speed, and quality notes using Groq AI to rank supplier offers.
+            Evaluates price, delivery speed, and quality notes across commercial offers to recommend the optimal choice.
           </p>
         </div>
         {/* RFQ Switcher Dropdown */}
@@ -146,9 +156,14 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
           {ranking ? (
             <div className="ai-recommendation-hero">
               <div className="hero-badge">
-                <Trophy size={20} className="trophy-icon" /> AI Optimal Choice
+                <Trophy size={20} className="trophy-icon" /> AI Recommended Offer
               </div>
-              <h3 className="hero-supplier-name">AI Recommends: {bestSupplierName}</h3>
+              <h3 className="hero-supplier-name">AI Recommends: {bestOfferTitle}</h3>
+              {bestOfferSub && (
+                <p style={{ margin: '0.25rem 0 0.5rem 0', fontWeight: 600, color: 'var(--color-primary-light, #38bdf8)' }}>
+                  {bestOfferSub}
+                </p>
+              )}
               <p className="hero-reasoning">{formatCurrencyInText(ranking.reasoning)}</p>
             </div>
           ) : (
@@ -166,7 +181,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
             <div className="card-header flex-between">
               <h4 className="card-title flex-items">
                 <BarChart3 size={18} />
-                <span>Received Quotes ({quotes.length})</span>
+                <span>Received Quotes & Variants ({quotes.length})</span>
               </h4>
             </div>
 
@@ -180,6 +195,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                 <thead>
                   <tr>
                     <th>Supplier</th>
+                    <th>Variant</th>
                     <th>Quoted Price</th>
                     <th>Delivery Time</th>
                     <th>Quality / Warranty</th>
@@ -189,15 +205,25 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                 </thead>
                 <tbody>
                   {quotes.map((q) => {
-                    const isBest = ranking?.best_supplier_id === q.supplier_id;
+                    const isBest = bestQuoteId
+                      ? q.id === bestQuoteId
+                      : (ranking?.best_supplier_id === q.supplier_id && quotes.filter((x) => x.supplier_id === ranking.best_supplier_id).length === 1);
+
                     return (
                       <tr key={q.id} className={isBest ? 'row-highlight' : ''}>
                         <td>
                           <strong>{q.suppliers?.name || 'Supplier'}</strong>
                           {isBest && (
-                            <span className="badge badge-best">
+                            <span className="badge badge-best" style={{ marginLeft: '0.5rem' }}>
                               <CheckCircle size={12} /> Best Value
                             </span>
+                          )}
+                        </td>
+                        <td>
+                          {q.variant_label ? (
+                            <span className="badge badge-category">{q.variant_label}</span>
+                          ) : (
+                            <span style={{ color: 'var(--text-muted)' }}>—</span>
                           )}
                         </td>
                         <td>
@@ -230,15 +256,15 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
               </div>
               <div className="ranking-breakdown-list">
                 {ranking.ranking_json.ranking.map((item, idx) => {
-                  const supplierName = getSupplierName(item.supplier_id);
+                  const supplierName = item.supplier_name || getSupplierName(item.supplier_id) || 'Supplier';
+                  const varLabel = item.variant_label ? ` (${item.variant_label})` : '';
+                  const priceText = item.price !== undefined && item.price !== null ? ` — AED ${item.price}` : '';
                   return (
                     <div key={idx} className="ranking-item">
                       <div className="rank-badge">#{item.rank}</div>
                       <div className="rank-details">
                         <strong>
-                          {supplierName
-                            ? `${supplierName} (ID: ${item.supplier_id})`
-                            : `Supplier ID: ${item.supplier_id}`}
+                          {supplierName}{varLabel}{priceText}
                         </strong>
                         <p>{formatCurrencyInText(item.summary)}</p>
                       </div>

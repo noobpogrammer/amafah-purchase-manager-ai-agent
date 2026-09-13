@@ -782,14 +782,17 @@ def get_all_quotes_for_rfq(rfq_id: str) -> list:
     return res.data or []
 
 
-def save_ranking(rfq_id: str, best_supplier_id: str, reasoning: str, ranking_json: dict):
+def save_ranking(rfq_id: str, best_supplier_id: str | None, reasoning: str, ranking_json: dict, best_quote_id: str | None = None):
     """Persists AI comparison ranking using upsert on rfq_id to guarantee idempotency."""
-    return supabase.table("rfq_rankings").upsert({
+    payload = {
         "rfq_id": rfq_id,
         "best_supplier_id": best_supplier_id,
         "reasoning": reasoning,
         "ranking_json": ranking_json,
-    }, on_conflict="rfq_id").execute().data
+    }
+    if best_quote_id:
+        payload["best_quote_id"] = best_quote_id
+    return supabase.table("rfq_rankings").upsert(payload, on_conflict="rfq_id").execute().data
 
 
 def get_ranking_for_rfq(rfq_id: str) -> dict | None:

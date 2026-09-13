@@ -617,8 +617,8 @@ def resolve_clarification(message_text: str, candidate_rfqs_context: str, previo
 
 def rank_quotes(rfq_details: str, quotes_summary: str) -> dict:
     """
-    Final comparison step: given all quotes for an RFQ, ask Groq to rank
-    suppliers and explain the reasoning. Uses structured JSON output.
+    Final comparison step: given all commercial offers/quote variants for an RFQ,
+    ask Groq to rank offers and explain the reasoning. Uses structured JSON output.
     """
     response = client.chat.completions.create(
         model=MODEL,
@@ -626,17 +626,19 @@ def rank_quotes(rfq_details: str, quotes_summary: str) -> dict:
             {
                 "role": "system",
                 "content": (
-                    "You are a procurement analyst. Given an RFQ and the quotes "
-                    "received, rank suppliers best-to-worst considering price, "
-                    "delivery time, and quality/warranty notes. All prices and currency are in AED (United Arab Emirates Dirham). "
-                    "Always use 'AED' when referencing prices in the reasoning and summaries (never use '$'). Respond ONLY with "
-                    "valid JSON: {\"best_supplier_id\": str, \"reasoning\": str, "
-                    "\"ranking\": [{\"supplier_id\": str, \"rank\": int, \"summary\": str}]}"
+                    "You are a procurement analyst. Given an RFQ and the commercial offers (quote variants) "
+                    "received, rank the offers best-to-worst considering price, delivery time, and quality/warranty notes. "
+                    "All prices and currency are in AED (United Arab Emirates Dirham). "
+                    "Always use 'AED' when referencing prices in the reasoning and summaries (never use '$'). "
+                    "Evaluate each distinct quote_id as an individual commercial offer. "
+                    "Respond ONLY with valid JSON in this exact structure: "
+                    "{\"best_quote_id\": str, \"reasoning\": str, "
+                    "\"ranking\": [{\"quote_id\": str, \"rank\": int, \"summary\": str}]}"
                 ),
             },
             {
                 "role": "user",
-                "content": f"RFQ:\n{rfq_details}\n\nQuotes received (all prices in AED):\n{quotes_summary}",
+                "content": f"RFQ:\n{rfq_details}\n\nCommercial offers received (all prices in AED):\n{quotes_summary}",
             },
         ],
         response_format={"type": "json_object"},
