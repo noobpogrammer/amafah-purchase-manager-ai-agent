@@ -6,14 +6,18 @@ Architecture:
 Supplier message -> LLM interpretation -> Structured Action Proposal -> Policy & Validator Layer -> Approved / Rejected action -> Deterministic execution
 """
 
+import logging
 import math
 import os
+import re
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 import db
 import guardrails
+
+logger = logging.getLogger(__name__)
 
 
 class ActionCategory(str, Enum):
@@ -57,6 +61,7 @@ def validate_action(
     context_rfqs: Optional[List[Dict[str, Any]]] = None,
     matched_rfq_id: Optional[str] = None,
     pending_clarification: Optional[Dict[str, Any]] = None,
+    input_origin: str = "supplier",
 ) -> ValidationResult:
     """
     Deterministic validation of an LLM action proposal.
@@ -484,7 +489,9 @@ def validate_action(
     if tool_name == "negotiate_price":
         args = proposal.arguments or {}
         rfq_id = args.get("rfq_id")
+        quote_id = args.get("quote_id")
         raw_price = args.get("quoted_price") if "quoted_price" in args else args.get("price")
+        raw_counter = args.get("counter_price")
         neg_msg = args.get("negotiation_message")
 
         if not rfq_id or not isinstance(rfq_id, str):
@@ -504,22 +511,164 @@ def validate_action(
                 reason=f"Proposed RFQ '{rfq_id}' does not match deterministically locked RFQ '{matched_rfq_id}'.",
             )
 
-        # Validate numeric price
+        # Validate quote_id
+        if not quote_id or not isinstance(quote_id, str) or not quote_id.strip():
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason="Missing or invalid quote_id in negotiate_price proposal.",
+            )
+        quote_id = quote_id.strip()
+
+        # Fetch target quote from DB
+        target_quote = None
         try:
-            price = float(raw_price)
-            if math.isnan(price) or math.isinf(price) or price <= 0:
+            target_quote = db.get_quote_by_id(quote_id)
+        except Exception:
+            pass
+
+        if not target_quote:
+            try:
+                q_res = db.supabase.table("quotes").select("*, rfqs(*)").eq("id", quote_id).execute()
+                if q_res.data:
+                    target_quote = q_res.data[0]
+            except Exception:
+                pass
+
+        if not target_quote:
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=f"Target quote '{quote_id}' does not exist.",
+            )
+
+        # Target quote must belong to the proposed RFQ
+        if str(target_quote.get("rfq_id")) != str(rfq_id):
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=f"Target quote '{quote_id}' belongs to RFQ '{target_quote.get('rfq_id')}', not '{rfq_id}'.",
+            )
+
+        # Target quote must belong to the current supplier
+        if str(target_quote.get("supplier_id")) != str(supplier_id):
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=f"Target quote '{quote_id}' belongs to supplier '{target_quote.get('supplier_id')}', not '{supplier_id}'.",
+            )
+
+        # Target quote must be available / not withdrawn
+        if target_quote.get("is_available", True) is False:
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=f"Target quote '{quote_id}' is marked unavailable or withdrawn.",
+            )
+
+        # Target quote must have a valid positive price
+        trusted_price_raw = target_quote.get("price")
+        if trusted_price_raw is None:
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=f"Target quote '{quote_id}' does not have a price.",
+            )
+        try:
+            trusted_price = float(trusted_price_raw)
+            if math.isnan(trusted_price) or math.isinf(trusted_price) or trusted_price <= 0:
                 return ValidationResult(
                     is_valid=False,
                     action=tool_name,
                     category=ActionCategory.PROPOSE_COMMUNICATE,
-                    reason=f"Invalid quoted_price value '{raw_price}'. Price must be a positive number.",
+                    reason=f"Target quote '{quote_id}' has an invalid non-positive price '{trusted_price_raw}'.",
                 )
         except (ValueError, TypeError):
             return ValidationResult(
                 is_valid=False,
                 action=tool_name,
                 category=ActionCategory.PROPOSE_COMMUNICATE,
-                reason=f"Non-numeric quoted_price '{raw_price}' provided for negotiation.",
+                reason=f"Target quote '{quote_id}' has non-numeric price '{trusted_price_raw}'.",
+            )
+
+        # Target quote must be the current EFFECTIVE quote (not superseded)
+        try:
+            effective_quotes = db.get_quotes_for_rfq(rfq_id, include_unavailable=False)
+            effective_ids = [str(q.get("id")) for q in (effective_quotes or []) if q.get("supplier_id") == supplier_id]
+            if effective_ids and str(quote_id) not in effective_ids:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=f"Target quote '{quote_id}' is superseded by a newer quote revision.",
+                )
+        except Exception as e:
+            logger.warning("Failed to check effective quotes for rfq %s: %s", rfq_id, e)
+
+        # Validate quoted_price vs trusted_price
+        if raw_price is not None:
+            try:
+                price = float(raw_price)
+                if math.isnan(price) or math.isinf(price) or price <= 0:
+                    return ValidationResult(
+                        is_valid=False,
+                        action=tool_name,
+                        category=ActionCategory.PROPOSE_COMMUNICATE,
+                        reason=f"Invalid quoted_price value '{raw_price}'. Price must be a positive number.",
+                    )
+                if not math.isclose(price, trusted_price, rel_tol=1e-3, abs_tol=1e-3):
+                    return ValidationResult(
+                        is_valid=False,
+                        action=tool_name,
+                        category=ActionCategory.PROPOSE_COMMUNICATE,
+                        reason=f"Quoted price '{price}' does not match trusted effective quote price '{trusted_price}'.",
+                    )
+            except (ValueError, TypeError):
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=f"Non-numeric quoted_price '{raw_price}' provided for negotiation.",
+                )
+        else:
+            price = trusted_price
+
+        # Validate counter_price
+        if raw_counter is None:
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason="Missing required counter_price in negotiate_price proposal.",
+            )
+        try:
+            counter_price = float(raw_counter)
+            if math.isnan(counter_price) or math.isinf(counter_price) or counter_price <= 0:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=f"Invalid counter_price value '{raw_counter}'. Counter price must be a positive finite number.",
+                )
+            if counter_price >= trusted_price:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=f"Invalid counter_price '{counter_price}': Counter price must be strictly less than the supplier's quoted price '{trusted_price}'.",
+                )
+        except (ValueError, TypeError):
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=f"Non-numeric counter_price '{raw_counter}' provided for negotiation.",
             )
 
         # Validate negotiation message
@@ -539,6 +688,34 @@ def validate_action(
                 reason="AI generated non-compliant or unsafe negotiation message caught by guardrails.",
             )
 
+        # Check for UUID leaks in negotiation_message
+        if re.search(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", neg_msg, re.IGNORECASE):
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason="Negotiation message contains an internal database UUID / ID leak.",
+            )
+
+        # Check for autonomous acceptance keywords
+        lower_msg = neg_msg.lower()
+        if any(w in lower_msg for w in [
+            "we accept your quote",
+            "quote accepted",
+            "order is confirmed",
+            "purchase order issued",
+            "po issued",
+            "rfq closed",
+            "bid awarded",
+            "awarding you the contract",
+        ]):
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason="Negotiation message contains autonomous acceptance or purchase commitment phrasing.",
+            )
+
         # Validate RFQ against context / DB
         target_rfq = None
         target_rfq_supplier = None
@@ -546,7 +723,7 @@ def validate_action(
         if context_rfqs:
             for item in context_rfqs:
                 rfq_obj = item.get("rfqs") if (isinstance(item, dict) and "rfqs" in item) else item
-                if isinstance(rfq_obj, dict) and rfq_obj.get("id") == rfq_id:
+                if isinstance(rfq_obj, dict) and str(rfq_obj.get("id")) == str(rfq_id):
                     target_rfq = rfq_obj
                     target_rfq_supplier = item if (isinstance(item, dict) and "rfqs" in item) else None
                     break
@@ -569,7 +746,7 @@ def validate_action(
 
         # Tenant isolation check
         rfq_client_id = target_rfq.get("client_id")
-        if rfq_client_id and rfq_client_id != client_id:
+        if rfq_client_id and str(rfq_client_id) != str(client_id):
             return ValidationResult(
                 is_valid=False,
                 action=tool_name,
@@ -605,22 +782,23 @@ def validate_action(
             )
 
         # Negotiation attempt limit check
-        attempts = db.get_negotiation_attempts(rfq_id, supplier_id)
-        if not isinstance(attempts, (int, float)):
-            attempts = 0
-        if attempts >= MAX_NEGOTIATION_ATTEMPTS:
-            return ValidationResult(
-                is_valid=False,
-                action=tool_name,
-                category=ActionCategory.PROPOSE_COMMUNICATE,
-                reason=f"Negotiation attempt limit reached ({attempts}/{MAX_NEGOTIATION_ATTEMPTS}).",
-            )
+        if input_origin != "operator":
+            attempts = db.get_negotiation_attempts(rfq_id, supplier_id)
+            if not isinstance(attempts, (int, float)):
+                attempts = 0
+            if attempts >= MAX_NEGOTIATION_ATTEMPTS:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=f"Negotiation attempt limit reached ({attempts}/{MAX_NEGOTIATION_ATTEMPTS}).",
+                )
 
-        sanitized_delivery = args.get("delivery_time")
+        sanitized_delivery = args.get("delivery_time") or target_quote.get("delivery_time")
         if sanitized_delivery is not None and not isinstance(sanitized_delivery, str):
             sanitized_delivery = str(sanitized_delivery)
 
-        sanitized_notes = args.get("quality_notes")
+        sanitized_notes = args.get("quality_notes") or target_quote.get("quality_notes")
         if sanitized_notes is not None and not isinstance(sanitized_notes, str):
             sanitized_notes = str(sanitized_notes)
 
@@ -630,8 +808,11 @@ def validate_action(
             category=ActionCategory.PROPOSE_COMMUNICATE,
             sanitized_args={
                 "rfq_id": rfq_id,
-                "quoted_price": price,
+                "quote_id": quote_id,
+                "quoted_price": trusted_price,
+                "counter_price": counter_price,
                 "negotiation_message": neg_msg.strip(),
+                "variant_label": target_quote.get("variant_label"),
                 "delivery_time": sanitized_delivery,
                 "quality_notes": sanitized_notes,
             },

@@ -1123,12 +1123,24 @@ def get_incomplete_rfqs_audit(client_id: str = None):
     }
 
 
+def get_quote_by_id(quote_id: str) -> dict | None:
+    """Fetches a single quote row by ID joined with its RFQ details."""
+    if not quote_id:
+        return None
+    try:
+        res = supabase.table("quotes").select("*, rfqs(*)").eq("id", quote_id).execute()
+        return res.data[0] if res and res.data else None
+    except Exception as e:
+        logger.warning(f"get_quote_by_id error for {quote_id}: {e}")
+        return None
+
+
 def get_supplier_prior_quotes(supplier_id: str, rfq_ids: list = None):
     """Fetches past quote(s) for a supplier to serve as prior context for Groq contradiction detection."""
     query = supabase.table("quotes").select("*, rfqs(product_name)").eq("supplier_id", supplier_id)
     if rfq_ids:
         query = query.in_("rfq_id", rfq_ids)
-    res = query.order("created_at", desc=True).limit(5).execute()
+    res = query.order("created_at", desc=True).order("id", desc=True).limit(10).execute()
     return res.data
 
 

@@ -940,29 +940,13 @@ async def execute_validated_action(
     elif validation.action == "negotiate_price":
         args = validation.sanitized_args
         target_rfq_id = args["rfq_id"]
-        quoted_price = args["quoted_price"]
+        quote_id = args.get("quote_id")
+        quoted_price = args.get("quoted_price")
+        counter_price = args.get("counter_price")
         neg_msg = args["negotiation_message"]
         delivery = args.get("delivery_time")
         notes = args.get("quality_notes")
-
-        quote_raw = context.review_raw_message if (context.input_origin == "operator" and context.review_raw_message) else raw_message
-
-        # Check existing quote to avoid duplicate insertion on negotiation if quote price hasn't changed
-        should_record = True
-        if context.input_origin == "operator":
-            existing_quotes = [q for q in context.prior_quotes if q.get("rfq_id") == target_rfq_id]
-            if existing_quotes and existing_quotes[0].get("price") == quoted_price:
-                should_record = False
-
-        if should_record:
-            db.record_quote(
-                rfq_id=target_rfq_id,
-                supplier_id=supplier_id,
-                price=quoted_price,
-                delivery_time=delivery,
-                quality_notes=notes,
-                raw_message=quote_raw,
-            )
+        variant_label = args.get("variant_label")
 
         attempts = db.increment_negotiation_attempts(target_rfq_id, supplier_id)
         if attempts <= 0:
@@ -991,7 +975,15 @@ async def execute_validated_action(
         if not msg_log_id:
             raise RuntimeError("Failed to log outbound negotiation message durably.")
         await enqueue_message(phone_number, neg_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
-        return {"status": "negotiation_sent", "rfq_id": target_rfq_id, "attempts": attempts}
+        return {
+            "status": "negotiation_sent",
+            "rfq_id": target_rfq_id,
+            "quote_id": quote_id,
+            "quoted_price": quoted_price,
+            "counter_price": counter_price,
+            "variant_label": variant_label,
+            "attempts": attempts,
+        }
 
     elif validation.action == "request_clarification":
         args = validation.sanitized_args
@@ -1415,6 +1407,7 @@ async def whatsapp_webhook(request: Request):
             context_rfqs=open_rfqs,
             matched_rfq_id=context.matched_rfq_id,
             pending_clarification=context.pending_clarification,
+            input_origin="supplier",
         )
 
         if not validation.is_valid:
@@ -1847,6 +1840,7 @@ async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, cu
             context_rfqs=context.open_rfqs,
             matched_rfq_id=rfq_id,
             pending_clarification=context.pending_clarification,
+            input_origin="operator",
         )
 
         if not validation.is_valid:

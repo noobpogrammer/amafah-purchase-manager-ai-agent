@@ -163,10 +163,14 @@ class TestWebhookIdempotencyIntegration:
             },
         }
 
+        mock_quote = {"id": "q-1", "rfq_id": RFQ_UUID, "supplier_id": SUPPLIER_UUID, "price": 68.0, "is_available": True}
+
         with patch("db.get_client_by_instance", return_value=mock_client), \
              patch("db.get_supplier_by_phone", return_value=mock_supplier), \
              patch("db.get_rfq_supplier_by_sent_message_id", return_value=matched_rfq_supplier), \
-             patch("db.get_supplier_prior_quotes", return_value=[]), \
+             patch("db.get_supplier_prior_quotes", return_value=[mock_quote]), \
+             patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]), \
              patch("db.get_competitive_pricing_context", return_value={"has_competition": True, "competing_quotes_count": 1, "best_competing_price": 55.0}), \
              patch("db.get_negotiation_attempts", return_value=0), \
              patch("db.get_pending_clarification_for_supplier", return_value=None), \
@@ -179,7 +183,9 @@ class TestWebhookIdempotencyIntegration:
                  "tool_name": "negotiate_price",
                  "arguments": {
                      "rfq_id": RFQ_UUID,
+                     "quote_id": "q-1",
                      "quoted_price": 68.0,
+                     "counter_price": 60.0,
                      "negotiation_message": "Could you do 60 AED?",
                  },
              }):

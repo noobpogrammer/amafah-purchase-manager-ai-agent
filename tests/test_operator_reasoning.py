@@ -369,16 +369,22 @@ class TestQuoteProvenanceAndNegotiation:
         """37-40. Operator can request negotiation below cap, but validator blocks attempts >= 3."""
         proposal = ActionProposal(
             tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quoted_price": 50.0, "negotiation_message": "Can you offer 48 AED?"},
+            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 50.0, "counter_price": 48.0, "negotiation_message": "Can you offer 48 AED?"},
         )
+        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "s-1", "price": 50.0, "is_available": True}
         # Case A: Below cap (2/3 attempts) -> PASS
         with patch("db.get_negotiation_attempts", return_value=2), \
-             patch("db.is_rfq_open", return_value=True):
+             patch("db.is_rfq_open", return_value=True), \
+             patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
             val = validate_action(proposal, client_id="c-1", supplier_id="s-1", matched_rfq_id="rfq-1", context_rfqs=[{"rfqs": {"id": "rfq-1", "status": "active"}}])
             assert val.is_valid is True
 
         # Case B: At cap (3/3 attempts) -> REJECT
-        with patch("db.get_negotiation_attempts", return_value=3):
+        with patch("db.get_negotiation_attempts", return_value=3), \
+             patch("db.is_rfq_open", return_value=True), \
+             patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
             val = validate_action(proposal, client_id="c-1", supplier_id="s-1", matched_rfq_id="rfq-1", context_rfqs=[{"rfqs": {"id": "rfq-1", "status": "active"}}])
             assert val.is_valid is False
             assert "Negotiation attempt limit reached" in val.reason

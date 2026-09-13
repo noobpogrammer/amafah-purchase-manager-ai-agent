@@ -638,23 +638,21 @@ class TestExecutionConsolidation:
             mock_enq.assert_called_once_with("+971501", main.THANK_YOU_MSG, rfq_id="rfq-1", supplier_id="s-1", message_log_id="log-1")
 
     def test_22_negotiate_price_execution(self):
-        """22. execute_validated_action executes negotiate_price, records quote, increments attempts, and dispatches negotiation message."""
+        """22. execute_validated_action executes negotiate_price, increments attempts, and dispatches negotiation message."""
         context = AgentContext(client_id="c-1", supplier_id="s-1")
         val = ValidationResult(
             is_valid=True,
             action="negotiate_price",
             category=ActionCategory.PROPOSE_COMMUNICATE,
-            sanitized_args={"rfq_id": "rfq-1", "quoted_price": 60.0, "negotiation_message": "Could you do 55 AED?"},
+            sanitized_args={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 60.0, "counter_price": 55.0, "negotiation_message": "Could you do 55 AED?"},
         )
-        with patch("db.record_quote") as mock_rec, \
-             patch("db.increment_negotiation_attempts", return_value=1) as mock_inc, \
+        with patch("db.increment_negotiation_attempts", return_value=1) as mock_inc, \
              patch("db.log_message", return_value="log-1") as mock_log, \
              patch("main.enqueue_message", new_callable=AsyncMock) as mock_enq:
 
             res = asyncio.run(main.execute_validated_action(val, context, "60 AED", {"id": "s-1", "phone_number": "+971501"}, "c-1"))
             assert res["status"] == "negotiation_sent"
             assert res["attempts"] == 1
-            mock_rec.assert_called_once()
             mock_inc.assert_called_once_with("rfq-1", "s-1")
             mock_log.assert_called_once_with("c-1", "s-1", "outbound", "Could you do 55 AED?", related_rfq_id="rfq-1")
             mock_enq.assert_called_once_with("+971501", "Could you do 55 AED?", rfq_id="rfq-1", supplier_id="s-1", message_log_id="log-1")

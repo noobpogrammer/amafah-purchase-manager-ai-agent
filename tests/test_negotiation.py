@@ -215,7 +215,7 @@ class TestPolicyValidator:
     def test_negotiation_action_requires_exact_rfq_and_supplier(self, mock_supabase):
         proposal = ActionProposal(
             tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quoted_price": 65.0, "negotiation_message": "Could you do AED 60?"},
+            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 65.0, "counter_price": 60.0, "negotiation_message": "Could you do AED 60?"},
         )
         context_rfq = {
             "rfqs": {
@@ -226,15 +226,20 @@ class TestPolicyValidator:
             },
             "supplier_id": "sup-1",
         }
-        res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-        assert res.is_valid is True
-        assert res.action == "negotiate_price"
-        assert res.sanitized_args["quoted_price"] == 65.0
+        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 65.0, "is_available": True}
+        with patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
+            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
+            assert res.is_valid is True
+            assert res.action == "negotiate_price"
+            assert res.sanitized_args["quoted_price"] == 65.0
+            assert res.sanitized_args["counter_price"] == 60.0
+            assert res.sanitized_args["quote_id"] == "q-1"
 
     def test_negotiation_blocked_for_cross_tenant(self, mock_supabase):
         proposal = ActionProposal(
             tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quoted_price": 65.0, "negotiation_message": "Can you offer AED 60?"},
+            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 65.0, "counter_price": 60.0, "negotiation_message": "Can you offer AED 60?"},
         )
         context_rfq = {
             "rfqs": {
@@ -245,14 +250,17 @@ class TestPolicyValidator:
             },
             "supplier_id": "sup-1",
         }
-        res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-        assert res.is_valid is False
-        assert "Cross-tenant violation" in res.reason
+        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 65.0, "is_available": True}
+        with patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
+            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
+            assert res.is_valid is False
+            assert "Cross-tenant violation" in res.reason
 
     def test_negotiation_blocked_after_deadline(self):
         proposal = ActionProposal(
             tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quoted_price": 65.0, "negotiation_message": "Can you offer AED 60?"},
+            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 65.0, "counter_price": 60.0, "negotiation_message": "Can you offer AED 60?"},
         )
         context_rfq = {
             "rfqs": {
@@ -263,14 +271,17 @@ class TestPolicyValidator:
             },
             "supplier_id": "sup-1",
         }
-        res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-        assert res.is_valid is False
-        assert "closed or deadline has passed" in res.reason
+        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 65.0, "is_available": True}
+        with patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
+            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
+            assert res.is_valid is False
+            assert "closed or deadline has passed" in res.reason
 
     def test_negotiation_blocked_for_closed_rfq(self):
         proposal = ActionProposal(
             tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quoted_price": 65.0, "negotiation_message": "Can you offer AED 60?"},
+            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 65.0, "counter_price": 60.0, "negotiation_message": "Can you offer AED 60?"},
         )
         context_rfq = {
             "rfqs": {
@@ -281,9 +292,12 @@ class TestPolicyValidator:
             },
             "supplier_id": "sup-1",
         }
-        res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-        assert res.is_valid is False
-        assert "closed or deadline has passed" in res.reason
+        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 65.0, "is_available": True}
+        with patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
+            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
+            assert res.is_valid is False
+            assert "closed or deadline has passed" in res.reason
 
     def test_high_risk_actions_blocked_regardless_of_confidence(self):
         for hr_tool in ("close_rfq", "accept_quote", "generate_ranking", "save_ranking", "delete_quote"):
@@ -306,10 +320,13 @@ class TestNegotiationLimits:
         attempts = db.get_negotiation_attempts("rfq-1", "sup-1")
         assert attempts == 2
 
-        with patch("db.get_negotiation_attempts", return_value=3):
+        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 75.0, "is_available": True}
+        with patch("db.get_negotiation_attempts", return_value=3), \
+             patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
             proposal = ActionProposal(
                 tool_name="negotiate_price",
-                arguments={"rfq_id": "rfq-1", "quoted_price": 75.0, "negotiation_message": "Please reduce your price."},
+                arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 75.0, "counter_price": 70.0, "negotiation_message": "Please reduce your price."},
             )
             context_rfq = {
                 "rfqs": {
@@ -368,7 +385,7 @@ class TestDeadlineBehavior:
     def test_negotiation_fails_after_deadline(self):
         proposal = ActionProposal(
             tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quoted_price": 65.0, "negotiation_message": "Discount please"},
+            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 65.0, "counter_price": 60.0, "negotiation_message": "Discount please"},
         )
         context_rfq = {
             "rfqs": {
@@ -379,9 +396,12 @@ class TestDeadlineBehavior:
             },
             "supplier_id": "sup-1",
         }
-        res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-        assert res.is_valid is False
-        assert "closed or deadline has passed" in res.reason
+        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 65.0, "is_available": True}
+        with patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
+            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
+            assert res.is_valid is False
+            assert "closed or deadline has passed" in res.reason
 
 
 # ==============================================================================
@@ -424,11 +444,14 @@ class TestWebhookNegotiationIntegration:
                 "due_by": (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(),
             },
         }
+        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 68.0, "is_available": True}
 
         with patch("db.get_client_by_instance", return_value=mock_client_row), \
              patch("db.get_supplier_by_phone", return_value=mock_supplier_row), \
              patch("db.get_rfq_supplier_by_sent_message_id", return_value=mock_rfq_supplier), \
-             patch("db.get_supplier_prior_quotes", return_value=[]), \
+             patch("db.get_supplier_prior_quotes", return_value=[mock_quote]), \
+             patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]), \
              patch("db.get_competitive_pricing_context", return_value={"has_competition": True, "competing_quotes_count": 1, "best_competing_price": 55.0}), \
              patch("db.get_negotiation_attempts", return_value=0), \
              patch("db.increment_negotiation_attempts", return_value=1) as mock_inc, \
@@ -439,7 +462,9 @@ class TestWebhookNegotiationIntegration:
                  "tool_name": "negotiate_price",
                  "arguments": {
                      "rfq_id": "rfq-1",
+                     "quote_id": "q-1",
                      "quoted_price": 68.0,
+                     "counter_price": 60.0,
                      "negotiation_message": "Thank you. Could you consider revising closer to AED 60 per unit?",
                      "delivery_time": "2 days",
                  },
@@ -448,7 +473,6 @@ class TestWebhookNegotiationIntegration:
             assert resp.status_code == 200
             assert resp.json()["status"] == "negotiation_sent"
             assert resp.json()["attempts"] == 1
-            mock_rec.assert_called_once()
             mock_inc.assert_called_once_with("rfq-1", "sup-1")
             mock_enq.assert_called_once()
             assert "Thank you. Could you consider revising closer to AED 60" in mock_enq.call_args[0][1]
@@ -490,10 +514,14 @@ class TestWebhookNegotiationIntegration:
             },
         }
 
+        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 68.0, "is_available": True}
+
         with patch("db.get_client_by_instance", return_value=mock_client_row), \
              patch("db.get_supplier_by_phone", return_value=mock_supplier_row), \
              patch("db.get_rfq_supplier_by_sent_message_id", return_value=mock_rfq_supplier), \
-             patch("db.get_supplier_prior_quotes", return_value=[]), \
+             patch("db.get_supplier_prior_quotes", return_value=[mock_quote]), \
+             patch("db.get_quote_by_id", return_value=mock_quote), \
+             patch("db.get_quotes_for_rfq", return_value=[mock_quote]), \
              patch("db.get_competitive_pricing_context", return_value={"has_competition": True, "competing_quotes_count": 1, "best_competing_price": 55.0}), \
              patch("db.get_negotiation_attempts", return_value=2), \
              patch("db.increment_negotiation_attempts", return_value=-1) as mock_inc, \
@@ -504,15 +532,15 @@ class TestWebhookNegotiationIntegration:
                  "tool_name": "negotiate_price",
                  "arguments": {
                      "rfq_id": "rfq-1",
+                     "quote_id": "q-1",
                      "quoted_price": 68.0,
+                     "counter_price": 60.0,
                      "negotiation_message": "Counter-offer message that should be suppressed",
                  },
              }):
             resp = client.post("/webhook/whatsapp", json=payload)
             assert resp.status_code == 200
             assert resp.json()["status"] == "rejected_by_policy"
-            # Quote was still safely recorded
-            mock_rec.assert_called_once()
             mock_inc.assert_called_once_with("rfq-1", "sup-1")
             # Counteroffer was NOT enqueued; THANK_YOU_MSG was enqueued instead
             mock_enq.assert_called_once()

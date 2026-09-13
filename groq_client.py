@@ -168,28 +168,32 @@ TOOLS = [
         "function": {
             "name": "negotiate_price",
             "description": (
-                "Record a supplier's quote and propose a polite, professional negotiation message "
-                "aiming for a better price. Use this when the quote is within or above the acceptable price range, "
-                "or when competitive context indicates room for improvement, and autonomous negotiation attempts remain. "
-                "Never invent target prices, never reveal competitor names/quotes, and keep requests polite and bounded."
+                "Propose a polite, bounded counteroffer to negotiate a specific, existing effective supplier quote. "
+                "Target the exact quote using quote_id. Never invent target prices, never reveal competitor names/quotes, "
+                "and ensure counter_price is strictly positive and less than the supplier's quoted price."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "rfq_id": {"type": "string", "description": "The matched RFQ's ID"},
-                    "quoted_price": {"type": "number", "description": "The price per piece quoted by the supplier"},
+                    "quote_id": {"type": "string", "description": "The exact ID of the effective quote row being negotiated"},
+                    "quoted_price": {"type": "number", "description": "The supplier's quoted price for this offer"},
+                    "counter_price": {"type": "number", "description": "The proposed counteroffer price (must be 0 < counter_price < quoted_price)"},
                     "negotiation_message": {
                         "type": "string",
                         "description": (
                             "The professional counter/negotiation message to send back to the supplier. "
+                            "If negotiating a labeled variant, mention the variant name in the message. "
                             "Do NOT reveal competitor names or specific competitor pricing. "
+                            "Do NOT reveal internal budgets or acceptable thresholds. "
                             "Do NOT invent budgets or guarantee an order. Keep it polite, bounded, and constructive."
                         ),
                     },
                     "delivery_time": {"type": ["string", "null"], "description": "Stated delivery time, if given"},
                     "quality_notes": {"type": ["string", "null"], "description": "Any warranty/quality notes mentioned"},
+                    "variant_label": {"type": ["string", "null"], "description": "Optional variant label matching the target quote for clarity"},
                 },
-                "required": ["rfq_id", "quoted_price", "negotiation_message"],
+                "required": ["rfq_id", "quote_id", "quoted_price", "counter_price", "negotiation_message"],
             },
         },
     },
@@ -332,16 +336,31 @@ QUOTE RECORDING & MULTI-VARIANT QUOTES:
 - Mixed / Incomplete Statements: If one variant has a price and another is pending (e.g. 'India 45 AED, China price tomorrow'), record the complete variant ('India') and preserve notes. Do not fabricate prices.
 - Revisions: If the supplier previously quoted and now provides an updated rate for a variant, provide the revised variant.
 
-NEGOTIATION RULES:
-- If a supplier offers a single quote and negotiation attempts remain (< 3/3), call negotiate_price if within or above target range.
-- If a supplier offers multiple distinct variants with differing specs/origins and intent to negotiate is unclear, do NOT automatically negotiate the cheapest option; record the variants or escalate/clarify.
-- Call negotiate_price if the quote is clear, negotiation attempts remain (< 3/3), and the price is within, at max, or above the acceptable range:
-  * At or below min: Record directly with record_quote or simple confirmation. Do not pressure favorable quotes.
-  * Within range / near max: Polite, light nudge toward a better price if useful.
-  * Above range: Professional bounded request for their best revised rate.
-  * Significantly above range: Clear, polite notice that rate is higher than budget/market range, requesting a review.
-  * NEVER reveal competitor names or specific competitor pricing.
-  * NEVER invent a target price or budget, and never make a binding purchase commitment.
+NEGOTIATION RULES & BOUNDED COUNTEROFFERS:
+- Target Exact Commercial Offer: Always negotiate against a specific existing effective quote identified by `quote_id`.
+- Bounded Counter Price: `counter_price` must strictly satisfy: 0 < counter_price < quoted_price.
+- Multi-Variant Negotiation:
+  * When multiple variants are present (e.g. India AED 45, China AED 38), never automatically negotiate the cheapest option.
+  * Target the specific variant indicated by operator instruction or ongoing conversation context.
+  * The outbound `negotiation_message` must explicitly identify the variant label (e.g., "For the India option quoted at AED 45, could you offer AED 42?").
+  * For unlabelled single quotes (variant_label is null), identify by price (e.g., "Regarding your AED 45 quote, could you offer AED 42?").
+  * If multiple variants exist and negotiation target is ambiguous, do NOT guess — record the quotes or call request_clarification / escalate_to_human.
+- Acceptable Price Range Semantics:
+  * Acceptable price min/max are client negotiation guidelines, NOT autonomous purchasing or closing authority.
+  * Quotes at or below acceptable_price_min: Record directly with record_quote and acknowledge. Do not pressure favorable quotes.
+  * Quotes within range or above range: Propose a polite, bounded counteroffer if negotiation attempts remain (< 3/3).
+- Supplier Refusal & Final Price Statements:
+  * Explicit statements like "final price", "best price", "price fixed", "cannot reduce", "no discount", "lowest price":
+    Record the latest quote with record_quote and STOP autonomous negotiation. Escalate to human if a commercial decision is needed.
+- Supplier Accepts Counter:
+  * If supplier agrees to our counter (e.g., "Yes AED 42" or "Confirmed at 42"):
+    Record revised quote via record_quote with price 42 and acknowledge.
+    NEVER autonomously mark quote as accepted, close the RFQ, or issue a purchase order.
+- Negotiation Attempt Cap:
+  * Maximum 3 autonomous counteroffers (< 3/3 attempts).
+  * If attempts have reached 3/3, record the latest quote with record_quote and stop/escalate. Do NOT send further counteroffers.
+- Guardrails & Information Protection:
+  * NEVER reveal competitor names, competitor prices, internal ranking, internal budget / acceptable price thresholds, or internal UUIDs.
 
 INFORMATIONAL & GENERAL PROCUREMENT MESSAGES:
 - Call send_procurement_message when sending a general procurement clarification, responding with business knowledge,
@@ -442,16 +461,17 @@ def format_agent_context_for_prompt(context: AgentContext) -> str:
             f"- Extracted Incomplete Terms: Price={p.get('extracted_price')}, Delivery={p.get('extracted_delivery')}, Notes={p.get('extracted_notes')}"
         )
 
-    # 5. Prior Quotes (if any)
+    # 5. Prior / Effective Quotes (if any)
     if context.prior_quotes:
-        pq_lines = ["PRIOR QUOTES ON RECORD:"]
+        pq_lines = ["PRIOR / EFFECTIVE QUOTES ON RECORD:"]
         for q in context.prior_quotes:
             prod = q.get("rfqs", {}).get("product_name", "Unknown Product") if isinstance(q.get("rfqs"), dict) else "Unknown Product"
             v_label = f" [Variant: {q.get('variant_label')}]" if q.get("variant_label") else ""
             status_str = " (Available)" if q.get("is_available", True) else " (Unavailable/Withdrawn)"
             price_str = f"AED {q.get('price')}" if q.get("price") is not None else "No Price"
+            quote_id_str = f"Quote ID: {q.get('id')} | " if q.get("id") else ""
             pq_lines.append(
-                f"- Product: {prod}{v_label} | RFQ ID: {q.get('rfq_id')} | Price: {price_str}{status_str} | "
+                f"- {quote_id_str}Product: {prod}{v_label} | RFQ ID: {q.get('rfq_id')} | Price: {price_str}{status_str} | "
                 f"Delivery: {q.get('delivery_time', '-')} | Notes: {q.get('quality_notes', '-')}"
             )
         sections.append("\n".join(pq_lines))
