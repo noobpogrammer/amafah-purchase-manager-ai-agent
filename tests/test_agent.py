@@ -1046,6 +1046,7 @@ class TestRFQCreationValidation:
             deadline_hours=12,
             specs=None,
             quantity=99,
+            last_quote=25.0,
         )
         mock_log.assert_called_once()
         mock_enqueue.assert_called_once()

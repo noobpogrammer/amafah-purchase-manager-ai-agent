@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import * as XLSX from 'xlsx';
-import { Send, CheckCircle, AlertTriangle, ArrowRight, Tag, Clock, Package, FileText, Plus, Upload } from 'lucide-react';
+import { Send, CheckCircle, AlertTriangle, ArrowRight, Tag, Clock, Package, FileText, Upload } from 'lucide-react';
 import { createRFQ, fetchCategories, createCustomCategory, bulkCreateRFQs } from '../api';
 // client_id is derived server-side from authenticated user; do not import DEMO_CLIENT_ID
 
@@ -247,7 +247,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
     setBulkRows((prev) => prev.map((row) => {
       if (row.id !== id) return row;
       const copy = { ...row };
-      if (field === 'quantity' || field === 'deadline_hours') {
+      if (field === 'quantity' || field === 'deadline_hours' || field === 'last_quote') {
         const n = value === '' || value === null ? null : Number(String(value).replace(/[^0-9.-]/g, ''));
         copy[field] = Number.isFinite(n) ? n : null;
       } else {
@@ -280,6 +280,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
       category: row.category,
       deadline_hours: row.deadline_hours,
       specs: row.specs,
+      last_quote: row.last_quote,
     }));
     formData.append('row_updates', JSON.stringify(rowUpdates));
 
@@ -485,6 +486,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
             </form>
           ) : (
             <div>
+              {errorMsg && <div className="error-alert">{errorMsg}</div>}
               <div className="form-group">
                 <label className="form-label flex-items">
                   <Upload size={16} /> Upload Material Requisition (.csv)

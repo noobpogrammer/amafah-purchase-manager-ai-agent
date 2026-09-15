@@ -306,6 +306,9 @@ export default function RFQDetailView({
                     <h3 className="rfq-product-title">{detailData.rfq.product_name}</h3>
                     <p className="rfq-specs-text">
                       Specs: <strong>{detailData.rfq.specs || 'Standard'}</strong> | Quantity: <strong>{detailData.rfq.quantity || 'N/A'}</strong> | Deadline: <strong>{detailData.rfq.deadline_hours || 24} hours</strong>
+                      {detailData.rfq.last_quote && (
+                        <> | Last Quote: <strong>AED {detailData.rfq.last_quote}</strong> (Target: <strong>AED {detailData.rfq.last_quote}</strong>, Final Tolerance: Up to <strong>AED {Number(detailData.rfq.last_quote) + 2}</strong>)</>
+                      )}
                     </p>
                   </div>
 

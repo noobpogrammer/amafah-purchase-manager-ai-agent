@@ -57,6 +57,9 @@ create table rfqs (
     category            text not null,
     specs               text,
     quantity            integer,
+    last_quote          numeric(12, 2),
+    acceptable_price_min numeric(12, 2),
+    acceptable_price_max numeric(12, 2),
     status              text not null default 'active'
                             check (status in ('active', 'closed', 'cancelled')),
     deadline_hours      integer,

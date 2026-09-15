@@ -802,20 +802,36 @@ def validate_action(
         if sanitized_notes is not None and not isinstance(sanitized_notes, str):
             sanitized_notes = str(sanitized_notes)
 
+        sanitized_dict = {
+            "rfq_id": rfq_id,
+            "quote_id": quote_id,
+            "quoted_price": trusted_price,
+            "counter_price": counter_price,
+            "negotiation_message": neg_msg.strip(),
+            "variant_label": target_quote.get("variant_label"),
+            "delivery_time": sanitized_delivery,
+            "quality_notes": sanitized_notes,
+        }
+
+        # Attach trusted historical price context if last_quote is present on RFQ
+        rfq_last_quote = target_rfq.get("last_quote") if target_rfq else None
+        if rfq_last_quote is not None:
+            hist_ctx = db.build_historical_price_context(rfq_last_quote, trusted_price)
+            if hist_ctx:
+                sanitized_dict.update({
+                    "last_quote": hist_ctx["last_quote"],
+                    "preferred_target": hist_ctx["preferred_target"],
+                    "tolerance_aed": hist_ctx["tolerance_aed"],
+                    "tolerated_final_ceiling": hist_ctx["tolerated_final_ceiling"],
+                    "historical_difference_aed": hist_ctx["difference_aed"],
+                    "historical_difference_percent": hist_ctx["difference_percent"],
+                })
+
         return ValidationResult(
             is_valid=True,
             action=tool_name,
             category=ActionCategory.PROPOSE_COMMUNICATE,
-            sanitized_args={
-                "rfq_id": rfq_id,
-                "quote_id": quote_id,
-                "quoted_price": trusted_price,
-                "counter_price": counter_price,
-                "negotiation_message": neg_msg.strip(),
-                "variant_label": target_quote.get("variant_label"),
-                "delivery_time": sanitized_delivery,
-                "quality_notes": sanitized_notes,
-            },
+            sanitized_args=sanitized_dict,
         )
 
     # 7. Validate PROPOSE_COMMUNICATE: send_procurement_message

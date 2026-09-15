@@ -60,11 +60,11 @@ export async function fetchDashboardMetrics() {
   const activeRfqs = (rfqsRes.data || []).filter(r => r.status === 'active').length;
 
   return {
-    totalRfqs: rfqsRes.count || 0,
+    totalRfqs: rfqsRes.data?.length ?? rfqsRes.count ?? 0,
     activeRfqs,
-    totalSuppliers: suppliersRes.count || 0,
-    totalQuotes: quotesRes.count || 0,
-    pendingFlags: flagsRes.count || 0,
+    totalSuppliers: suppliersRes.data?.length ?? suppliersRes.count ?? 0,
+    totalQuotes: quotesRes.data?.length ?? quotesRes.count ?? 0,
+    pendingFlags: flagsRes.data?.length ?? flagsRes.count ?? 0,
     recentMessages: recentMessagesRes.data || [],
   };
 }

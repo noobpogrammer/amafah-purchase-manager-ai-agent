@@ -32,7 +32,7 @@ from auth import get_current_user
 import groq_client
 from groq_client import AgentContext
 import guardrails
-from policy_validator import ActionProposal, validate_action, ActionCategory, ValidationResult
+from policy_validator import ActionProposal, validate_action, ActionCategory, ValidationResult, MAX_NEGOTIATION_ATTEMPTS
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ class RFQCreateRequest(BaseModel):
             raise ValueError("'deadline_hours' must be a positive integer")
         return int(v)
 
-    @field_validator("acceptable_price_min", "acceptable_price_max")
+    @field_validator("acceptable_price_min", "acceptable_price_max", "last_quote")
     @classmethod
     def validate_price_bounds(cls, v: Optional[float], info: ValidationInfo) -> Optional[float]:
         if v is not None:
@@ -170,7 +170,14 @@ def normalize_requisition_row(row: dict, row_index: int) -> Optional[dict]:
         quantity = None
 
     try:
-        last_quote = float(str(last_quote_raw).replace(",", "")) if last_quote_raw not in (None, "") else None
+        if last_quote_raw not in (None, ""):
+            lq_val = float(str(last_quote_raw).replace(",", ""))
+            if math.isnan(lq_val) or math.isinf(lq_val) or lq_val <= 0:
+                last_quote = None
+            else:
+                last_quote = lq_val
+        else:
+            last_quote = None
     except (TypeError, ValueError):
         last_quote = None
 
@@ -843,6 +850,28 @@ app.add_middleware(
 )
 
 
+def is_supplier_final_price_statement(message: str) -> bool:
+    """Detects whether supplier explicitly stated their price is final, lowest, or non-negotiable."""
+    if not message:
+        return False
+    msg = message.lower().strip()
+    patterns = [
+        r"\bfinal\b",
+        r"\bfinal\s*price\b",
+        r"\bbest\s*price\b",
+        r"\blowest\s*(?:price|rate|is)?\b",
+        r"\bcannot\s*(?:reduce|discount|go\s*lower|go\s*below|decrease)\b",
+        r"\bcan't\s*(?:reduce|discount|go\s*lower|go\s*below|decrease)\b",
+        r"\bprice\s*fixed\b",
+        r"\bfixed\s*price\b",
+        r"\bno\s*(?:more\s*)?discount\b",
+        r"\bthat'?s\s*my\s*final\b",
+        r"\blast\s*price\b",
+        r"\bnon[\s-]*negotiable\b",
+    ]
+    return any(re.search(pat, msg) for pat in patterns)
+
+
 async def execute_validated_action(
     validation: ValidationResult,
     context: AgentContext,
@@ -852,11 +881,12 @@ async def execute_validated_action(
     decision_id: str = None,
 ) -> dict:
     """
-    Consolidated, deterministic action execution across all inbound message origins:
-    1. Executes DB mutations (quotes, clarification state, negotiation attempts, human escalation flags).
-    2. Logs outbound messages in message_log.
-    3. Enqueues outbound WhatsApp delivery through the paced queue.
-    4. Updates agent_decisions audit record with execution outcome and outbound message linkage.
+    Executes a policy-approved action deterministically:
+    - record_quote: records single/batch quote variants and evaluates historical last quote tolerance
+    - negotiate_price: records counteroffer and sends negotiation message within attempt limit
+    - request_clarification: creates/advances pending clarification
+    - send_procurement_message: sends safe informational message
+    - escalate_to_human: creates operator review flag
     """
     phone_number = supplier.get("phone_number")
     supplier_id = supplier["id"]
@@ -924,17 +954,146 @@ async def execute_validated_action(
                     candidate_rfq_ids=context.pending_clarification.get("pending_rfq_ids", []),
                 )
 
+            # Retrieve target RFQ for historical price evaluation
+            target_rfq = next((r.get("rfqs", r) for r in (context.open_rfqs or []) if str(r.get("rfqs", r).get("id")) == str(target_rfq_id)), None)
+            if not target_rfq and target_rfq_id:
+                try:
+                    target_rfq = db.get_rfq_by_id(target_rfq_id)
+                except Exception:
+                    pass
+
+            rfq_last_quote = target_rfq.get("last_quote") if isinstance(target_rfq, dict) else None
+            price_val = None
+            if variants and isinstance(variants, list) and len(variants) > 0:
+                for v in variants:
+                    if v.get("is_available", True) and v.get("price") is not None:
+                        try:
+                            pv = float(v.get("price"))
+                            if pv > 0:
+                                price_val = pv
+                                break
+                        except Exception:
+                            pass
+
+            hist_ctx = db.build_historical_price_context(rfq_last_quote, price_val) if (rfq_last_quote is not None and price_val is not None) else None
+            attempts_made = db.get_negotiation_attempts(target_rfq_id, supplier_id) if target_rfq_id else 0
+            if not isinstance(attempts_made, (int, float)):
+                attempts_made = 0
+
+            is_final = is_supplier_final_price_statement(raw_message) or bool(quote_raw and is_supplier_final_price_statement(quote_raw))
+
+            should_escalate_attention = False
+            escalation_reason = None
+
+            if hist_ctx and price_val is not None and context.input_origin != "operator":
+                # Supplier price is above the tolerated historical ceiling (last_quote + 2 AED)
+                if not hist_ctx["within_tolerance"]:
+                    supp_name = supplier.get("name") or "Supplier"
+                    prod_name = target_rfq.get("product_name") or "Product" if isinstance(target_rfq, dict) else "Product"
+                    var_label = variants[0].get("variant_label") if variants else None
+                    var_line = f"Variant:\n{var_label}\n\n" if var_label else ""
+                    diff_above_ceiling = round(price_val - hist_ctx["tolerated_final_ceiling"], 2)
+                    diff_from_target = round(price_val - hist_ctx["preferred_target"], 2)
+
+                    if is_final:
+                        should_escalate_attention = True
+                        escalation_reason = (
+                            f"Negotiation Requires Attention\n\n"
+                            f"Supplier:\n{supp_name}\n\n"
+                            f"Product:\n{prod_name}\n\n"
+                            f"{var_line}"
+                            f"Historical Last Quote:\nAED {hist_ctx['last_quote']}\n\n"
+                            f"Preferred Target:\nAED {hist_ctx['preferred_target']}\n\n"
+                            f"Tolerated Final Ceiling:\nAED {hist_ctx['tolerated_final_ceiling']}\n\n"
+                            f"Supplier Final Quote:\nAED {price_val}\n\n"
+                            f"Difference from Last Quote:\nAED +{diff_from_target}\n\n"
+                            f"Negotiation Attempts:\n{attempts_made}/3\n\n"
+                            f"Reason:\nSupplier stated AED {price_val} is their final price, which is AED {diff_above_ceiling} above the tolerated historical ceiling."
+                        )
+                    elif attempts_made >= MAX_NEGOTIATION_ATTEMPTS:
+                        should_escalate_attention = True
+                        escalation_reason = (
+                            f"Negotiation Requires Attention\n\n"
+                            f"Supplier:\n{supp_name}\n\n"
+                            f"Product:\n{prod_name}\n\n"
+                            f"{var_line}"
+                            f"Historical Last Quote:\nAED {hist_ctx['last_quote']}\n\n"
+                            f"Preferred Target:\nAED {hist_ctx['preferred_target']}\n\n"
+                            f"Tolerated Final Ceiling:\nAED {hist_ctx['tolerated_final_ceiling']}\n\n"
+                            f"Supplier Latest Quote:\nAED {price_val}\n\n"
+                            f"Difference from Last Quote:\nAED +{diff_from_target}\n\n"
+                            f"Negotiation Attempts:\n3/3\n\n"
+                            f"Reason:\nAutonomous negotiation limit reached (3/3) while supplier price AED {price_val} remains AED {diff_above_ceiling} above the tolerated historical ceiling."
+                        )
+
+            if should_escalate_attention and escalation_reason:
+                flag_res = db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=target_rfq_id,
+                    reason=escalation_reason,
+                    category="requires_business_knowledge",
+                    raw_message=raw_message,
+                )
+                flag_id = flag_res[0]["id"] if flag_res and len(flag_res) > 0 else None
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", HUMAN_ACK_MSG, related_rfq_id=target_rfq_id)
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log outbound message durably.")
+                await enqueue_message(phone_number, HUMAN_ACK_MSG, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+
+                if decision_id:
+                    updated_args = dict(args)
+                    if hist_ctx:
+                        updated_args.update({
+                            "last_quote": hist_ctx["last_quote"],
+                            "preferred_target": hist_ctx["preferred_target"],
+                            "tolerated_final_ceiling": hist_ctx["tolerated_final_ceiling"],
+                            "historical_difference_aed": hist_ctx["difference_aed"],
+                            "historical_difference_percent": hist_ctx["difference_percent"],
+                            "negotiation_attempt": attempts_made,
+                            "supplier_final_price_detected": is_final,
+                        })
+                    db.update_agent_decision(
+                        decision_id,
+                        validation_status="approved",
+                        execution_status="executed",
+                        outbound_message_id=msg_log_id,
+                        flag_id=flag_id,
+                        arguments=updated_args,
+                        executed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                return {
+                    "status": "escalated_to_human",
+                    "reason": escalation_reason,
+                    "category": "requires_business_knowledge",
+                    "rfq_id": target_rfq_id,
+                    "flag_id": flag_id,
+                }
+
+            # Normal quote acknowledgement (no escalation)
             msg_log_id = db.log_message(client_id, supplier_id, "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
             if not msg_log_id:
                 raise RuntimeError("Failed to log outbound thank-you message durably.")
             await enqueue_message(phone_number, THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
 
             if decision_id:
+                updated_args = dict(args)
+                if hist_ctx:
+                    updated_args.update({
+                        "last_quote": hist_ctx["last_quote"],
+                        "preferred_target": hist_ctx["preferred_target"],
+                        "tolerated_final_ceiling": hist_ctx["tolerated_final_ceiling"],
+                        "historical_difference_aed": hist_ctx["difference_aed"],
+                        "historical_difference_percent": hist_ctx["difference_percent"],
+                        "negotiation_attempt": attempts_made,
+                        "supplier_final_price_detected": is_final,
+                    })
                 db.update_agent_decision(
                     decision_id,
                     validation_status="approved",
                     execution_status="executed",
                     outbound_message_id=msg_log_id,
+                    arguments=updated_args,
                     executed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
@@ -997,11 +1156,15 @@ async def execute_validated_action(
             await enqueue_message(phone_number, neg_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
 
             if decision_id:
+                updated_args = dict(args)
+                updated_args["negotiation_attempt"] = attempts
+                updated_args["supplier_final_price_detected"] = False
                 db.update_agent_decision(
                     decision_id,
                     validation_status="approved",
                     execution_status="executed",
                     outbound_message_id=msg_log_id,
+                    arguments=updated_args,
                     executed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
@@ -1591,6 +1754,8 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
         "specs": req.specs,
         "quantity": req.quantity,
     }
+    if req.last_quote is not None:
+        create_kwargs["last_quote"] = req.last_quote
     if req.acceptable_price_min is not None:
         create_kwargs["acceptable_price_min"] = req.acceptable_price_min
     if req.acceptable_price_max is not None:
@@ -1665,7 +1830,7 @@ async def bulk_create_rfq_endpoint(
     if not isinstance(overrides, list):
         overrides = []
 
-    # Parse optional row-level updates (product_name, quantity, category, deadline_hours, specs, acceptable_price_min, acceptable_price_max)
+    # Parse optional row-level updates (product_name, quantity, category, deadline_hours, specs, acceptable_price_min, acceptable_price_max, last_quote)
     try:
         updates = json.loads(row_updates) if row_updates else []
     except json.JSONDecodeError:
@@ -1697,6 +1862,7 @@ async def bulk_create_rfq_endpoint(
         final_category = row_category
         final_min = acceptable_price_min
         final_max = acceptable_price_max
+        final_last_quote = None
 
         if row_update and isinstance(row_update, dict):
             if row_update.get("product_name") not in (None, ""):
@@ -1731,6 +1897,21 @@ async def bulk_create_rfq_endpoint(
                         final_max = pmax
                 except Exception:
                     pass
+            if row_update.get("last_quote") not in (None, ""):
+                try:
+                    plq = float(str(row_update.get("last_quote")).replace(",", ""))
+                    if not math.isnan(plq) and not math.isinf(plq) and plq > 0:
+                        final_last_quote = plq
+                except Exception:
+                    pass
+
+        if final_last_quote is None and row.get("last_quote") is not None:
+            try:
+                plq = float(str(row.get("last_quote")).replace(",", ""))
+                if not math.isnan(plq) and not math.isinf(plq) and plq > 0:
+                    final_last_quote = plq
+            except Exception:
+                pass
 
         if final_min is not None and final_max is not None and final_min > final_max:
             final_min, final_max = final_max, final_min
@@ -1758,6 +1939,8 @@ async def bulk_create_rfq_endpoint(
             "specs": final_specs,
             "quantity": final_quantity,
         }
+        if final_last_quote is not None:
+            create_kwargs["last_quote"] = final_last_quote
         if final_min is not None:
             create_kwargs["acceptable_price_min"] = final_min
         if final_max is not None:

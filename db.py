@@ -1046,9 +1046,45 @@ def increment_negotiation_attempts(rfq_id: str, supplier_id: str, max_attempts: 
     return -1
 
 
+def build_historical_price_context(last_quote: float = None, current_quote: float = None) -> dict:
+    """
+    Deterministically computes trusted historical price comparison metrics.
+    preferred_target = last_quote
+    tolerance_aed = 2.0
+    tolerated_final_ceiling = last_quote + 2.0
+    """
+    if last_quote is None or current_quote is None:
+        return None
+    try:
+        lq = float(last_quote)
+        cq = float(current_quote)
+        if math.isnan(lq) or math.isinf(lq) or lq <= 0 or math.isnan(cq) or math.isinf(cq) or cq <= 0:
+            return None
+        diff_aed = round(cq - lq, 2)
+        diff_pct = round(((cq - lq) / lq) * 100.0, 4) if lq > 0 else 0.0
+        tolerance_aed = 2.0
+        tolerated_ceiling = round(lq + tolerance_aed, 2)
+        within_tolerance = bool(cq <= tolerated_ceiling)
+        at_or_below_target = bool(cq <= lq)
+        return {
+            "last_quote": lq,
+            "current_quote": cq,
+            "difference_aed": diff_aed,
+            "difference_percent": diff_pct,
+            "preferred_target": lq,
+            "tolerance_aed": tolerance_aed,
+            "tolerated_final_ceiling": tolerated_ceiling,
+            "within_tolerance": within_tolerance,
+            "at_or_below_target": at_or_below_target,
+        }
+    except (ValueError, TypeError, ZeroDivisionError):
+        return None
+
+
 def create_rfq_and_match_suppliers(client_id: str, product_name: str, category: str,
                                    deadline_hours: int = 24, specs: str = None,
                                    quantity: int = None,
+                                   last_quote: float = None,
                                    acceptable_price_min: float = None,
                                    acceptable_price_max: float = None):
     """Creates a new RFQ row, queries matching active suppliers by category, and creates rfq_suppliers join records."""
@@ -1065,6 +1101,7 @@ def create_rfq_and_match_suppliers(client_id: str, product_name: str, category: 
         "due_by": due_by,
         "status": "active",
         "finalization_status": "pending",
+        "last_quote": last_quote,
         "acceptable_price_min": acceptable_price_min,
         "acceptable_price_max": acceptable_price_max,
     }
@@ -1956,8 +1993,9 @@ def get_rfq_activity(rfq_id: str, client_id: str) -> list[dict] | None:
                 variant_part = f" for '{args.get('variant_label')}'" if args.get("variant_label") else ""
                 quoted_part = f"AED {args.get('quoted_price')}" if args.get('quoted_price') is not None else "Quote"
                 counter_part = f"AED {args.get('counter_price')}" if args.get('counter_price') is not None else "Counter"
+                target_part = f" towards target AED {args.get('last_quote')}" if args.get("last_quote") is not None else ""
                 title = f"Negotiation Counteroffer to {supp_name}"
-                summary = f"Countered offer{variant_part} from {quoted_part} to {counter_part}."
+                summary = f"Countered offer{variant_part} from {quoted_part} to {counter_part}{target_part}."
                 status = exec_status
             elif tool == "request_clarification":
                 event_type = "clarification_requested"
