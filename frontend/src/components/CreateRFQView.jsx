@@ -478,7 +478,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
               </div>
 
               <div className="form-actions">
-                <button type="submit" className="btn btn-primary btn-lg" disabled={loading || !formHasRequiredFields}>
+                <button type="submit" className="btn btn-primary btn-lg" disabled={loading}>
                   <Send size={18} />
                   <span>{loading ? 'Matching Suppliers & Queuing...' : 'Submit & Match Suppliers'}</span>
                 </button>
