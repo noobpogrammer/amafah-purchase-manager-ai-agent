@@ -28,7 +28,7 @@ from starlette.concurrency import run_in_threadpool
 
 import db
 import logging
-from auth import get_current_user
+from auth import get_current_user, verify_jwt
 import groq_client
 from groq_client import AgentContext
 import guardrails
@@ -56,6 +56,10 @@ OUTBOUND_MIN_DELAY = float(os.getenv("OUTBOUND_MIN_DELAY", "3.0"))
 OUTBOUND_MAX_DELAY = float(os.getenv("OUTBOUND_MAX_DELAY", "8.0"))
 
 outbound_queue: asyncio.Queue = asyncio.Queue()
+
+
+class PasswordResetRequest(BaseModel):
+    password: str = Field(..., min_length=6, max_length=200)
 
 
 class RFQCreateRequest(BaseModel):
@@ -1738,6 +1742,63 @@ async def whatsapp_webhook(request: Request):
         if "decision_id" in locals() and decision_id:
             db.update_agent_decision(decision_id, execution_status="failed", execution_error=str(e))
         return {"status": "error_logged", "note": "internal error, logged for review"}
+
+
+@app.post("/auth/reset-password")
+async def reset_password(payload: PasswordResetRequest, request: Request):
+    """Update the authenticated user's password through Supabase Auth.
+
+    This is a server-side fallback for browsers that fail to send the direct
+    cross-origin PUT used by supabase-js. The caller's own access token is
+    verified and forwarded to Supabase; the service-role key is not used.
+    """
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    token = auth_header.split(None, 1)[1].strip()
+    claims = verify_jwt(token)
+    if not claims.get("sub"):
+        raise HTTPException(status_code=401, detail="Token missing sub claim")
+
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    public_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("VITE_SUPABASE_ANON_KEY")
+    if not supabase_url or not public_key:
+        raise HTTPException(status_code=500, detail="Supabase Auth is not configured")
+
+    def _update_password():
+        return requests.put(
+            f"{supabase_url}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": public_key,
+                "Content-Type": "application/json",
+            },
+            json={"password": payload.password},
+            timeout=15,
+        )
+
+    try:
+        response = await run_in_threadpool(_update_password)
+    except requests.RequestException as exc:
+        logger.exception("Supabase password update request failed")
+        raise HTTPException(status_code=502, detail="Could not reach authentication service") from exc
+
+    if response.status_code >= 400:
+        try:
+            error_body = response.json()
+        except ValueError:
+            error_body = {}
+        detail = (
+            error_body.get("msg")
+            or error_body.get("message")
+            or error_body.get("error_description")
+            or error_body.get("error")
+            or "Password update failed"
+        )
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    return {"status": "password_updated"}
 
 
 @app.post("/rfq/create")
