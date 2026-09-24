@@ -880,6 +880,9 @@ def get_suppliers_by_category(client_id: str, category: str) -> list:
     return res.data
 
 
+PRICE_TOLERANCE_AED = 3.0
+
+
 def classify_price_position(
     quote_price: float,
     acceptable_min: float = None,
@@ -887,13 +890,18 @@ def classify_price_position(
 ) -> str:
     """
     Deterministically classifies a supplier quote against the RFQ's negotiation price range.
+
+    The old percentage-based 1.15 threshold was intentionally removed because it
+    scales too aggressively with item price. The upper tolerance is now a fixed
+    AED 3.00.
+
     Returns:
       - 'NO_RANGE_SET' if neither boundary is provided
       - 'AT_OR_BELOW_MIN' if quote_price <= acceptable_min
       - 'AT_MAX' if quote_price == acceptable_max
       - 'WITHIN_ACCEPTABLE_RANGE' if acceptable_min < quote_price < acceptable_max
-      - 'ABOVE_ACCEPTABLE_RANGE' if max < quote_price <= max * 1.15
-      - 'SIGNIFICANTLY_ABOVE_RANGE' if quote_price > max * 1.15
+      - 'ABOVE_ACCEPTABLE_RANGE' if max < quote_price <= max + AED 3
+      - 'SIGNIFICANTLY_ABOVE_RANGE' if quote_price > max + AED 3
     """
     if quote_price is None:
         return "UNKNOWN"
@@ -917,17 +925,95 @@ def classify_price_position(
     if min_p is not None and max_p is not None and min_p < quote_p < max_p:
         return "WITHIN_ACCEPTABLE_RANGE"
     if max_p is not None:
-        if quote_p <= max_p * 1.15:
-            return "ABOVE_ACCEPTABLE_RANGE"
-        else:
-            return "SIGNIFICANTLY_ABOVE_RANGE"
+        return (
+            "ABOVE_ACCEPTABLE_RANGE"
+            if quote_p <= max_p + PRICE_TOLERANCE_AED
+            else "SIGNIFICANTLY_ABOVE_RANGE"
+        )
     if min_p is not None:
-        if quote_p <= min_p * 1.15:
-            return "ABOVE_ACCEPTABLE_RANGE"
-        else:
-            return "SIGNIFICANTLY_ABOVE_RANGE"
+        return (
+            "ABOVE_ACCEPTABLE_RANGE"
+            if quote_p <= min_p + PRICE_TOLERANCE_AED
+            else "SIGNIFICANTLY_ABOVE_RANGE"
+        )
 
     return "WITHIN_ACCEPTABLE_RANGE"
+
+
+def build_negotiation_price_context(
+    acceptable_min: float = None,
+    acceptable_max: float = None,
+    last_quote: float = None,
+    current_quote: float = None,
+    tolerance_aed: float = PRICE_TOLERANCE_AED,
+) -> dict | None:
+    """
+    Builds the deterministic price-policy context used after a quote is persisted.
+
+    Target priority:
+      1. acceptable_price_min — the optimum procurement target
+      2. historical last_quote — fallback when no acceptable minimum is configured
+      3. acceptable_price_max — final fallback target
+
+    Final tolerance ceiling:
+      - acceptable_price_max + tolerance_aed when max exists
+      - otherwise preferred_target + tolerance_aed
+
+    A quote above the preferred target should be negotiated toward the target while
+    attempts remain, even when the quote is already inside the broad acceptable range.
+    """
+    if current_quote is None:
+        return None
+
+    def _positive_float(value):
+        if value is None:
+            return None
+        try:
+            number = float(value)
+            if math.isnan(number) or math.isinf(number) or number <= 0:
+                return None
+            return number
+        except (TypeError, ValueError):
+            return None
+
+    current = _positive_float(current_quote)
+    min_p = _positive_float(acceptable_min)
+    max_p = _positive_float(acceptable_max)
+    last_p = _positive_float(last_quote)
+    tolerance = _positive_float(tolerance_aed) or PRICE_TOLERANCE_AED
+
+    if current is None:
+        return None
+
+    if min_p is not None:
+        preferred_target = min_p
+        target_source = "acceptable_price_min"
+    elif last_p is not None:
+        preferred_target = last_p
+        target_source = "last_quote"
+    elif max_p is not None:
+        preferred_target = max_p
+        target_source = "acceptable_price_max"
+    else:
+        return None
+
+    ceiling_base = max_p if max_p is not None else preferred_target
+    tolerated_final_ceiling = round(ceiling_base + tolerance, 2)
+
+    return {
+        "current_quote": current,
+        "acceptable_min": min_p,
+        "acceptable_max": max_p,
+        "last_quote": last_p,
+        "preferred_target": preferred_target,
+        "target_source": target_source,
+        "tolerance_aed": tolerance,
+        "tolerated_final_ceiling": tolerated_final_ceiling,
+        "within_tolerance": current <= tolerated_final_ceiling,
+        "at_or_below_target": current <= preferred_target,
+        "should_negotiate": current > preferred_target,
+        "price_position": classify_price_position(current, min_p, max_p),
+    }
 
 
 def get_competitive_pricing_context(rfq_id: str, current_supplier_id: str) -> dict:
@@ -1049,9 +1135,10 @@ def increment_negotiation_attempts(rfq_id: str, supplier_id: str, max_attempts: 
 def build_historical_price_context(last_quote: float = None, current_quote: float = None) -> dict:
     """
     Deterministically computes trusted historical price comparison metrics.
+    Used only as a historical fallback when no acceptable minimum is configured.
     preferred_target = last_quote
-    tolerance_aed = 2.0
-    tolerated_final_ceiling = last_quote + 2.0
+    tolerance_aed = AED 3.0
+    tolerated_final_ceiling = last_quote + AED 3.0
     """
     if last_quote is None or current_quote is None:
         return None
@@ -1062,7 +1149,7 @@ def build_historical_price_context(last_quote: float = None, current_quote: floa
             return None
         diff_aed = round(cq - lq, 2)
         diff_pct = round(((cq - lq) / lq) * 100.0, 4) if lq > 0 else 0.0
-        tolerance_aed = 2.0
+        tolerance_aed = PRICE_TOLERANCE_AED
         tolerated_ceiling = round(lq + tolerance_aed, 2)
         within_tolerance = bool(cq <= tolerated_ceiling)
         at_or_below_target = bool(cq <= lq)
