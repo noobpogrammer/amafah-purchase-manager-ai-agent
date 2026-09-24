@@ -930,9 +930,10 @@ async def execute_validated_action(
                 if existing_quotes and all_match:
                     should_record = False
 
+            persisted_quotes = []
             if should_record:
                 if len(variants) == 1 and variants[0].get("variant_label") is None and variants[0].get("is_available", True) is True:
-                    db.record_quote(
+                    persisted = db.record_quote(
                         rfq_id=target_rfq_id,
                         supplier_id=supplier_id,
                         price=variants[0].get("price"),
@@ -940,14 +941,21 @@ async def execute_validated_action(
                         quality_notes=variants[0].get("quality_notes"),
                         raw_message=quote_raw,
                     )
+                    if persisted:
+                        persisted_quotes = [persisted]
                 else:
-                    db.record_quotes_batch(
+                    persisted_quotes = db.record_quotes_batch(
                         rfq_id=target_rfq_id,
                         supplier_id=supplier_id,
                         variants=variants,
                         raw_message=quote_raw,
                         source_message_id=context.source_message_id,
-                    )
+                    ) or []
+            elif context.input_origin == "operator":
+                persisted_quotes = [
+                    q for q in context.prior_quotes
+                    if str(q.get("rfq_id")) == str(target_rfq_id)
+                ]
 
             # Resolve pending clarification if one was active for this supplier
             if context.pending_clarification:
@@ -985,6 +993,92 @@ async def execute_validated_action(
                 attempts_made = 0
 
             is_final = is_supplier_final_price_statement(raw_message) or bool(quote_raw and is_supplier_final_price_statement(quote_raw))
+
+            # Quote-first negotiation policy:
+            # Persist the supplier's factual quote first, then deterministically decide
+            # whether to negotiate. The acceptable minimum is the optimum target.
+            acceptable_min = target_rfq.get("acceptable_price_min") if isinstance(target_rfq, dict) else None
+            acceptable_max = target_rfq.get("acceptable_price_max") if isinstance(target_rfq, dict) else None
+            price_policy = db.build_negotiation_price_context(
+                acceptable_min=acceptable_min,
+                acceptable_max=acceptable_max,
+                last_quote=rfq_last_quote,
+                current_quote=price_val,
+            ) if price_val is not None else None
+
+            can_auto_negotiate = (
+                context.input_origin != "operator"
+                and price_policy
+                and price_policy.get("should_negotiate")
+                and not is_final
+                and attempts_made < MAX_NEGOTIATION_ATTEMPTS
+                and len(variants) == 1
+                and variants[0].get("is_available", True) is True
+                and variants[0].get("variant_label") is None
+            )
+
+            persisted_quote_id = None
+            if persisted_quotes:
+                persisted_quote_id = persisted_quotes[0].get("id")
+
+            if can_auto_negotiate and persisted_quote_id:
+                counter_price = float(price_policy["preferred_target"])
+                negotiation_message = (
+                    f"Thanks for the quote. Could you offer AED {counter_price:g} per piece?"
+                )
+
+                followup_proposal = ActionProposal(
+                    tool_name="negotiate_price",
+                    arguments={
+                        "rfq_id": target_rfq_id,
+                        "quote_id": str(persisted_quote_id),
+                        "quoted_price": float(price_val),
+                        "counter_price": counter_price,
+                        "negotiation_message": negotiation_message,
+                        "delivery_time": variants[0].get("delivery_time"),
+                        "quality_notes": variants[0].get("quality_notes"),
+                        "variant_label": None,
+                    },
+                    raw_message=raw_message,
+                )
+                followup_validation = validate_action(
+                    followup_proposal,
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    context_rfqs=context.open_rfqs,
+                    matched_rfq_id=context.matched_rfq_id,
+                    pending_clarification=context.pending_clarification,
+                    input_origin="supplier",
+                )
+
+                if followup_validation.is_valid:
+                    followup_decision = db.record_agent_decision(
+                        client_id=client_id,
+                        origin="supplier",
+                        tool_name="negotiate_price",
+                        arguments=followup_validation.sanitized_args,
+                        validation_status="approved",
+                        validation_reason="Deterministic post-persist negotiation toward optimum acceptable price.",
+                        execution_status="pending",
+                        rfq_id=target_rfq_id,
+                        supplier_id=supplier_id,
+                        inbound_message_id=context.source_message_id,
+                    )
+                    followup_decision_id = followup_decision.get("id") if followup_decision else None
+                    return await execute_validated_action(
+                        followup_validation,
+                        context,
+                        raw_message,
+                        supplier,
+                        client_id,
+                        decision_id=followup_decision_id,
+                    )
+
+                logger.warning(
+                    "Post-persist negotiation rejected for RFQ %s: %s",
+                    target_rfq_id,
+                    followup_validation.reason,
+                )
 
             should_escalate_attention = False
             escalation_reason = None
