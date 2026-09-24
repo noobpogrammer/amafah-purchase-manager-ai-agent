@@ -1463,8 +1463,29 @@ async def whatsapp_webhook(request: Request):
 
         msg_key_id = key_data.get("id")
 
-        raw_remote_jid = key_data.get("remoteJid", "")
-        sender_phone = normalize_phone(raw_remote_jid)
+        raw_remote_jid = str(key_data.get("remoteJid") or "")
+        remote_jid_alt = str(
+            key_data.get("remoteJidAlt")
+            or key_data.get("participantAlt")
+            or ""
+        )
+
+        # Group chats are unrelated to supplier RFQ conversations. Ignoring them
+        # here prevents group JIDs (e.g. 1203...@g.us) from being treated as
+        # supplier phone numbers and flooding webhook_errors.
+        if raw_remote_jid.endswith("@g.us"):
+            return {"status": "ignored", "reason": "group chat message"}
+
+        # Newer WhatsApp/Evolution payloads may use an opaque LID as remoteJid
+        # and expose the actual phone JID in remoteJidAlt. Prefer the phone JID
+        # for supplier matching, falling back to participantAlt when available.
+        sender_jid = raw_remote_jid
+        if raw_remote_jid.endswith("@lid"):
+            sender_jid = remote_jid_alt or raw_remote_jid
+        elif not sender_jid and remote_jid_alt:
+            sender_jid = remote_jid_alt
+
+        sender_phone = normalize_phone(sender_jid)
         message_text = (
             data.get("message", {}).get("conversation", "")
             or data.get("message", {}).get("extendedTextMessage", {}).get("text", "")
@@ -1515,7 +1536,7 @@ async def whatsapp_webhook(request: Request):
         # Look up supplier scoped strictly to this client
         supplier = db.get_supplier_by_phone(client_id, sender_phone)
         if not supplier:
-            err_msg = f"Unknown supplier: sender_phone='{sender_phone}' (raw remoteJid='{raw_remote_jid}') not found for client '{client.get('name')}' (id={client_id}, instance='{instance_name}')."
+            err_msg = f"Unknown supplier: sender_phone='{sender_phone}' (raw remoteJid='{raw_remote_jid}', resolved senderJid='{sender_jid}') not found for client '{client.get('name')}' (id={client_id}, instance='{instance_name}')."
             db.log_webhook_error(
                 error_message=err_msg,
                 traceback_str=f"Unmatched incoming WhatsApp message from sender_phone='{sender_phone}' for client {client_id}. Message: {message_text[:500]}",
