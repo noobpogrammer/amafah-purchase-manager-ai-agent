@@ -132,12 +132,36 @@ class TestNegotiationPriceLogic:
         assert db.classify_price_position(60.0, 50.0, 60.0) == "AT_MAX"
 
     def test_classify_above_acceptable_range(self):
-        # 65 is above 60 but within 60 * 1.15 = 69
-        assert db.classify_price_position(65.0, 50.0, 60.0) == "ABOVE_ACCEPTABLE_RANGE"
+        # Fixed tolerance is AED 3: 62 is above 60 but within 63.
+        assert db.classify_price_position(62.0, 50.0, 60.0) == "ABOVE_ACCEPTABLE_RANGE"
 
     def test_classify_significantly_above_range(self):
-        # 75 is above 60 * 1.15 = 69
-        assert db.classify_price_position(75.0, 50.0, 60.0) == "SIGNIFICANTLY_ABOVE_RANGE"
+        # Fixed tolerance is AED 3: 64 is above the 63 ceiling.
+        assert db.classify_price_position(64.0, 50.0, 60.0) == "SIGNIFICANTLY_ABOVE_RANGE"
+
+    def test_negotiation_context_targets_acceptable_minimum(self):
+        ctx = db.build_negotiation_price_context(
+            acceptable_min=50.0,
+            acceptable_max=60.0,
+            last_quote=55.0,
+            current_quote=68.0,
+        )
+        assert ctx["preferred_target"] == 50.0
+        assert ctx["target_source"] == "acceptable_price_min"
+        assert ctx["tolerated_final_ceiling"] == 63.0
+        assert ctx["should_negotiate"] is True
+        assert ctx["price_position"] == "SIGNIFICANTLY_ABOVE_RANGE"
+
+    def test_negotiation_context_falls_back_to_last_quote_without_minimum(self):
+        ctx = db.build_negotiation_price_context(
+            acceptable_min=None,
+            acceptable_max=None,
+            last_quote=43.0,
+            current_quote=48.0,
+        )
+        assert ctx["preferred_target"] == 43.0
+        assert ctx["target_source"] == "last_quote"
+        assert ctx["tolerated_final_ceiling"] == 46.0
 
     def test_classify_no_range_set(self):
         assert db.classify_price_position(55.0, None, None) == "NO_RANGE_SET"
