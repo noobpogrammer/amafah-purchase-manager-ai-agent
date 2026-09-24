@@ -1052,6 +1052,23 @@ async def execute_validated_action(
                 )
 
                 if followup_validation.is_valid:
+                    if decision_id:
+                        db.update_agent_decision(
+                            decision_id,
+                            validation_status="approved",
+                            execution_status="executed",
+                            arguments={
+                                **dict(args),
+                                "quote_persisted_before_negotiation": True,
+                                "persisted_quote_id": str(persisted_quote_id),
+                                "price_position": price_policy.get("price_position"),
+                                "preferred_target": price_policy.get("preferred_target"),
+                                "target_source": price_policy.get("target_source"),
+                                "tolerated_final_ceiling": price_policy.get("tolerated_final_ceiling"),
+                            },
+                            executed_at=datetime.now(timezone.utc).isoformat(),
+                        )
+
                     followup_decision = db.record_agent_decision(
                         client_id=client_id,
                         origin="supplier",
