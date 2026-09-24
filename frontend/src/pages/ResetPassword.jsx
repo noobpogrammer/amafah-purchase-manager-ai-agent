@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { supabase } from '../supabaseClient';
+import { supabase, authorizedFetch } from '../supabaseClient';
 import AuthShell from '../components/AuthShell';
 
 export default function ResetPassword({ navigate }) {
@@ -17,10 +17,36 @@ export default function ResetPassword({ navigate }) {
     setLoading(true);
     setMessage(null);
     try {
-      const { error } = await supabase.auth.updateUser({ password });
-      if (error) setMessage({ type: 'error', text: error.message });
-      else {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (!sessionData?.session?.access_token) {
+        throw new Error('This reset link is invalid or has expired. Please request a new password reset link.');
+      }
+
+      let updateError = null;
+      try {
+        const { error } = await supabase.auth.updateUser({ password });
+        updateError = error;
+      } catch (directError) {
+        // Some browser/network combinations can complete the recovery session
+        // but fail before sending Supabase's cross-origin PUT /auth/v1/user.
+        // Fall back to the authenticated Railway backend, which forwards this
+        // user's own access token to Supabase Auth server-to-server.
+        const response = await authorizedFetch('/auth/reset-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password }),
+        });
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.detail || 'Failed to update password');
+        }
+      }
+
+      if (updateError) {
+        setMessage({ type: 'error', text: updateError.message });
+      } else {
         setMessage({ type: 'success', text: 'Password updated. You can now log in.' });
+        await supabase.auth.signOut();
         navigate('/login');
       }
     } catch (err) {
