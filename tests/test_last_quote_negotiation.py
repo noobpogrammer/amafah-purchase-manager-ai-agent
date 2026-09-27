@@ -183,7 +183,7 @@ class TestLastQuoteNegotiationPolicy:
         assert ctx["at_or_below_target"] is False
         assert ctx["within_tolerance"] is True
         assert ctx["preferred_target"] == 43.0
-        assert ctx["tolerated_final_ceiling"] == 45.0
+        assert ctx["tolerated_final_ceiling"] == 46.0
 
     def test_14_quote_45_non_final_at_tolerance_ceiling_target_remains_43(self):
         ctx = db.build_historical_price_context(last_quote=43.0, current_quote=45.0)
@@ -197,15 +197,16 @@ class TestLastQuoteNegotiationPolicy:
         assert math.isclose(ctx["difference_percent"], 11.6279, rel_tol=1e-3)
 
     def test_16_quote_48_inside_acceptable_range_still_negotiates_due_to_last_quote(self):
-        # Even if acceptable range is 40-50, quote 48 is above tolerance ceiling 45
+        # Even if acceptable range is 40-50, quote 48 is above tolerance ceiling 46
         ctx = db.build_historical_price_context(last_quote=43.0, current_quote=48.0)
         assert ctx["within_tolerance"] is False
         assert ctx["preferred_target"] == 43.0
 
-    def test_17_supplier_revises_48_to_46_still_above_tolerance_can_continue(self):
-        ctx = db.build_historical_price_context(last_quote=43.0, current_quote=46.0)
+    def test_17_supplier_revises_48_to_47_still_above_tolerance_can_continue(self):
+        ctx = db.build_historical_price_context(last_quote=43.0, current_quote=47.0)
         assert ctx["within_tolerance"] is False
-        assert ctx["tolerated_final_ceiling"] == 45.0
+        assert ctx["tolerated_final_ceiling"] == 46.0
+
 
     @pytest.mark.asyncio
     async def test_18_supplier_revises_48_to_45_final_stops_without_escalation(self, mock_supabase):
@@ -266,26 +267,26 @@ class TestLastQuoteNegotiationPolicy:
             mock_flag.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_21_supplier_says_46_final_escalates_to_agent_attention(self, mock_supabase):
+    async def test_21_supplier_says_47_final_escalates_to_agent_attention(self, mock_supabase):
         mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
         context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
         val = policy_validator.ValidationResult(
             is_valid=True,
             action="record_quote",
             category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 46.0, "variants": [{"price": 46.0, "variant_label": None}]},
+            sanitized_args={"rfq_id": RFQ_ID, "price": 47.0, "variants": [{"price": 47.0, "variant_label": None}]},
         )
         with patch.object(db, "record_quote"), \
              patch.object(db, "log_message", return_value="msg-1"), \
              patch("main.enqueue_message", new_callable=AsyncMock), \
              patch.object(db, "flag_for_human_review", return_value=[{"id": "flag-1"}]) as mock_flag:
-            res = await main.execute_validated_action(val, context, "AED 46 final", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
+            res = await main.execute_validated_action(val, context, "AED 47 final", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
             assert res["status"] == "escalated_to_human"
             mock_flag.assert_called_once()
             flag_args = mock_flag.call_args.kwargs
             assert "Historical Last Quote:\nAED 43.0" in flag_args["reason"]
-            assert "Tolerated Final Ceiling:\nAED 45.0" in flag_args["reason"]
-            assert "Supplier Final Quote:\nAED 46.0" in flag_args["reason"]
+            assert "Tolerated Final Ceiling:\nAED 46.0" in flag_args["reason"]
+            assert "Supplier Final Quote:\nAED 47.0" in flag_args["reason"]
 
     @pytest.mark.asyncio
     async def test_22_supplier_says_47_final_escalates_to_agent_attention(self, mock_supabase):
@@ -337,20 +338,20 @@ class TestLastQuoteNegotiationPolicy:
             mock_flag.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_25_supplier_says_cannot_go_below_46_escalation(self, mock_supabase):
+    async def test_25_supplier_says_cannot_go_below_47_escalation(self, mock_supabase):
         mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
         context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
         val = policy_validator.ValidationResult(
             is_valid=True,
             action="record_quote",
             category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 46.0, "variants": [{"price": 46.0, "variant_label": None}]},
+            sanitized_args={"rfq_id": RFQ_ID, "price": 47.0, "variants": [{"price": 47.0, "variant_label": None}]},
         )
         with patch.object(db, "record_quote"), \
              patch.object(db, "log_message", return_value="msg-1"), \
              patch("main.enqueue_message", new_callable=AsyncMock), \
              patch.object(db, "flag_for_human_review", return_value=[{"id": "flag-3"}]) as mock_flag:
-            res = await main.execute_validated_action(val, context, "Cannot go lower than 46 AED", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
+            res = await main.execute_validated_action(val, context, "Cannot go lower than 47 AED", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
             assert res["status"] == "escalated_to_human"
             mock_flag.assert_called_once()
 
@@ -375,23 +376,27 @@ class TestNegotiationAttempts:
             res = validate_action(proposal, client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
             assert res.is_valid is True
             assert res.sanitized_args["preferred_target"] == 43.0
-            assert res.sanitized_args["tolerated_final_ceiling"] == 45.0
+            assert res.sanitized_args["tolerated_final_ceiling"] == 46.0
 
     @pytest.mark.asyncio
-    async def test_27_attempt_3_reached_and_quote_46_creates_agent_attention(self, mock_supabase):
+    async def test_27_attempt_3_reached_and_quote_47_creates_agent_attention(self, mock_supabase):
         mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
         context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
         val = policy_validator.ValidationResult(
             is_valid=True,
             action="record_quote",
             category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 46.0, "variants": [{"price": 46.0, "variant_label": None}]},
+            sanitized_args={"rfq_id": RFQ_ID, "price": 47.0, "variants": [{"price": 47.0, "variant_label": None}]},
         )
         with patch.object(db, "record_quote"), \
              patch.object(db, "get_negotiation_attempts", return_value=3), \
              patch.object(db, "log_message", return_value="msg-1"), \
              patch("main.enqueue_message", new_callable=AsyncMock), \
              patch.object(db, "flag_for_human_review", return_value=[{"id": "flag-4"}]) as mock_flag:
+            res = await main.execute_validated_action(val, context, "I can offer 47", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
+            assert res["status"] == "escalated_to_human"
+            assert "Autonomous negotiation limit reached (3/3)" in mock_flag.call_args.kwargs["reason"]
+
             res = await main.execute_validated_action(val, context, "I can offer 46", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
             assert res["status"] == "escalated_to_human"
             assert "Autonomous negotiation limit reached (3/3)" in mock_flag.call_args.kwargs["reason"]
@@ -631,7 +636,7 @@ class TestNegotiationAuditTrail:
             assert len(updated_decisions) == 1
             assert updated_decisions[0][1]["flag_id"] == "flag-audit-1"
             assert updated_decisions[0][1]["arguments"]["last_quote"] == 43.0
-            assert updated_decisions[0][1]["arguments"]["tolerated_final_ceiling"] == 45.0
+            assert updated_decisions[0][1]["arguments"]["tolerated_final_ceiling"] == 46.0
 
     def test_46_no_chain_of_thought_stored_in_decision_args(self):
         raw_args = {

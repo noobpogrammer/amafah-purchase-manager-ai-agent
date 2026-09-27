@@ -14,7 +14,7 @@ import re
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import math
 import docx
@@ -230,6 +230,157 @@ async def enqueue_message(
     await outbound_queue.put((phone_number, message, rfq_id, supplier_id, message_log_id))
 
 
+def extract_evolution_message_ids(resp: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extracts canonical WhatsApp message ID (e.g. key.id) and any alternate ID from Evolution API response.
+    Returns (canonical_id, alt_id).
+    """
+    if not resp or not isinstance(resp, dict):
+        return None, None
+
+    candidate_ids = []
+
+    # Check key.id inside resp, response, data, messages[0]
+    for container in [resp, resp.get("response"), resp.get("data")]:
+        if isinstance(container, dict):
+            key = container.get("key")
+            if isinstance(key, dict):
+                k_id = key.get("id") or key.get("stanzaId")
+                if k_id:
+                    candidate_ids.append(str(k_id))
+
+    messages = resp.get("messages")
+    if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+        m_key = messages[0].get("key")
+        if isinstance(m_key, dict):
+            k_id = m_key.get("id")
+            if k_id:
+                candidate_ids.append(str(k_id))
+
+    # Check root fields
+    for field in ["messageId", "stanzaId", "keyId", "id"]:
+        val = resp.get(field)
+        if val and isinstance(val, (str, int)):
+            candidate_ids.append(str(val))
+
+    if not candidate_ids:
+        return None, None
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_ids = []
+    for cid in candidate_ids:
+        cid_str = cid.strip()
+        if cid_str and cid_str not in seen:
+            seen.add(cid_str)
+            unique_ids.append(cid_str)
+
+    if not unique_ids:
+        return None, None
+
+    canonical = unique_ids[0]
+    norm_canonical = db.normalize_message_id(canonical)
+
+    alt_id = None
+    if len(unique_ids) > 1:
+        alt_id = unique_ids[1]
+    elif norm_canonical and norm_canonical != canonical:
+        alt_id = canonical
+        canonical = norm_canonical
+    elif norm_canonical:
+        canonical = norm_canonical
+
+    return canonical, alt_id
+
+
+def extract_inbound_quoted_info(data: dict) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    Safely extracts (quoted_stanza_id, quoted_text, message_type) from inbound webhook data
+    without throwing on NoneType or unexpected nesting.
+    """
+    if not data or not isinstance(data, dict):
+        return None, None, "unknown"
+
+    msg_obj = data.get("message")
+    if not isinstance(msg_obj, dict):
+        msg_obj = {}
+
+    # Determine message type
+    message_type = "conversation"
+    if "extendedTextMessage" in msg_obj:
+        message_type = "extendedTextMessage"
+    elif "imageMessage" in msg_obj:
+        message_type = "imageMessage"
+    elif "documentMessage" in msg_obj:
+        message_type = "documentMessage"
+    elif "audioMessage" in msg_obj:
+        message_type = "audioMessage"
+    elif "buttonsResponseMessage" in msg_obj:
+        message_type = "buttonsResponseMessage"
+    elif "templateButtonReplyMessage" in msg_obj:
+        message_type = "templateButtonReplyMessage"
+    elif "interactiveResponseMessage" in msg_obj:
+        message_type = "interactiveResponseMessage"
+
+    # ContextInfo discovery across all potential locations
+    context_info = None
+    for loc in [
+        data.get("contextInfo"),
+        msg_obj.get("extendedTextMessage", {}).get("contextInfo") if isinstance(msg_obj.get("extendedTextMessage"), dict) else None,
+        msg_obj.get("contextInfo"),
+        msg_obj.get("imageMessage", {}).get("contextInfo") if isinstance(msg_obj.get("imageMessage"), dict) else None,
+        msg_obj.get("documentMessage", {}).get("contextInfo") if isinstance(msg_obj.get("documentMessage"), dict) else None,
+        msg_obj.get("audioMessage", {}).get("contextInfo") if isinstance(msg_obj.get("audioMessage"), dict) else None,
+        msg_obj.get("buttonsResponseMessage", {}).get("contextInfo") if isinstance(msg_obj.get("buttonsResponseMessage"), dict) else None,
+        msg_obj.get("templateButtonReplyMessage", {}).get("contextInfo") if isinstance(msg_obj.get("templateButtonReplyMessage"), dict) else None,
+        msg_obj.get("interactiveResponseMessage", {}).get("contextInfo") if isinstance(msg_obj.get("interactiveResponseMessage"), dict) else None,
+        data.get("messageContextInfo"),
+    ]:
+        if isinstance(loc, dict) and loc:
+            context_info = loc
+            break
+
+    quoted_stanza_id = None
+    quoted_text = None
+
+    if context_info:
+        quoted_stanza_id = context_info.get("stanzaId")
+        q_msg = context_info.get("quotedMessage")
+        if isinstance(q_msg, dict):
+            quoted_text = (
+                q_msg.get("conversation")
+                or (q_msg.get("extendedTextMessage", {}).get("text") if isinstance(q_msg.get("extendedTextMessage"), dict) else None)
+                or q_msg.get("text")
+            )
+
+    # Direct quoted object (some Evolution / Baileys webhook versions)
+    if not quoted_stanza_id:
+        quoted = data.get("quoted")
+        if isinstance(quoted, dict):
+            q_key = quoted.get("key")
+            if isinstance(q_key, dict):
+                quoted_stanza_id = q_key.get("id")
+            if not quoted_stanza_id:
+                quoted_stanza_id = quoted.get("stanzaId")
+            if not quoted_text:
+                q_sub_msg = quoted.get("message")
+                if isinstance(q_sub_msg, dict):
+                    quoted_text = q_sub_msg.get("conversation") or q_sub_msg.get("text")
+
+    if not quoted_stanza_id:
+        quoted_key = data.get("quotedKey")
+        if isinstance(quoted_key, dict):
+            quoted_stanza_id = quoted_key.get("id")
+
+    if quoted_stanza_id:
+        quoted_stanza_id = str(quoted_stanza_id).strip()
+
+    if quoted_text:
+        quoted_text = str(quoted_text)
+
+    return quoted_stanza_id, quoted_text, message_type
+
+
 async def outbound_worker():
     """Background worker that processes outbound WhatsApp messages one by one with randomized delay."""
     while True:
@@ -260,20 +411,33 @@ async def outbound_worker():
             try:
                 resp = await run_in_threadpool(send_whatsapp_message, phone_number, message)
                 
-                # Extract Evolution message ID safely
-                msg_id = None
-                if resp and isinstance(resp, dict):
-                    msg_id = resp.get("key", {}).get("id") or resp.get("id")
-                    if msg_id:
-                        msg_id = str(msg_id)
+                # Extract Evolution message IDs safely (canonical and alternate)
+                canonical_id, alt_id = extract_evolution_message_ids(resp)
 
                 # 2. Transition to 'sent'
                 if message_log_id:
-                    db.mark_message_sent(message_log_id, evolution_message_id=msg_id)
+                    if alt_id:
+                        db.mark_message_sent(
+                            message_log_id,
+                            evolution_message_id=canonical_id,
+                            external_message_id=canonical_id,
+                            external_alt_message_id=alt_id,
+                        )
+                    else:
+                        db.mark_message_sent(message_log_id, evolution_message_id=canonical_id)
 
-                # Phase 4 correlation persistence: update rfq_suppliers.sent_message_id
-                if msg_id and rfq_id and supplier_id:
-                    db.update_rfq_supplier_sent_message_id(rfq_id, supplier_id, msg_id)
+                # Correlation persistence: update rfq_suppliers.sent_message_id and sent_message_alt_id
+                if canonical_id and rfq_id and supplier_id:
+                    if alt_id:
+                        db.update_rfq_supplier_sent_message_id(
+                            rfq_id,
+                            supplier_id,
+                            canonical_id,
+                            sent_message_alt_id=alt_id,
+                        )
+                    else:
+                        db.update_rfq_supplier_sent_message_id(rfq_id, supplier_id, canonical_id)
+
 
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
                 # Ambiguous transport error: cannot determine if Evolution accepted or dropped it
@@ -295,6 +459,7 @@ async def outbound_worker():
                 print(f"[Outbound Worker] Error sending WhatsApp message to {phone_number} (marked 'failed'): {e}")
             finally:
                 outbound_queue.task_done()
+
 
             # Random jittered delay between outbound messages
             delay = random.uniform(OUTBOUND_MIN_DELAY, OUTBOUND_MAX_DELAY)
@@ -1604,16 +1769,7 @@ async def whatsapp_webhook(request: Request):
             data.get("message", {}).get("conversation", "")
             or data.get("message", {}).get("extendedTextMessage", {}).get("text", "")
         )
-        quoted_stanza_id = (
-            data.get("contextInfo", {}).get("stanzaId")
-            or data.get("message", {}).get("extendedTextMessage", {}).get("contextInfo", {}).get("stanzaId")
-            or data.get("message", {}).get("contextInfo", {}).get("stanzaId")
-        )
-        quoted_text = (
-            data.get("contextInfo", {}).get("quotedMessage", {}).get("conversation", "")
-            or data.get("message", {}).get("extendedTextMessage", {}).get("contextInfo", {}).get("quotedMessage", {}).get("conversation", "")
-            or data.get("message", {}).get("contextInfo", {}).get("quotedMessage", {}).get("conversation", "")
-        )
+        quoted_stanza_id, quoted_text, message_type = extract_inbound_quoted_info(data)
 
         if not sender_phone or not message_text:
             return {"status": "ignored", "reason": "no message content"}
@@ -1661,6 +1817,9 @@ async def whatsapp_webhook(request: Request):
                 db.complete_webhook_message(client_id, msg_key_id)
             return {"status": "ignored", "reason": "unknown supplier"}
 
+        # Task 2: Log safely, without secrets, phone numbers, or auth tokens
+        print(f"[Webhook] Inbound msg_id='{msg_key_id}' type='{message_type}' quoted_stanzaId='{quoted_stanza_id or 'none'}'")
+
         inbound_log_id = db.log_message(client_id, supplier["id"], "inbound", message_text)
         decision_id = None
 
@@ -1672,7 +1831,7 @@ async def whatsapp_webhook(request: Request):
         if quoted_stanza_id:
             matched_rfq_supplier = db.get_rfq_supplier_by_sent_message_id(supplier["id"], quoted_stanza_id)
             if not matched_rfq_supplier:
-                print(f"[Webhook] Quoted stanzaId '{quoted_stanza_id}' present but does not match any open RFQ for supplier {supplier['id']}. Ignoring cross-RFQ fallback.")
+                print(f"[Webhook] Quoted stanzaId '{quoted_stanza_id}' present on msg '{msg_key_id}' but does not match any open RFQ for supplier {supplier['id']}. Failing closed without cross-RFQ fallback.")
                 if msg_key_id:
                     db.complete_webhook_message(client_id, msg_key_id)
                 return {"status": "ignored", "reason": "quoted_stanza_id already responded or closed"}
@@ -1680,6 +1839,8 @@ async def whatsapp_webhook(request: Request):
             matched_rfq = matched_rfq_supplier.get("rfqs", matched_rfq_supplier)
             matched_rfq_id = matched_rfq.get("id") if isinstance(matched_rfq, dict) else None
             db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
+            print(f"[Webhook] Quoted stanzaId '{quoted_stanza_id}' resolved to RFQ '{matched_rfq_id}'")
+
         elif quoted_text:
             matched_rfq_supplier = db.get_rfq_supplier_by_quoted_text(supplier["id"], quoted_text)
             if matched_rfq_supplier:

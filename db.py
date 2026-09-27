@@ -8,6 +8,7 @@ import math
 import os
 import secrets
 import uuid
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 load_dotenv()
@@ -532,30 +533,125 @@ def mark_rfq_supplier_no_response(rfq_supplier_id: str):
     }).eq("id", rfq_supplier_id).execute()
 
 
-def update_rfq_supplier_sent_message_id(rfq_id: str, supplier_id: str, sent_message_id: str):
-    """Saves the Evolution API outgoing message ID to rfq_suppliers.sent_message_id."""
-    return supabase.table("rfq_suppliers").update({
-        "sent_message_id": sent_message_id
-    }).eq("rfq_id", rfq_id).eq("supplier_id", supplier_id).execute()
+def normalize_message_id(raw_id: str) -> Optional[str]:
+    """
+    Normalizes a WhatsApp / Evolution message ID by:
+    - Stripping surrounding whitespace/quotes.
+    - Extracting the suffix ONLY if formatted as a compound key (e.g., 'false_971501234567@s.whatsapp.net_3EB0428E3498' -> '3EB0428E3498').
+    - Stripping trailing device or jid suffixes like ':1' or '@s.whatsapp.net' or '@lid'.
+    """
+    if not raw_id or not isinstance(raw_id, str):
+        return None
+    cleaned = raw_id.strip().strip("'\"")
+    if not cleaned:
+        return None
+    if (cleaned.startswith("true_") or cleaned.startswith("false_")) and "@" in cleaned:
+        parts = cleaned.split("_")
+        cleaned = parts[-1].strip()
+    if "@" in cleaned:
+        cleaned = cleaned.split("@")[0].strip()
+    if ":" in cleaned and not cleaned.startswith("http"):
+        cleaned = cleaned.split(":")[0].strip()
+    return cleaned if cleaned else None
+
+
+
+def update_rfq_supplier_sent_message_id(
+    rfq_id: str,
+    supplier_id: str,
+    sent_message_id: str,
+    sent_message_alt_id: str = None,
+):
+    """Saves the Evolution API / WhatsApp outgoing message ID(s) to rfq_suppliers."""
+    payload = {"sent_message_id": sent_message_id}
+    if sent_message_alt_id:
+        payload["sent_message_alt_id"] = sent_message_alt_id
+    return supabase.table("rfq_suppliers").update(payload).eq("rfq_id", rfq_id).eq("supplier_id", supplier_id).execute()
 
 
 def get_rfq_supplier_by_sent_message_id(supplier_id: str, sent_message_id: str):
     """
-    Looks up an active rfq_suppliers record for a supplier that matches sent_message_id.
-    Returns the entry joined with rfqs(*) if the underlying RFQ is active and supplier status in ('sent', 'clarifying', 'responded').
+    Looks up an active rfq_suppliers record for a supplier that matches sent_message_id
+    (or sent_message_alt_id, or an outbound message_log row for the same supplier).
+
+    Fail-closed: Returns the entry joined with rfqs(*) if and only if the underlying RFQ is active
+    and supplier status is in ('sent', 'clarifying', 'responded').
     """
     if not supplier_id or not sent_message_id:
         return None
-    res = (
-        supabase.table("rfq_suppliers")
-        .select("*, rfqs(*)")
-        .eq("supplier_id", supplier_id)
-        .eq("sent_message_id", sent_message_id)
-        .in_("status", ["sent", "clarifying", "responded"])
-        .execute()
-    )
-    active_entries = [entry for entry in (res.data or []) if is_rfq_open(entry.get("rfqs"))]
-    return active_entries[0] if active_entries else None
+
+    raw_id = str(sent_message_id).strip()
+    norm_id = normalize_message_id(raw_id)
+    search_ids = list(dict.fromkeys([i for i in [raw_id, norm_id] if i]))
+
+    # 1. Primary lookup: match on rfq_suppliers.sent_message_id
+    for sid in search_ids:
+        try:
+            res = (
+                supabase.table("rfq_suppliers")
+                .select("*, rfqs(*)")
+                .eq("supplier_id", supplier_id)
+                .eq("sent_message_id", sid)
+                .in_("status", ["sent", "clarifying", "responded"])
+                .execute()
+            )
+            active_entries = [entry for entry in (res.data or []) if is_rfq_open(entry.get("rfqs"))]
+            if active_entries:
+                return active_entries[0]
+        except Exception as e:
+            logger.warning("Error querying rfq_suppliers by sent_message_id=%s: %s", sid, e)
+
+    # 2. Secondary lookup: match on rfq_suppliers.sent_message_alt_id
+    for sid in search_ids:
+        try:
+            res = (
+                supabase.table("rfq_suppliers")
+                .select("*, rfqs(*)")
+                .eq("supplier_id", supplier_id)
+                .eq("sent_message_alt_id", sid)
+                .in_("status", ["sent", "clarifying", "responded"])
+                .execute()
+            )
+            active_entries = [entry for entry in (res.data or []) if is_rfq_open(entry.get("rfqs"))]
+            if active_entries:
+                return active_entries[0]
+        except Exception as e:
+            logger.warning("Error querying rfq_suppliers by sent_message_alt_id=%s: %s", sid, e)
+
+    # 3. Tertiary lookup: match via outbound message_log rows for the same supplier
+    # This covers cases where reminders, clarifications, or counteroffers were sent for the same RFQ
+    for sid in search_ids:
+        for col in ["external_message_id", "external_alt_message_id", "evolution_message_id"]:
+            try:
+                msg_res = (
+                    supabase.table("message_log")
+                    .select("id, related_rfq_id, supplier_id")
+                    .eq("supplier_id", supplier_id)
+                    .eq("direction", "outbound")
+                    .eq(col, sid)
+                    .not_.is_("related_rfq_id", "null")
+                    .limit(1)
+                    .execute()
+                )
+                if msg_res.data:
+                    related_rfq_id = msg_res.data[0].get("related_rfq_id")
+                    if related_rfq_id:
+                        rfq_supp_res = (
+                            supabase.table("rfq_suppliers")
+                            .select("*, rfqs(*)")
+                            .eq("supplier_id", supplier_id)
+                            .eq("rfq_id", related_rfq_id)
+                            .in_("status", ["sent", "clarifying", "responded"])
+                            .execute()
+                        )
+                        active_entries = [entry for entry in (rfq_supp_res.data or []) if is_rfq_open(entry.get("rfqs"))]
+                        if active_entries:
+                            return active_entries[0]
+            except Exception as e:
+                logger.warning("Error querying message_log by %s=%s: %s", col, sid, e)
+
+    return None
+
 
 
 def get_rfq_supplier_by_quoted_text(supplier_id: str, quoted_text: str):
@@ -1681,8 +1777,13 @@ def mark_message_sending(message_log_id: str) -> bool:
         return False
 
 
-def mark_message_sent(message_log_id: str, evolution_message_id: str = None) -> bool:
-    """Marks an outbound message as sent with timestamp and optional Evolution message ID."""
+def mark_message_sent(
+    message_log_id: str,
+    evolution_message_id: str = None,
+    external_message_id: str = None,
+    external_alt_message_id: str = None,
+) -> bool:
+    """Marks an outbound message as sent with timestamp and Evolution / WhatsApp message IDs."""
     if not message_log_id:
         return False
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1690,14 +1791,20 @@ def mark_message_sent(message_log_id: str, evolution_message_id: str = None) -> 
         "status": "sent",
         "sent_at": now_iso,
     }
-    if evolution_message_id:
-        upd_payload["evolution_message_id"] = str(evolution_message_id)
+    primary_id = external_message_id or evolution_message_id
+    if primary_id:
+        upd_payload["evolution_message_id"] = str(primary_id)
+        upd_payload["external_message_id"] = str(primary_id)
+    if external_alt_message_id:
+        upd_payload["external_alt_message_id"] = str(external_alt_message_id)
+
     try:
         upd = supabase.table("message_log").update(upd_payload).eq("id", message_log_id).execute()
         return bool(upd.data)
     except Exception as ex:
         logger.warning("mark_message_sent error for id %s: %s", message_log_id, ex)
         return False
+
 
 
 def mark_message_failed(message_log_id: str, error_message: str) -> bool:
