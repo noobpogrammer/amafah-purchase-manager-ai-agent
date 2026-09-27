@@ -120,14 +120,25 @@ def validate_action(
 
         # Backward compatibility / legacy adapter: normalize single price into variants list
         variants_raw = args.get("variants")
-        if variants_raw is None and "price" in args:
-            variants_raw = [{
-                "variant_label": args.get("variant_label"),
-                "price": args.get("price"),
-                "delivery_time": args.get("delivery_time"),
-                "quality_notes": args.get("quality_notes"),
-                "is_available": args.get("is_available", True),
-            }]
+        if variants_raw is None:
+            fallback_price = args.get("price")
+            fallback_delivery = args.get("delivery_time")
+            fallback_notes = args.get("quality_notes")
+            if fallback_price is None and pending_clarification:
+                fallback_price = pending_clarification.get("extracted_price")
+                if fallback_delivery is None:
+                    fallback_delivery = pending_clarification.get("extracted_delivery")
+                if fallback_notes is None:
+                    fallback_notes = pending_clarification.get("extracted_notes")
+
+            if fallback_price is not None or "price" in args or pending_clarification:
+                variants_raw = [{
+                    "variant_label": args.get("variant_label"),
+                    "price": fallback_price,
+                    "delivery_time": fallback_delivery,
+                    "quality_notes": fallback_notes,
+                    "is_available": args.get("is_available", True),
+                }]
 
         if not isinstance(variants_raw, list) or len(variants_raw) < 1:
             return ValidationResult(
@@ -212,6 +223,13 @@ def validate_action(
 
             # 3. Validate price
             raw_price = item.get("price")
+            if raw_price is None and is_avail and pending_clarification and pending_clarification.get("extracted_price") is not None:
+                raw_price = pending_clarification.get("extracted_price")
+                if item.get("delivery_time") is None and pending_clarification.get("extracted_delivery") is not None:
+                    item["delivery_time"] = pending_clarification.get("extracted_delivery")
+                if item.get("quality_notes") is None and pending_clarification.get("extracted_notes") is not None:
+                    item["quality_notes"] = pending_clarification.get("extracted_notes")
+
             price_val = None
             if is_avail:
                 if raw_price is None:
@@ -440,9 +458,9 @@ def validate_action(
             sanitized_args={
                 "candidate_rfq_ids": candidate_ids,
                 "clarifying_question": question,
-                "extracted_price": args.get("extracted_price"),
-                "extracted_delivery": args.get("extracted_delivery"),
-                "extracted_notes": args.get("extracted_notes"),
+                "extracted_price": args.get("extracted_price") if args.get("extracted_price") is not None else (pending_clarification.get("extracted_price") if pending_clarification else None),
+                "extracted_delivery": args.get("extracted_delivery") if args.get("extracted_delivery") is not None else (pending_clarification.get("extracted_delivery") if pending_clarification else None),
+                "extracted_notes": args.get("extracted_notes") if args.get("extracted_notes") is not None else (pending_clarification.get("extracted_notes") if pending_clarification else None),
             },
         )
 

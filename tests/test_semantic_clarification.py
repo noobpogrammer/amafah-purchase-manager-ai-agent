@@ -867,20 +867,13 @@ async def test_17_negotiation_resolution_resolves_pending_clarification():
 
 
 def test_18_non_selected_candidates_revert_correctly(mock_supabase):
-    """18. db.revert_unresolved_candidates resets candidate rfq_suppliers from clarifying back to sent."""
-    mock_table = MagicMock()
-    mock_supabase.table.return_value = mock_table
-    mock_table.update.return_value.eq.return_value.in_.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
-
+    """18. db.revert_unresolved_candidates is a safe no-op that never changes rfq_suppliers status."""
     db.revert_unresolved_candidates(
         supplier_id="s-1",
         resolved_rfq_id="rfq-1",
         candidate_rfq_ids=["rfq-1", "rfq-2", "rfq-3"],
     )
-
-    assert mock_table.update.call_count == 1
-    update_arg = mock_table.update.call_args[0][0]
-    assert update_arg == {"status": "sent"}
+    mock_supabase.table.assert_not_called()
 
 
 def test_19_last_question_persisted(mock_supabase):
@@ -1138,7 +1131,7 @@ async def test_27_supplier_can_narrow_4_to_3_to_2_to_1_successfully():
 
 
 def test_28_master_rfq_remains_active_during_clarification(mock_supabase):
-    """28. Clarification lifecycle operates at rfq_suppliers level; rfqs status remains active."""
+    """28. create_pending_clarification only inserts into pending_clarifications table and does not mutate rfq_suppliers table."""
     mock_rfq_supp_table = MagicMock()
     mock_pending_table = MagicMock()
 
@@ -1151,7 +1144,6 @@ def test_28_master_rfq_remains_active_during_clarification(mock_supabase):
 
     mock_supabase.table.side_effect = router
     mock_pending_table.insert.return_value.execute.return_value = MagicMock(data=[{"id": "pc-1"}])
-    mock_rfq_supp_table.update.return_value.eq.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
 
     db.create_pending_clarification(
         client_id="c-1",
@@ -1160,10 +1152,9 @@ def test_28_master_rfq_remains_active_during_clarification(mock_supabase):
         raw_message="cement",
     )
 
-    # Confirm only rfq_suppliers table was updated with 'clarifying', NOT rfqs table
-    assert mock_rfq_supp_table.update.called
-    update_arg = mock_rfq_supp_table.update.call_args_list[0][0][0]
-    assert update_arg == {"status": "clarifying"}
+    # Confirm pending_clarifications was inserted into and rfq_suppliers was NOT mutated
+    assert mock_pending_table.insert.called
+    assert not mock_rfq_supp_table.update.called
 
 
 def test_29_phase_9_review_handling_remains_compatible():

@@ -318,7 +318,9 @@ PRODUCT & MULTI-RFQ MATCHING / NARROWING RULES:
 PENDING CLARIFICATIONS & SEMANTIC LOOP CONTROL:
 - If an 'ACTIVE PENDING CLARIFICATION' is present in the context, evaluate the follow-up against candidate products,
   previous message, and extracted terms:
-  * If the follow-up clearly identifies ONE specific candidate product, call record_quote or negotiate_price for that RFQ. Do NOT call request_clarification if only 1 candidate remains.
+  * If the follow-up clearly identifies ONE specific candidate product, call record_quote or negotiate_price for that RFQ.
+    Combine the resolved RFQ with the preserved extracted terms (price, delivery, notes) from the active pending clarification
+    (unless explicitly overridden in the latest message). Do NOT call request_clarification and do NOT re-ask for price or terms already extracted.
   * If the follow-up narrows the candidate set (rules out some options while 2+ still remain), call request_clarification with the NARROWED candidate_rfq_ids and a new specific clarifying_question.
   * Do NOT reintroduce previously eliminated candidates.
   * Never send a clarifying question that is substantively identical to the previous question asked in the conversation history.

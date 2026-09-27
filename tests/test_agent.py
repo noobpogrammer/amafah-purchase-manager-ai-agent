@@ -691,13 +691,8 @@ class TestQuotedMessageMatching:
             assert matched["rfqs"]["id"] == "rfq-60w"
 
     def test_revert_unresolved_candidates(self, mock_supabase):
-        mock_query = MagicMock()
-        mock_query.update.return_value.eq.return_value.in_.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
-        mock_supabase.table.return_value = mock_query
-
         db.revert_unresolved_candidates(supplier_id="supp-1", resolved_rfq_id="rfq-1", candidate_rfq_ids=["rfq-1", "rfq-2", "rfq-3"])
-        mock_supabase.table.assert_called_with("rfq_suppliers")
-        mock_query.update.assert_called_with({"status": "sent"})
+        mock_supabase.table.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_webhook_quoted_message_direct_match(self, mock_supabase):

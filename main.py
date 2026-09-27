@@ -957,6 +957,9 @@ async def execute_validated_action(
                     if str(q.get("rfq_id")) == str(target_rfq_id)
                 ]
 
+            if context.source_message_id and target_rfq_id:
+                db.update_message_related_rfq(context.source_message_id, target_rfq_id)
+
             # Resolve pending clarification if one was active for this supplier
             if context.pending_clarification:
                 db.resolve_pending_clarification(context.pending_clarification["id"])
@@ -1212,7 +1215,7 @@ async def execute_validated_action(
                     executed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
-            if context.match_source:
+            if context.match_source in ("exact_stanza", "quoted_text"):
                 return {"status": "recorded_via_quoted_message", "rfq_id": target_rfq_id}
             elif context.pending_clarification:
                 return {
@@ -1413,10 +1416,10 @@ async def execute_validated_action(
                     client_id=client_id,
                     supplier_id=supplier_id,
                     candidate_rfq_ids=candidate_ids,
-                    raw_message=raw_message,
-                    extracted_price=args.get("extracted_price"),
-                    extracted_delivery=args.get("extracted_delivery"),
-                    extracted_notes=args.get("extracted_notes"),
+                    raw_message=prev_pc.get("raw_message") or raw_message,
+                    extracted_price=args.get("extracted_price") if args.get("extracted_price") is not None else prev_pc.get("extracted_price"),
+                    extracted_delivery=args.get("extracted_delivery") if args.get("extracted_delivery") is not None else prev_pc.get("extracted_delivery"),
+                    extracted_notes=args.get("extracted_notes") if args.get("extracted_notes") is not None else prev_pc.get("extracted_notes"),
                     round_number=next_round,
                     no_progress_count=no_progress_count,
                     last_question=question,
@@ -1664,6 +1667,8 @@ async def whatsapp_webhook(request: Request):
         # 1. Deterministic Quoted / Stanza Match
         matched_rfq_supplier = None
         match_source = None
+        matched_rfq_id = None
+
         if quoted_stanza_id:
             matched_rfq_supplier = db.get_rfq_supplier_by_sent_message_id(supplier["id"], quoted_stanza_id)
             if not matched_rfq_supplier:
@@ -1672,32 +1677,135 @@ async def whatsapp_webhook(request: Request):
                     db.complete_webhook_message(client_id, msg_key_id)
                 return {"status": "ignored", "reason": "quoted_stanza_id already responded or closed"}
             match_source = "exact_stanza"
+            matched_rfq = matched_rfq_supplier.get("rfqs", matched_rfq_supplier)
+            matched_rfq_id = matched_rfq.get("id") if isinstance(matched_rfq, dict) else None
+            db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
         elif quoted_text:
             matched_rfq_supplier = db.get_rfq_supplier_by_quoted_text(supplier["id"], quoted_text)
             if matched_rfq_supplier:
                 match_source = "quoted_text"
+                matched_rfq = matched_rfq_supplier.get("rfqs", matched_rfq_supplier)
+                matched_rfq_id = matched_rfq.get("id") if isinstance(matched_rfq, dict) else None
+                db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
 
         # 2. Check Pending Clarification
         pending = db.get_pending_clarification_for_supplier(supplier["id"])
         if pending and not isinstance(pending, dict):
             pending = None
 
-        # 3. Retrieve Open RFQs & Candidate RFQs
-        open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"]) or []
+        # 3. Retrieve Open RFQs & Conversation History for Candidate Evaluation
+        all_open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"]) or []
         if matched_rfq_supplier and not any(
             (e.get("rfqs", {}).get("id") or e.get("id")) == (matched_rfq_supplier.get("rfqs", {}).get("id") or matched_rfq_supplier.get("id"))
-            for e in open_rfqs
+            for e in all_open_rfqs
         ):
-            open_rfqs.append(matched_rfq_supplier)
+            all_open_rfqs.append(matched_rfq_supplier)
 
-        if pending:
+        all_rfq_ids = [
+            (e.get("rfqs", e).get("id") if isinstance(e.get("rfqs", e), dict) else None)
+            for e in all_open_rfqs
+        ]
+        all_rfq_ids = [r for r in all_rfq_ids if r]
+
+        prior_quotes = []
+        if all_rfq_ids:
+            try:
+                prior_quotes = db.get_supplier_prior_quotes(supplier["id"], all_rfq_ids)
+            except Exception as e:
+                logger.warning(f"Error loading prior quotes: {e}")
+
+        try:
+            conv_history = db.get_supplier_conversation_history(client_id, supplier["id"], limit=10, exclude_message_id=inbound_log_id)
+        except Exception as e:
+            logger.warning(f"Error loading conversation history: {e}")
+            conv_history = []
+
+        # 4. Route candidate RFQs by strict priority
+        if matched_rfq_supplier:
+            # Tier 1: Exact WhatsApp Stanza Match always wins & locks
+            open_rfqs = [matched_rfq_supplier]
+        elif pending:
+            # Tier 2: Active Pending Clarification strictly limits candidates to pending_rfq_ids
             candidate_ids = pending.get("pending_rfq_ids", [])
-            if candidate_ids:
-                cand_rfqs = db.get_rfqs_by_ids(candidate_ids)
-                for cr in cand_rfqs:
-                    cr_id = cr.get("rfqs", {}).get("id") or cr.get("id")
-                    if not any((e.get("rfqs", {}).get("id") or e.get("id")) == cr_id for e in open_rfqs):
-                        open_rfqs.append(cr)
+            open_rfqs = db.get_rfqs_by_ids(candidate_ids) if candidate_ids else []
+        else:
+            # Classify open RFQs into Unanswered (Awaiting Initial Response) vs Responded (Open for Revisions)
+            unanswered_rfqs = []
+            responded_rfqs = []
+            for entry in all_open_rfqs:
+                r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+                r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
+                status = entry.get("status") if isinstance(entry, dict) else None
+                has_quote = any(str(q.get("rfq_id")) == r_id for q in prior_quotes)
+                if status == "sent" and not has_quote:
+                    unanswered_rfqs.append(entry)
+                else:
+                    responded_rfqs.append(entry)
+
+            msg_lower = (message_text or "").lower()
+
+            if len(unanswered_rfqs) == 1:
+                # Tier 4: Exactly one unanswered RFQ exists -> strongly prefer it over historical responded RFQs
+                unanswered_entry = unanswered_rfqs[0]
+                unanswered_prod = (unanswered_entry.get("rfqs", {}).get("product_name") or "").strip().lower()
+
+                # Check if supplier explicitly quoted a specific responded product name differing from unanswered
+                explicit_resp_match = None
+                for resp_entry in responded_rfqs:
+                    resp_prod = (resp_entry.get("rfqs", {}).get("product_name") or "").strip().lower()
+                    if resp_prod and resp_prod in msg_lower and resp_prod != unanswered_prod:
+                        explicit_resp_match = resp_entry
+                        break
+
+                if explicit_resp_match:
+                    open_rfqs = [explicit_resp_match]
+                else:
+                    open_rfqs = [unanswered_entry]
+
+            elif len(unanswered_rfqs) > 1:
+                # Multiple unanswered RFQs: candidate pool is restricted to unanswered RFQs
+                matches = []
+                for entry in unanswered_rfqs:
+                    prod = (entry.get("rfqs", {}).get("product_name") or "").strip().lower()
+                    specs = (entry.get("rfqs", {}).get("specs") or "").strip().lower()
+                    if (prod and prod in msg_lower) or (specs and specs in msg_lower):
+                        matches.append(entry)
+
+                if len(matches) == 1:
+                    open_rfqs = [matches[0]]
+                else:
+                    open_rfqs = unanswered_rfqs
+
+            elif not unanswered_rfqs and responded_rfqs:
+                # All open RFQs already responded (awaiting deadline for quote revisions)
+                # Tier 3 & 5: Check conversation context and product matching
+                context_rfq_id = None
+                if conv_history:
+                    recent_linked = [m for m in reversed(conv_history) if m.get("related_rfq_id")]
+                    if recent_linked:
+                        cand_id = str(recent_linked[0].get("related_rfq_id"))
+                        if any(str(e.get("rfqs", e).get("id")) == cand_id for e in responded_rfqs):
+                            context_rfq_id = cand_id
+
+                matches = []
+                for entry in responded_rfqs:
+                    prod = (entry.get("rfqs", {}).get("product_name") or "").strip().lower()
+                    specs = (entry.get("rfqs", {}).get("specs") or "").strip().lower()
+                    if (prod and prod in msg_lower) or (specs and specs in msg_lower):
+                        matches.append(entry)
+
+                if len(matches) == 1:
+                    open_rfqs = [matches[0]]
+                elif context_rfq_id:
+                    matching_ctx = next((e for e in responded_rfqs if str(e.get("rfqs", e).get("id")) == context_rfq_id), None)
+                    if matching_ctx:
+                        open_rfqs = [matching_ctx]
+                    else:
+                        open_rfqs = responded_rfqs
+                else:
+                    open_rfqs = responded_rfqs
+            else:
+                open_rfqs = []
 
         if not open_rfqs and not matched_rfq_supplier and not pending:
             if msg_key_id:
@@ -1707,22 +1815,15 @@ async def whatsapp_webhook(request: Request):
                 "note": "message received but no active RFQ to match",
             }
 
-        # 4. Fetch Prior Quotes, Negotiation Attempts, and Competitive Context
-        open_rfq_ids = []
+        # 5. Fetch Negotiation Attempts and Competitive Context for Active Candidates
+        candidate_rfq_ids = []
         for e in open_rfqs:
             rfq_obj = e.get("rfqs", e) if isinstance(e, dict) else e
             if isinstance(rfq_obj, dict) and rfq_obj.get("id"):
-                open_rfq_ids.append(rfq_obj["id"])
-
-        prior_quotes = []
-        if open_rfq_ids:
-            try:
-                prior_quotes = db.get_supplier_prior_quotes(supplier["id"], open_rfq_ids)
-            except Exception as e:
-                logger.warning(f"Error loading prior quotes: {e}")
+                candidate_rfq_ids.append(rfq_obj["id"])
 
         negotiation_attempts = {}
-        for r_id in open_rfq_ids:
+        for r_id in candidate_rfq_ids:
             try:
                 negotiation_attempts[r_id] = db.get_negotiation_attempts(r_id, supplier["id"])
             except Exception as e:
@@ -1730,25 +1831,13 @@ async def whatsapp_webhook(request: Request):
                 negotiation_attempts[r_id] = 0
 
         competitive_context = {}
-        for r_id in open_rfq_ids:
+        for r_id in candidate_rfq_ids:
             try:
                 comp_ctx = db.get_competitive_pricing_context(r_id, supplier["id"])
                 if isinstance(comp_ctx, dict) and comp_ctx.get("has_competition"):
                     competitive_context[r_id] = f"Best competing quote is AED {comp_ctx['best_competing_price']} (from {comp_ctx['competing_quotes_count']} other supplier(s))"
             except Exception as e:
                 logger.warning(f"Error loading competitive context for RFQ {r_id}: {e}")
-
-        # 5. Fetch Bounded Chronological Conversation History (excluding current inbound turn)
-        try:
-            conv_history = db.get_supplier_conversation_history(client_id, supplier["id"], limit=10, exclude_message_id=inbound_log_id)
-        except Exception as e:
-            logger.warning(f"Error loading conversation history: {e}")
-            conv_history = []
-
-        matched_rfq_id = None
-        if matched_rfq_supplier:
-            matched_rfq = matched_rfq_supplier.get("rfqs", matched_rfq_supplier)
-            matched_rfq_id = matched_rfq.get("id") if isinstance(matched_rfq, dict) else None
 
         # 6. Build Single Unified AgentContext
         context = AgentContext(

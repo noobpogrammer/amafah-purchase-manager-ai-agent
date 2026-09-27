@@ -406,11 +406,6 @@ def create_pending_clarification(client_id: str, supplier_id: str,
         payload["last_question"] = last_question
     res = supabase.table("pending_clarifications").insert(payload).execute()
 
-    for rfq_id in candidate_rfq_ids:
-        supabase.table("rfq_suppliers").update({"status": "clarifying"}).eq(
-            "rfq_id", rfq_id
-        ).eq("supplier_id", supplier_id).execute()
-
     return res.data[0].get("id") if res and res.data else None
 
 
@@ -430,7 +425,7 @@ def advance_pending_clarification(
     """
     Database-authoritative atomic replacement of an active pending clarification.
     Calls PostgreSQL RPC advance_pending_clarification to guarantee atomic transition
-    (abandon old row + insert new row + update rfq_suppliers) in a single transaction.
+    (abandon old row + insert new row) in a single transaction without mutating rfq_suppliers.
     Fails closed (returns None) on any RPC or database error.
     """
     if not previous_id or not client_id or not supplier_id or not candidate_rfq_ids:
@@ -597,18 +592,11 @@ def get_rfq_supplier_by_quoted_text(supplier_id: str, quoted_text: str):
 
 def revert_unresolved_candidates(supplier_id: str, resolved_rfq_id: str, candidate_rfq_ids: list):
     """
-    When one candidate RFQ is resolved, resets any remaining candidate RFQs for this supplier
-    that are currently in 'clarifying' status back to 'sent'.
+    Deprecated/Safe no-op: RFQ business lifecycle (rfq_suppliers.status) is decoupled from
+    conversational clarification state. Pending clarifications are resolved in pending_clarifications
+    without mutating rfq_suppliers statuses (guaranteeing 'responded' never reverts to 'sent').
     """
-    if not candidate_rfq_ids:
-        return
-    remaining_rfq_ids = [rfq_id for rfq_id in candidate_rfq_ids if rfq_id != resolved_rfq_id]
-    if not remaining_rfq_ids:
-        return
-
-    supabase.table("rfq_suppliers").update({"status": "sent"}).eq(
-        "supplier_id", supplier_id
-    ).in_("rfq_id", remaining_rfq_ids).eq("status", "clarifying").execute()
+    pass
 
 
 
@@ -789,6 +777,21 @@ def log_message(client_id: str, supplier_id: str, direction: str,
         except Exception as e2:
             logger.error("log_message unkeyed insert fallback failed: %s", e2)
     return None
+
+
+def update_message_related_rfq(message_id: str, rfq_id: str):
+    """
+    Updates the related_rfq_id column of a message_log row once the RFQ association
+    becomes known (via stanza match, clarification resolution, unanswered routing, etc.).
+    """
+    if not message_id or not rfq_id:
+        return None
+    try:
+        res = supabase.table("message_log").update({"related_rfq_id": str(rfq_id)}).eq("id", str(message_id)).execute()
+        return res.data[0] if res and res.data else None
+    except Exception as e:
+        logger.warning("Failed to update message_log %s related_rfq_id to %s: %s", message_id, rfq_id, e)
+        return None
 
 
 def get_quotes_for_rfq(rfq_id: str, include_unavailable: bool = False) -> list:
