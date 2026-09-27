@@ -1,0 +1,366 @@
+"""
+Phase 2: Adaptive Autonomous Negotiation Engine.
+
+Implements:
+1. Target hierarchy & price bounds calculation
+2. Concession tracking and counterparty behavior classification
+3. Structured strategy selection (ANCHOR, HOLD_POSITION, RECIPROCAL_CONCESSION, INFORMATION_SEEKING, FINAL_PUSH, ACKNOWLEDGE_AND_STOP, ESCALATE)
+4. Deterministic allowed counter range calculation (safeguards LLM from proposing arbitrary numbers)
+5. Robust final price detection
+6. Structured preflight preparation
+"""
+
+import os
+import re
+from typing import Dict, Any, Optional, Tuple
+
+MAX_NEGOTIATION_ATTEMPTS = int(os.environ.get("MAX_NEGOTIATION_ATTEMPTS", 10))
+PRICE_TOLERANCE_AED = 3.0
+
+
+FINAL_PRICE_PATTERNS = [
+    r"\bfinal\b",
+    r"\bbest\s+price\b",
+    r"\blowest\s+price\b",
+    r"\bfixed\s+price\b",
+    r"\blast\s+price\b",
+    r"\bnon-?negotiable\b",
+    r"\bcan'?t\s+go\s+lower\b",
+    r"\bcannot\s+(reduce|go\s+lower|discount|drop)\b",
+    r"\bno\s+more\s+discount\b",
+    r"\bthat'?s\s+(my\s+)?final\b",
+    r"\bfinal\s+(offer|price|rate|quote)\b",
+    r"\blast\s+(offer|rate|quote)\b",
+    r"\bfixed\s+rate\b",
+    r"\bbottom\s+line\b",
+    r"\btake\s+it\s+or\s+leave\s+it\b",
+]
+
+FINAL_PRICE_RE = re.compile("|".join(FINAL_PRICE_PATTERNS), re.IGNORECASE)
+
+
+def is_final_price_declared(text: Optional[str]) -> bool:
+    """Detects if supplier message explicitly declares a final/fixed/non-negotiable offer."""
+    if not text:
+        return False
+    return bool(FINAL_PRICE_RE.search(text))
+
+
+def compute_target_hierarchy(
+    acceptable_price_min: Optional[float] = None,
+    acceptable_price_max: Optional[float] = None,
+    last_quote: Optional[float] = None,
+) -> Dict[str, Optional[float]]:
+    """
+    Establishes the deterministic price target hierarchy:
+    1. acceptable_price_min = optimum / preferred target
+    2. last_quote = fallback target if acceptable_price_min is missing
+    3. acceptable_price_max = final fallback target if neither exists
+    
+    Ceiling: acceptable_price_max + 3.0 (or preferred_target + 3.0)
+    """
+    preferred_target = None
+    if acceptable_price_min is not None and acceptable_price_min > 0:
+        preferred_target = float(acceptable_price_min)
+    elif last_quote is not None and last_quote > 0:
+        preferred_target = float(last_quote)
+    elif acceptable_price_max is not None and acceptable_price_max > 0:
+        preferred_target = float(acceptable_price_max)
+
+    acc_max = float(acceptable_price_max) if acceptable_price_max is not None and acceptable_price_max > 0 else None
+
+    # Tolerated final ceiling
+    if acc_max is not None:
+        tolerated_ceiling = acc_max + PRICE_TOLERANCE_AED
+    elif preferred_target is not None:
+        tolerated_ceiling = preferred_target + PRICE_TOLERANCE_AED
+    else:
+        tolerated_ceiling = None
+
+    return {
+        "preferred_target": preferred_target,
+        "acceptable_max": acc_max,
+        "tolerated_final_ceiling": tolerated_ceiling,
+    }
+
+
+def classify_supplier_movement(
+    initial_offer: float,
+    previous_offer: Optional[float],
+    latest_offer: float,
+    latest_agent_counter: Optional[float] = None,
+    is_final_declared: bool = False,
+) -> Tuple[str, float, float]:
+    """
+    Classifies supplier concession behavior:
+    Returns (behavior_classification, supplier_last_concession, supplier_total_concession)
+    """
+    if previous_offer is not None:
+        last_concession = round(previous_offer - latest_offer, 2)
+    else:
+        last_concession = 0.0
+
+    total_concession = round(initial_offer - latest_offer, 2)
+
+    if latest_agent_counter is not None and latest_offer <= latest_agent_counter:
+        return "ACCEPTED_COUNTER", last_concession, total_concession
+
+    if is_final_declared:
+        return "FINAL_PRICE", last_concession, total_concession
+
+    if previous_offer is None:
+        return "INITIAL_OFFER", 0.0, 0.0
+
+    if last_concession < -0.01:
+        return "PRICE_INCREASED", last_concession, total_concession
+    elif abs(last_concession) <= 0.01:
+        return "NO_MOVEMENT", 0.0, total_concession
+    elif last_concession >= 5.0 or (previous_offer and (last_concession / previous_offer) >= 0.08):
+        return "MOVED_SIGNIFICANTLY", last_concession, total_concession
+    else:
+        return "MOVED_SLIGHTLY", last_concession, total_concession
+
+
+def build_allowed_counter_range(
+    preferred_target: Optional[float],
+    acceptable_max: Optional[float],
+    tolerated_final_ceiling: Optional[float],
+    latest_supplier_offer: float,
+    previous_supplier_offer: Optional[float] = None,
+    latest_agent_counter: Optional[float] = None,
+    attempt_count: int = 0,
+    max_attempts: int = MAX_NEGOTIATION_ATTEMPTS,
+    supplier_final_detected: bool = False,
+    no_movement_count: int = 0,
+) -> Dict[str, Any]:
+    """
+    Calculates deterministic bounds for the next autonomous agent counteroffer.
+    Enforces all concession principles and guarantees the LLM cannot invent illegal prices.
+    """
+    # If preferred target is missing, fallback safely
+    if preferred_target is None:
+        preferred_target = acceptable_max or latest_supplier_offer
+
+    effective_cap = acceptable_max if acceptable_max is not None else preferred_target
+
+    # 1. Target reached: supplier price is already at or below preferred target
+    if latest_supplier_offer <= preferred_target:
+        return {
+            "allowed_counter_min": None,
+            "allowed_counter_max": None,
+            "recommended_anchor": None,
+            "can_concede": False,
+            "selected_strategy": "ACKNOWLEDGE_AND_STOP",
+            "reason_code": "TARGET_REACHED",
+            "should_counter": False,
+        }
+
+    # 2. Supplier accepted our counter
+    if latest_agent_counter is not None and latest_supplier_offer <= latest_agent_counter:
+        return {
+            "allowed_counter_min": None,
+            "allowed_counter_max": None,
+            "recommended_anchor": None,
+            "can_concede": False,
+            "selected_strategy": "ACKNOWLEDGE_AND_STOP",
+            "reason_code": "COUNTER_ACCEPTED",
+            "should_counter": False,
+        }
+
+    # 3. Final price declared by supplier
+    if supplier_final_detected:
+        is_above_ceiling = (
+            tolerated_final_ceiling is not None and latest_supplier_offer > tolerated_final_ceiling
+        )
+        return {
+            "allowed_counter_min": None,
+            "allowed_counter_max": None,
+            "recommended_anchor": None,
+            "can_concede": False,
+            "selected_strategy": "ESCALATE" if is_above_ceiling else "ACKNOWLEDGE_AND_STOP",
+            "reason_code": "SUPPLIER_FINAL_ABOVE_CEILING" if is_above_ceiling else "SUPPLIER_FINAL_WITHIN_BOUNDS",
+            "should_counter": False,
+        }
+
+    # 4. Attempt limit reached (e.g. 10 attempts already used)
+    if attempt_count >= max_attempts:
+        is_above_ceiling = (
+            tolerated_final_ceiling is not None and latest_supplier_offer > tolerated_final_ceiling
+        )
+        return {
+            "allowed_counter_min": None,
+            "allowed_counter_max": None,
+            "recommended_anchor": None,
+            "can_concede": False,
+            "selected_strategy": "ESCALATE",
+            "reason_code": "ATTEMPT_LIMIT_REACHED",
+            "should_counter": False,
+        }
+
+    # 5. First counter (ANCHOR)
+    if latest_agent_counter is None or attempt_count == 0:
+        anchor = preferred_target
+        # Counter must be strictly less than supplier offer
+        if anchor >= latest_supplier_offer:
+            anchor = max(1.0, round(latest_supplier_offer - 1.0, 2))
+        return {
+            "allowed_counter_min": round(anchor, 2),
+            "allowed_counter_max": round(anchor, 2),
+            "recommended_anchor": round(anchor, 2),
+            "can_concede": False,
+            "selected_strategy": "ANCHOR",
+            "reason_code": "INITIAL_ANCHOR",
+            "should_counter": True,
+        }
+
+    # 6. Subsequent counters
+    current_counter = float(latest_agent_counter)
+    supplier_last_concession = 0.0
+    if previous_supplier_offer is not None:
+        supplier_last_concession = round(previous_supplier_offer - latest_supplier_offer, 2)
+
+    # Upper hard ceiling: counter must be <= acceptable_max and strictly < latest_supplier_offer
+    max_possible_counter = min(effective_cap, latest_supplier_offer - 0.5)
+    if max_possible_counter < current_counter:
+        max_possible_counter = current_counter
+
+    # A. Supplier increased price or did not move -> HOLD POSITION
+    if supplier_last_concession <= 0.01:
+        strategy = "HOLD_POSITION"
+        if no_movement_count >= 2:
+            strategy = "INFORMATION_SEEKING"
+        return {
+            "allowed_counter_min": round(current_counter, 2),
+            "allowed_counter_max": round(current_counter, 2),
+            "recommended_anchor": round(current_counter, 2),
+            "can_concede": False,
+            "selected_strategy": strategy,
+            "reason_code": "NO_SUPPLIER_MOVEMENT",
+            "should_counter": True,
+        }
+
+    # B. Supplier made meaningful concession -> Controlled reciprocal concession
+    # Rule: our concession must normally be smaller than supplier's concession
+    # Step proportion: ~25% - 40% of supplier concession, capped at remaining gap to acceptable_max
+    raw_step = supplier_last_concession * 0.35
+    # Ensure step is at least 0.5 AED if room allows, but strictly smaller than supplier concession
+    concession_step = max(0.5, round(min(raw_step, supplier_last_concession - 0.5), 2))
+    if concession_step >= supplier_last_concession and supplier_last_concession > 1.0:
+        concession_step = round(supplier_last_concession / 2.0, 2)
+
+    new_counter_max = min(max_possible_counter, current_counter + concession_step)
+    new_counter_min = current_counter  # Never oscillate backward
+
+    # Check if near attempt limit (e.g. attempt >= 8) -> FINAL PUSH
+    if attempt_count >= 8:
+        strategy = "FINAL_PUSH"
+        reason = "NEAR_ATTEMPT_LIMIT_PUSH"
+        new_counter_max = min(max_possible_counter, effective_cap)
+    else:
+        strategy = "RECIPROCAL_CONCESSION"
+        reason = "SUPPLIER_CONCEDED"
+
+    recommended = round(new_counter_max, 2)
+
+    return {
+        "allowed_counter_min": round(new_counter_min, 2),
+        "allowed_counter_max": round(new_counter_max, 2),
+        "recommended_anchor": recommended,
+        "can_concede": True,
+        "selected_strategy": strategy,
+        "reason_code": reason,
+        "should_counter": True,
+    }
+
+
+def build_negotiation_preflight(
+    rfq: Dict[str, Any],
+    supplier_quote: float,
+    previous_quotes: list,
+    active_session: Optional[Dict[str, Any]] = None,
+    raw_message_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Builds the internal structured preflight plan before reasoning or countering.
+    Never exposed directly to the supplier.
+    """
+    min_price = rfq.get("acceptable_price_min")
+    max_price = rfq.get("acceptable_price_max")
+    last_quote_val = rfq.get("last_quote")
+
+    hierarchy = compute_target_hierarchy(min_price, max_price, last_quote_val)
+    preferred_target = hierarchy["preferred_target"]
+    acceptable_max = hierarchy["acceptable_max"]
+    tolerated_ceiling = hierarchy["tolerated_final_ceiling"]
+
+    attempts_used = active_session.get("attempt_count", 0) if active_session else 0
+    attempts_remaining = max(0, MAX_NEGOTIATION_ATTEMPTS - attempts_used)
+
+    prev_supplier_offer = None
+    if active_session and active_session.get("latest_supplier_offer") is not None:
+        prev_supplier_offer = float(active_session["latest_supplier_offer"])
+    elif previous_quotes:
+        prev_supplier_offer = float(previous_quotes[-1]["price"])
+
+    initial_supplier_offer = (
+        float(active_session["initial_supplier_offer"])
+        if active_session and active_session.get("initial_supplier_offer") is not None
+        else supplier_quote
+    )
+
+    prev_agent_counter = (
+        float(active_session["latest_agent_counter"])
+        if active_session and active_session.get("latest_agent_counter") is not None
+        else None
+    )
+
+    is_final = is_final_price_declared(raw_message_text)
+    if active_session and active_session.get("supplier_final_detected"):
+        is_final = True
+
+    no_mov_count = active_session.get("no_movement_count", 0) if active_session else 0
+
+    behavior, last_concession, total_concession = classify_supplier_movement(
+        initial_offer=initial_supplier_offer,
+        previous_offer=prev_supplier_offer,
+        latest_offer=supplier_quote,
+        latest_agent_counter=prev_agent_counter,
+        is_final_declared=is_final,
+    )
+
+    bounds = build_allowed_counter_range(
+        preferred_target=preferred_target,
+        acceptable_max=acceptable_max,
+        tolerated_final_ceiling=tolerated_ceiling,
+        latest_supplier_offer=supplier_quote,
+        previous_supplier_offer=prev_supplier_offer,
+        latest_agent_counter=prev_agent_counter,
+        attempt_count=attempts_used,
+        max_attempts=MAX_NEGOTIATION_ATTEMPTS,
+        supplier_final_detected=is_final,
+        no_movement_count=no_mov_count,
+    )
+
+    return {
+        "primary_objective": "Negotiate commercially optimal price towards preferred target without exceeding acceptable max",
+        "preferred_target": preferred_target,
+        "acceptable_max": acceptable_max,
+        "tolerated_final_ceiling": tolerated_ceiling,
+        "initial_supplier_offer": initial_supplier_offer,
+        "previous_supplier_offer": prev_supplier_offer,
+        "latest_supplier_offer": supplier_quote,
+        "previous_agent_counter": prev_agent_counter,
+        "attempts_used": attempts_used,
+        "attempts_remaining": attempts_remaining,
+        "supplier_last_concession": last_concession,
+        "supplier_total_concession": total_concession,
+        "supplier_behavior": behavior,
+        "supplier_final_detected": is_final,
+        "selected_strategy": bounds["selected_strategy"],
+        "reason_code": bounds["reason_code"],
+        "should_counter": bounds["should_counter"],
+        "allowed_counter_min": bounds["allowed_counter_min"],
+        "allowed_counter_max": bounds["allowed_counter_max"],
+        "recommended_anchor": bounds["recommended_anchor"],
+        "can_concede": bounds["can_concede"],
+    }

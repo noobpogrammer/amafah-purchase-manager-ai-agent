@@ -33,6 +33,7 @@ import groq_client
 from groq_client import AgentContext
 import guardrails
 from policy_validator import ActionProposal, validate_action, ActionCategory, ValidationResult, MAX_NEGOTIATION_ATTEMPTS
+import negotiation_engine
 
 logger = logging.getLogger(__name__)
 
@@ -534,7 +535,7 @@ def format_rfq_context(open_rfqs: list, current_supplier_id: str = None) -> str:
             f"Specs: {rfq.get('specs', '-')} | Qty: {rfq.get('quantity', '-')} | "
             f"Acceptable Price Range: {range_str} | "
             f"Competitive Context: {comp_str} | "
-            f"Negotiation Attempts Made: {attempts}/3"
+            f"Negotiation Attempts Made: {attempts}/10"
         )
     return "\n".join(lines)
 
@@ -1023,22 +1024,37 @@ def is_supplier_final_price_statement(message: str) -> bool:
     """Detects whether supplier explicitly stated their price is final, lowest, or non-negotiable."""
     if not message:
         return False
-    msg = message.lower().strip()
-    patterns = [
-        r"\bfinal\b",
-        r"\bfinal\s*price\b",
-        r"\bbest\s*price\b",
-        r"\blowest\s*(?:price|rate|is)?\b",
-        r"\bcannot\s*(?:reduce|discount|go\s*lower|go\s*below|decrease)\b",
-        r"\bcan't\s*(?:reduce|discount|go\s*lower|go\s*below|decrease)\b",
-        r"\bprice\s*fixed\b",
-        r"\bfixed\s*price\b",
-        r"\bno\s*(?:more\s*)?discount\b",
-        r"\bthat'?s\s*my\s*final\b",
-        r"\blast\s*price\b",
-        r"\bnon[\s-]*negotiable\b",
-    ]
-    return any(re.search(pat, msg) for pat in patterns)
+    return negotiation_engine.is_final_price_declared(message)
+
+
+def generate_adaptive_negotiation_message(
+    strategy: str,
+    counter_price: float,
+    supplier_last_concession: float = 0.0,
+    product_name: str = None,
+    variant_label: str = None,
+) -> str:
+    """
+    Generates warm, professional WhatsApp negotiation phrasing based on strategy & movement.
+    Avoids repetitive identical templates.
+    """
+    var_prefix = f"For the {variant_label} option, " if variant_label else ""
+    if strategy == "ANCHOR":
+        return f"{var_prefix}Thanks for the quote. We're looking for a more competitive rate on this order. Could you do AED {counter_price:g} per piece?"
+    elif strategy == "RECIPROCAL_CONCESSION":
+        if supplier_last_concession >= 5.0:
+            return f"{var_prefix}Thanks for moving significantly on the price. We're getting closer. Could you meet us at AED {counter_price:g} per piece?"
+        else:
+            return f"{var_prefix}Appreciate the flexibility. We're getting closer on our end. Could you improve it to AED {counter_price:g} per piece?"
+    elif strategy == "HOLD_POSITION":
+        return f"{var_prefix}Understood. We're still trying to improve the rate on this order. Is there any further flexibility on the price?"
+    elif strategy == "FINAL_PUSH":
+        return f"{var_prefix}We really appreciate your effort on this. If you can meet us at AED {counter_price:g} per piece, we can finalize this."
+    elif strategy == "INFORMATION_SEEKING":
+        return f"{var_prefix}Understood on the current rate. Would the pricing improve if we adjust the order quantity or delivery schedule?"
+    else:
+        return f"{var_prefix}Thanks for the update. Could you consider AED {counter_price:g} per piece?"
+
 
 
 async def execute_validated_action(
@@ -1122,6 +1138,12 @@ async def execute_validated_action(
                     if str(q.get("rfq_id")) == str(target_rfq_id)
                 ]
 
+            persisted_quote_id = (
+                persisted_quotes[0].get("id")
+                if (persisted_quotes and isinstance(persisted_quotes, list) and isinstance(persisted_quotes[0], dict))
+                else None
+            )
+
             if context.source_message_id and target_rfq_id:
                 db.update_message_related_rfq(context.source_message_id, target_rfq_id)
 
@@ -1162,22 +1184,45 @@ async def execute_validated_action(
 
             is_final = is_supplier_final_price_statement(raw_message) or bool(quote_raw and is_supplier_final_price_statement(quote_raw))
 
-            # Quote-first negotiation policy:
-            # Persist the supplier's factual quote first, then deterministically decide
-            # whether to negotiate. The acceptable minimum is the optimum target.
-            acceptable_min = target_rfq.get("acceptable_price_min") if isinstance(target_rfq, dict) else None
-            acceptable_max = target_rfq.get("acceptable_price_max") if isinstance(target_rfq, dict) else None
-            price_policy = db.build_negotiation_price_context(
-                acceptable_min=acceptable_min,
-                acceptable_max=acceptable_max,
-                last_quote=rfq_last_quote,
-                current_quote=price_val,
-            ) if price_val is not None else None
+            # 1. Evaluate negotiation preflight and active session
+            active_session = db.get_active_negotiation_session(client_id, target_rfq_id, supplier_id) if target_rfq_id else None
+            prior_quotes_for_rfq = [q for q in (context.prior_quotes or []) if str(q.get("rfq_id")) == str(target_rfq_id)]
+            
+            preflight = negotiation_engine.build_negotiation_preflight(
+                rfq=target_rfq or {},
+                supplier_quote=price_val if price_val is not None else 0.0,
+                previous_quotes=prior_quotes_for_rfq,
+                active_session=active_session,
+                raw_message_text=raw_message,
+            ) if (target_rfq and price_val is not None) else None
 
+            # 2. Persist / update negotiation session
+            persisted_session = None
+            if preflight and target_rfq_id and price_val is not None:
+                no_mov = (active_session.get("no_movement_count", 0) + 1) if (active_session and preflight.get("supplier_behavior") in ("NO_MOVEMENT", "PRICE_INCREASED")) else 0
+                session_update = {
+                    "preferred_target": preflight["preferred_target"],
+                    "acceptable_max": preflight["acceptable_max"],
+                    "tolerated_final_ceiling": preflight["tolerated_final_ceiling"],
+                    "initial_supplier_offer": preflight["initial_supplier_offer"],
+                    "previous_supplier_offer": preflight["previous_supplier_offer"],
+                    "latest_supplier_offer": price_val,
+                    "supplier_total_concession": preflight["supplier_total_concession"],
+                    "supplier_last_concession": preflight["supplier_last_concession"],
+                    "no_movement_count": no_mov,
+                    "supplier_final_detected": is_final or preflight["supplier_final_detected"],
+                    "selected_strategy": preflight["selected_strategy"],
+                    "last_quote_id": persisted_quote_id,
+                }
+                persisted_session = db.create_or_update_negotiation_session(
+                    client_id, target_rfq_id, supplier_id, **session_update
+                )
+
+            # 3. Check whether to trigger adaptive autonomous counteroffer
             can_auto_negotiate = (
                 context.input_origin != "operator"
-                and price_policy
-                and price_policy.get("should_negotiate")
+                and preflight
+                and preflight.get("should_counter")
                 and not is_final
                 and attempts_made < MAX_NEGOTIATION_ATTEMPTS
                 and len(variants) == 1
@@ -1185,14 +1230,14 @@ async def execute_validated_action(
                 and variants[0].get("variant_label") is None
             )
 
-            persisted_quote_id = None
-            if persisted_quotes:
-                persisted_quote_id = persisted_quotes[0].get("id")
-
             if can_auto_negotiate and persisted_quote_id:
-                counter_price = float(price_policy["preferred_target"])
-                negotiation_message = (
-                    f"Thanks for the quote. Could you offer AED {counter_price:g} per piece?"
+                counter_price = float(preflight["recommended_anchor"])
+                negotiation_message = generate_adaptive_negotiation_message(
+                    strategy=preflight["selected_strategy"],
+                    counter_price=counter_price,
+                    supplier_last_concession=preflight["supplier_last_concession"],
+                    product_name=target_rfq.get("product_name") if isinstance(target_rfq, dict) else None,
+                    variant_label=variants[0].get("variant_label") if variants else None,
                 )
 
                 followup_proposal = ActionProposal(
@@ -1229,10 +1274,9 @@ async def execute_validated_action(
                                 **dict(args),
                                 "quote_persisted_before_negotiation": True,
                                 "persisted_quote_id": str(persisted_quote_id),
-                                "price_position": price_policy.get("price_position"),
-                                "preferred_target": price_policy.get("preferred_target"),
-                                "target_source": price_policy.get("target_source"),
-                                "tolerated_final_ceiling": price_policy.get("tolerated_final_ceiling"),
+                                "strategy": preflight.get("selected_strategy"),
+                                "preferred_target": preflight.get("preferred_target"),
+                                "tolerated_final_ceiling": preflight.get("tolerated_final_ceiling"),
                             },
                             executed_at=datetime.now(timezone.utc).isoformat(),
                         )
@@ -1243,7 +1287,7 @@ async def execute_validated_action(
                         tool_name="negotiate_price",
                         arguments=followup_validation.sanitized_args,
                         validation_status="approved",
-                        validation_reason="Deterministic post-persist negotiation toward optimum acceptable price.",
+                        validation_reason=f"Adaptive negotiation ({preflight.get('selected_strategy')}) toward optimum price.",
                         execution_status="pending",
                         rfq_id=target_rfq_id,
                         supplier_id=supplier_id,
@@ -1265,49 +1309,68 @@ async def execute_validated_action(
                     followup_validation.reason,
                 )
 
+            # 4. Handle Stop / Escalation conditions
+            if preflight and persisted_session and persisted_session.get("id"):
+                if preflight["reason_code"] == "TARGET_REACHED":
+                    db.complete_negotiation_session(persisted_session["id"], status="target_reached")
+                elif preflight["reason_code"] == "COUNTER_ACCEPTED":
+                    db.complete_negotiation_session(persisted_session["id"], status="completed")
+
             should_escalate_attention = False
             escalation_reason = None
 
-            if hist_ctx and price_val is not None and context.input_origin != "operator":
-                # Supplier price is above the tolerated historical ceiling (last_quote + 2 AED)
-                if not hist_ctx["within_tolerance"]:
-                    supp_name = supplier.get("name") or "Supplier"
-                    prod_name = target_rfq.get("product_name") or "Product" if isinstance(target_rfq, dict) else "Product"
-                    var_label = variants[0].get("variant_label") if variants else None
-                    var_line = f"Variant:\n{var_label}\n\n" if var_label else ""
-                    diff_above_ceiling = round(price_val - hist_ctx["tolerated_final_ceiling"], 2)
-                    diff_from_target = round(price_val - hist_ctx["preferred_target"], 2)
+            if preflight and price_val is not None and context.input_origin != "operator":
+                supp_name = supplier.get("name") or "Supplier"
+                prod_name = target_rfq.get("product_name") if isinstance(target_rfq, dict) else "Product"
+                var_label = variants[0].get("variant_label") if variants else None
+                var_line = f"Variant:\n{var_label}\n\n" if var_label else ""
+                
+                pref_target = preflight["preferred_target"]
+                tol_ceiling = preflight["tolerated_final_ceiling"]
+                acc_max = preflight["acceptable_max"]
+                is_above_ceiling = (tol_ceiling is not None and price_val > tol_ceiling)
+                diff_from_target = round(price_val - pref_target, 2) if pref_target else "N/A"
+                diff_above_ceiling = round(price_val - tol_ceiling, 2) if tol_ceiling else "N/A"
 
-                    if is_final:
-                        should_escalate_attention = True
-                        escalation_reason = (
-                            f"Negotiation Requires Attention\n\n"
-                            f"Supplier:\n{supp_name}\n\n"
-                            f"Product:\n{prod_name}\n\n"
-                            f"{var_line}"
-                            f"Historical Last Quote:\nAED {hist_ctx['last_quote']}\n\n"
-                            f"Preferred Target:\nAED {hist_ctx['preferred_target']}\n\n"
-                            f"Tolerated Final Ceiling:\nAED {hist_ctx['tolerated_final_ceiling']}\n\n"
-                            f"Supplier Final Quote:\nAED {price_val}\n\n"
-                            f"Difference from Last Quote:\nAED +{diff_from_target}\n\n"
-                            f"Negotiation Attempts:\n{attempts_made}/3\n\n"
-                            f"Reason:\nSupplier stated AED {price_val} is their final price, which is AED {diff_above_ceiling} above the tolerated historical ceiling."
-                        )
-                    elif attempts_made >= MAX_NEGOTIATION_ATTEMPTS:
-                        should_escalate_attention = True
-                        escalation_reason = (
-                            f"Negotiation Requires Attention\n\n"
-                            f"Supplier:\n{supp_name}\n\n"
-                            f"Product:\n{prod_name}\n\n"
-                            f"{var_line}"
-                            f"Historical Last Quote:\nAED {hist_ctx['last_quote']}\n\n"
-                            f"Preferred Target:\nAED {hist_ctx['preferred_target']}\n\n"
-                            f"Tolerated Final Ceiling:\nAED {hist_ctx['tolerated_final_ceiling']}\n\n"
-                            f"Supplier Latest Quote:\nAED {price_val}\n\n"
-                            f"Difference from Last Quote:\nAED +{diff_from_target}\n\n"
-                            f"Negotiation Attempts:\n3/3\n\n"
-                            f"Reason:\nAutonomous negotiation limit reached (3/3) while supplier price AED {price_val} remains AED {diff_above_ceiling} above the tolerated historical ceiling."
-                        )
+                if is_final and is_above_ceiling:
+                    should_escalate_attention = True
+                    escalation_reason = (
+                        f"Negotiation Requires Attention\n\n"
+                        f"Supplier:\n{supp_name}\n\n"
+                        f"Product:\n{prod_name}\n\n"
+                        f"{var_line}"
+                        f"Historical Last Quote:\nAED {rfq_last_quote if rfq_last_quote else 'N/A'}\n\n"
+                        f"Preferred Target:\nAED {pref_target if pref_target else 'N/A'}\n\n"
+                        f"Acceptable Maximum:\nAED {acc_max if acc_max else 'N/A'}\n\n"
+                        f"Tolerated Final Ceiling:\nAED {tol_ceiling if tol_ceiling else 'N/A'}\n\n"
+                        f"Supplier Final Quote:\nAED {price_val}\n\n"
+                        f"Difference from Last Quote:\nAED +{diff_from_target}\n\n"
+                        f"Negotiation Attempts:\n{attempts_made}/{MAX_NEGOTIATION_ATTEMPTS}\n\n"
+                        f"Reason:\nSupplier stated AED {price_val} is their final price, which is AED {diff_above_ceiling} above the tolerated final ceiling."
+                    )
+                    if persisted_session and persisted_session.get("id"):
+                        db.complete_negotiation_session(persisted_session["id"], status="awaiting_human_review")
+                elif is_final and not is_above_ceiling:
+                    if persisted_session and persisted_session.get("id"):
+                        db.complete_negotiation_session(persisted_session["id"], status="supplier_final")
+                elif attempts_made >= MAX_NEGOTIATION_ATTEMPTS and (pref_target is None or price_val > pref_target):
+                    should_escalate_attention = True
+                    escalation_reason = (
+                        f"Negotiation Requires Attention\n\n"
+                        f"Supplier:\n{supp_name}\n\n"
+                        f"Product:\n{prod_name}\n\n"
+                        f"{var_line}"
+                        f"Historical Last Quote:\nAED {rfq_last_quote if rfq_last_quote else 'N/A'}\n\n"
+                        f"Preferred Target:\nAED {pref_target if pref_target else 'N/A'}\n\n"
+                        f"Acceptable Maximum:\nAED {acc_max if acc_max else 'N/A'}\n\n"
+                        f"Tolerated Final Ceiling:\nAED {tol_ceiling if tol_ceiling else 'N/A'}\n\n"
+                        f"Supplier Latest Quote:\nAED {price_val}\n\n"
+                        f"Difference from Last Quote:\nAED +{diff_from_target}\n\n"
+                        f"Negotiation Attempts:\n{MAX_NEGOTIATION_ATTEMPTS}/{MAX_NEGOTIATION_ATTEMPTS}\n\n"
+                        f"Reason:\nAutonomous negotiation limit reached ({MAX_NEGOTIATION_ATTEMPTS}/{MAX_NEGOTIATION_ATTEMPTS}) while supplier price AED {price_val} remains above preferred target."
+                    )
+                    if persisted_session and persisted_session.get("id"):
+                        db.complete_negotiation_session(persisted_session["id"], status="awaiting_human_review")
 
             if should_escalate_attention and escalation_reason:
                 flag_res = db.flag_for_human_review(
@@ -1326,13 +1389,12 @@ async def execute_validated_action(
 
                 if decision_id:
                     updated_args = dict(args)
-                    if hist_ctx:
+                    if preflight:
                         updated_args.update({
-                            "last_quote": hist_ctx["last_quote"],
-                            "preferred_target": hist_ctx["preferred_target"],
-                            "tolerated_final_ceiling": hist_ctx["tolerated_final_ceiling"],
-                            "historical_difference_aed": hist_ctx["difference_aed"],
-                            "historical_difference_percent": hist_ctx["difference_percent"],
+                            "last_quote": rfq_last_quote,
+                            "preferred_target": preflight.get("preferred_target"),
+                            "tolerated_final_ceiling": preflight.get("tolerated_final_ceiling"),
+                            "acceptable_max": preflight.get("acceptable_max"),
                             "negotiation_attempt": attempts_made,
                             "supplier_final_price_detected": is_final,
                         })
@@ -1361,13 +1423,12 @@ async def execute_validated_action(
 
             if decision_id:
                 updated_args = dict(args)
-                if hist_ctx:
+                if preflight:
                     updated_args.update({
-                        "last_quote": hist_ctx["last_quote"],
-                        "preferred_target": hist_ctx["preferred_target"],
-                        "tolerated_final_ceiling": hist_ctx["tolerated_final_ceiling"],
-                        "historical_difference_aed": hist_ctx["difference_aed"],
-                        "historical_difference_percent": hist_ctx["difference_percent"],
+                        "last_quote": rfq_last_quote,
+                        "preferred_target": preflight.get("preferred_target"),
+                        "tolerated_final_ceiling": preflight.get("tolerated_final_ceiling"),
+                        "acceptable_max": preflight.get("acceptable_max"),
                         "negotiation_attempt": attempts_made,
                         "supplier_final_price_detected": is_final,
                     })
@@ -1438,6 +1499,23 @@ async def execute_validated_action(
                 raise RuntimeError("Failed to log outbound negotiation message durably.")
             await enqueue_message(phone_number, neg_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
 
+            # Update negotiation session state
+            active_session = db.get_active_negotiation_session(client_id, target_rfq_id, supplier_id)
+            if active_session:
+                prev_counter = active_session.get("latest_agent_counter")
+                pref_t = active_session.get("preferred_target") or counter_price
+                db.create_or_update_negotiation_session(
+                    client_id=client_id,
+                    rfq_id=target_rfq_id,
+                    supplier_id=supplier_id,
+                    previous_agent_counter=prev_counter,
+                    latest_agent_counter=counter_price,
+                    attempt_count=attempts,
+                    agent_last_concession=round(counter_price - float(prev_counter), 2) if prev_counter is not None else 0.0,
+                    agent_total_concession=round(counter_price - float(pref_t), 2),
+                    last_outbound_message_id=msg_log_id,
+                )
+
             if decision_id:
                 updated_args = dict(args)
                 updated_args["negotiation_attempt"] = attempts
@@ -1460,6 +1538,7 @@ async def execute_validated_action(
                 "variant_label": variant_label,
                 "attempts": attempts,
             }
+
 
         elif validation.action == "request_clarification":
             args = validation.sanitized_args
@@ -1890,6 +1969,16 @@ async def whatsapp_webhook(request: Request):
             candidate_ids = pending.get("pending_rfq_ids", [])
             open_rfqs = db.get_rfqs_by_ids(candidate_ids) if candidate_ids else []
         else:
+            # Check Active Negotiation Session Continuity (Tier 3)
+            active_session = db.get_active_negotiation_session_for_supplier(client_id, supplier["id"])
+            session_entry = None
+            if active_session:
+                session_rfq_id = str(active_session.get("rfq_id"))
+                session_entry = next(
+                    (e for e in all_open_rfqs if str(e.get("rfqs", e).get("id")) == session_rfq_id),
+                    None,
+                )
+
             # Classify open RFQs into Unanswered (Awaiting Initial Response) vs Responded (Open for Revisions)
             unanswered_rfqs = []
             responded_rfqs = []
@@ -1905,7 +1994,29 @@ async def whatsapp_webhook(request: Request):
 
             msg_lower = (message_text or "").lower()
 
-            if len(unanswered_rfqs) == 1:
+            # Check if supplier explicitly quoted a specific product name differing from session
+            explicit_diff_match = None
+            if session_entry:
+                session_prod = (session_entry.get("rfqs", {}).get("product_name") or "").strip().lower()
+                for entry in all_open_rfqs:
+                    prod = (entry.get("rfqs", {}).get("product_name") or "").strip().lower()
+                    if prod and prod in msg_lower and prod != session_prod:
+                        explicit_diff_match = entry
+                        break
+
+            if explicit_diff_match:
+                # Explicit product reference overrides ongoing session for a different product
+                open_rfqs = [explicit_diff_match]
+                matched_rfq_id = str(explicit_diff_match.get("rfqs", explicit_diff_match).get("id"))
+                match_source = "explicit_product"
+                db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
+            elif session_entry:
+                # Active negotiation session continuity locks RFQ context
+                open_rfqs = [session_entry]
+                matched_rfq_id = str(active_session.get("rfq_id"))
+                match_source = "negotiation_session"
+                db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
+            elif len(unanswered_rfqs) == 1:
                 # Tier 4: Exactly one unanswered RFQ exists -> strongly prefer it over historical responded RFQs
                 unanswered_entry = unanswered_rfqs[0]
                 unanswered_prod = (unanswered_entry.get("rfqs", {}).get("product_name") or "").strip().lower()

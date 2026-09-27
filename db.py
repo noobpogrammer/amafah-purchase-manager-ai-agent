@@ -980,6 +980,7 @@ def get_suppliers_by_category(client_id: str, category: str) -> list:
 
 
 PRICE_TOLERANCE_AED = 3.0
+MAX_NEGOTIATION_ATTEMPTS = int(os.environ.get("MAX_NEGOTIATION_ATTEMPTS", 10))
 
 
 def classify_price_position(
@@ -1174,11 +1175,11 @@ def get_negotiation_attempts(rfq_id: str, supplier_id: str) -> int:
     return 0
 
 
-def increment_negotiation_attempts(rfq_id: str, supplier_id: str, max_attempts: int = 3) -> int:
+def increment_negotiation_attempts(rfq_id: str, supplier_id: str, max_attempts: int = MAX_NEGOTIATION_ATTEMPTS) -> int:
     """
     Atomically increments the negotiation attempt counter on rfq_suppliers
     only if current attempts < max_attempts.
-    Returns the new attempt count (e.g. 1, 2, 3) on success, or -1 if the limit was reached / update failed.
+    Returns the new attempt count (e.g. 1..10) on success, or -1 if the limit was reached / update failed.
     """
     if not rfq_id or not supplier_id:
         return -1
@@ -1229,6 +1230,112 @@ def increment_negotiation_attempts(rfq_id: str, supplier_id: str, max_attempts: 
         return -1
 
     return -1
+
+
+def get_active_negotiation_session(client_id: str, rfq_id: str, supplier_id: str) -> dict | None:
+    """Retrieves active negotiation session for a specific rfq and supplier."""
+    try:
+        res = (
+            supabase.table("negotiation_sessions")
+            .select("*")
+            .eq("client_id", client_id)
+            .eq("rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .eq("status", "active")
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if res.data and len(res.data) > 0:
+            return res.data[0]
+    except Exception as e:
+        logger.error("get_active_negotiation_session error: %s", e)
+    return None
+
+
+def get_active_negotiation_session_for_supplier(client_id: str, supplier_id: str) -> dict | None:
+    """Retrieves the most recently updated active negotiation session for a supplier across any open RFQ."""
+    try:
+        res = (
+            supabase.table("negotiation_sessions")
+            .select("*, rfqs(*)")
+            .eq("client_id", client_id)
+            .eq("supplier_id", supplier_id)
+            .eq("status", "active")
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if res.data and len(res.data) > 0:
+            return res.data[0]
+    except Exception as e:
+        logger.error("get_active_negotiation_session_for_supplier error: %s", e)
+    return None
+
+
+def create_or_update_negotiation_session(client_id: str, rfq_id: str, supplier_id: str, **kwargs) -> dict:
+    """Creates a new active negotiation session or updates the existing active session."""
+    now_utc = datetime.now(timezone.utc).isoformat()
+    try:
+        existing = get_active_negotiation_session(client_id, rfq_id, supplier_id)
+        if existing:
+            update_data = {**kwargs, "updated_at": now_utc}
+            res = (
+                supabase.table("negotiation_sessions")
+                .update(update_data)
+                .eq("id", existing["id"])
+                .execute()
+            )
+            return res.data[0] if (res.data and len(res.data) > 0) else {**existing, **update_data}
+        else:
+            insert_data = {
+                "client_id": client_id,
+                "rfq_id": rfq_id,
+                "supplier_id": supplier_id,
+                "status": "active",
+                "created_at": now_utc,
+                "updated_at": now_utc,
+                **kwargs,
+            }
+            res = supabase.table("negotiation_sessions").insert(insert_data).execute()
+            return res.data[0] if (res.data and len(res.data) > 0) else insert_data
+    except Exception as e:
+        logger.error("create_or_update_negotiation_session error: %s", e)
+        return {
+            "client_id": client_id,
+            "rfq_id": rfq_id,
+            "supplier_id": supplier_id,
+            "status": "active",
+            **kwargs,
+        }
+
+
+def complete_negotiation_session(session_id: str, status: str, **kwargs) -> dict | None:
+    """Marks a negotiation session completed with a final status."""
+    now_utc = datetime.now(timezone.utc).isoformat()
+    update_data = {
+        "status": status,
+        "completed_at": now_utc,
+        "updated_at": now_utc,
+        **kwargs,
+    }
+    try:
+        res = (
+            supabase.table("negotiation_sessions")
+            .update(update_data)
+            .eq("id", session_id)
+            .execute()
+        )
+        return res.data[0] if (res.data and len(res.data) > 0) else None
+    except Exception as e:
+        logger.error("complete_negotiation_session error: %s", e)
+        return None
+
+
+def deactivate_negotiation_session(session_id: str, reason: str = "deactivated"):
+    """Deactivates a negotiation session (e.g. on RFQ close or operator switch)."""
+    return complete_negotiation_session(session_id, status="expired")
+
 
 
 def build_historical_price_context(last_quote: float = None, current_quote: float = None) -> dict:

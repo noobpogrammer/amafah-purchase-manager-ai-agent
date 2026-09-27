@@ -42,7 +42,7 @@ class ValidationResult(BaseModel):
     sanitized_args: Dict[str, Any] = Field(default_factory=dict)
 
 
-MAX_NEGOTIATION_ATTEMPTS = int(os.environ.get("MAX_NEGOTIATION_ATTEMPTS", 3))
+MAX_NEGOTIATION_ATTEMPTS = int(os.environ.get("MAX_NEGOTIATION_ATTEMPTS", 10))
 
 HIGH_RISK_ACTIONS = {
     "close_rfq",
@@ -811,6 +811,16 @@ def validate_action(
                     category=ActionCategory.PROPOSE_COMMUNICATE,
                     reason=f"Negotiation attempt limit reached ({attempts}/{MAX_NEGOTIATION_ATTEMPTS}).",
                 )
+
+        # Check acceptable_max boundary
+        acc_max = target_rfq.get("acceptable_price_max") if target_rfq else None
+        if acc_max is not None and float(counter_price) > float(acc_max):
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=f"Counter price '{counter_price}' exceeds RFQ acceptable_price_max '{acc_max}'.",
+            )
 
         sanitized_delivery = args.get("delivery_time") or target_quote.get("delivery_time")
         if sanitized_delivery is not None and not isinstance(sanitized_delivery, str):

@@ -345,7 +345,7 @@ class TestNegotiationLimits:
         assert attempts == 2
 
         mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 75.0, "is_available": True}
-        with patch("db.get_negotiation_attempts", return_value=3), \
+        with patch("db.get_negotiation_attempts", return_value=10), \
              patch("db.get_quote_by_id", return_value=mock_quote), \
              patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
             proposal = ActionProposal(
@@ -386,7 +386,7 @@ class TestWhatsAppContinuity:
         }), patch("db.get_negotiation_attempts", return_value=1):
             ctx = main.format_rfq_context(open_rfqs, current_supplier_id="sup-1")
             assert "Best competing quote is AED 54.0" in ctx
-            assert "Negotiation Attempts Made: 1/3" in ctx
+            assert "Negotiation Attempts Made: 1/10" in ctx
             assert "Acceptable Price Range: AED 50.0 - 60.0" in ctx
             # Ensure no supplier names or IDs appear in the text
             assert "Supplier" not in ctx or "supplier" in ctx.lower()
@@ -583,7 +583,7 @@ class TestAtomicNegotiationConcurrency:
         mock_supabase.rpc.assert_called_with("increment_negotiation_attempts", {
             "p_rfq_id": "rfq-1",
             "p_supplier_id": "sup-1",
-            "p_max_attempts": 3,
+            "p_max_attempts": 10,
         })
 
     def test_increment_from_2_succeeds_rpc(self, mock_supabase):
@@ -617,7 +617,7 @@ class TestAtomicNegotiationConcurrency:
 
     def test_cas_fallback_increment_from_3_rejected(self, mock_supabase):
         mock_supabase.rpc.side_effect = Exception("RPC not found")
-        mock_supabase.table().select().eq().eq().execute.return_value.data = [{"negotiation_attempts": 3}]
+        mock_supabase.table().select().eq().eq().execute.return_value.data = [{"negotiation_attempts": 10}]
 
         res = db.increment_negotiation_attempts("rfq-1", "sup-1")
         assert res == -1

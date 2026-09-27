@@ -389,17 +389,17 @@ class TestNegotiationAttempts:
             sanitized_args={"rfq_id": RFQ_ID, "price": 47.0, "variants": [{"price": 47.0, "variant_label": None}]},
         )
         with patch.object(db, "record_quote"), \
-             patch.object(db, "get_negotiation_attempts", return_value=3), \
+             patch.object(db, "get_negotiation_attempts", return_value=10), \
              patch.object(db, "log_message", return_value="msg-1"), \
              patch("main.enqueue_message", new_callable=AsyncMock), \
              patch.object(db, "flag_for_human_review", return_value=[{"id": "flag-4"}]) as mock_flag:
             res = await main.execute_validated_action(val, context, "I can offer 47", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
             assert res["status"] == "escalated_to_human"
-            assert "Autonomous negotiation limit reached (3/3)" in mock_flag.call_args.kwargs["reason"]
+            assert "Autonomous negotiation limit reached (10/10)" in mock_flag.call_args.kwargs["reason"]
 
             res = await main.execute_validated_action(val, context, "I can offer 46", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
             assert res["status"] == "escalated_to_human"
-            assert "Autonomous negotiation limit reached (3/3)" in mock_flag.call_args.kwargs["reason"]
+            assert "Autonomous negotiation limit reached (10/10)" in mock_flag.call_args.kwargs["reason"]
 
     @pytest.mark.asyncio
     async def test_28_attempt_3_reached_and_quote_45_no_escalation(self, mock_supabase):
@@ -409,14 +409,14 @@ class TestNegotiationAttempts:
             is_valid=True,
             action="record_quote",
             category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 45.0, "variants": [{"price": 45.0, "variant_label": None}]},
+            sanitized_args={"rfq_id": RFQ_ID, "price": 43.0, "variants": [{"price": 43.0, "variant_label": None}]},
         )
         with patch.object(db, "record_quote"), \
-             patch.object(db, "get_negotiation_attempts", return_value=3), \
+             patch.object(db, "get_negotiation_attempts", return_value=10), \
              patch.object(db, "log_message", return_value="msg-1"), \
              patch("main.enqueue_message", new_callable=AsyncMock), \
              patch.object(db, "flag_for_human_review") as mock_flag:
-            res = await main.execute_validated_action(val, context, "I can offer 45", {"id": SUPPLIER_ID, "phone_number": "+971501111111"}, DEMO_CLIENT)
+            res = await main.execute_validated_action(val, context, "I can offer 43", {"id": SUPPLIER_ID, "phone_number": "+971501111111"}, DEMO_CLIENT)
             assert res["status"] == "recorded"
             mock_flag.assert_not_called()
 
@@ -437,7 +437,7 @@ class TestNegotiationAttempts:
         with patch.object(db, "get_quote_by_id", return_value=mock_quote), \
              patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
              patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
-             patch.object(db, "get_negotiation_attempts", return_value=3):
+             patch.object(db, "get_negotiation_attempts", return_value=10):
             proposal = ActionProposal(
                 tool_name="negotiate_price",
                 arguments={"rfq_id": RFQ_ID, "quote_id": QUOTE_ID, "quoted_price": 48.0, "counter_price": 43.0, "negotiation_message": "Can you do 43?"},

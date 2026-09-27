@@ -380,8 +380,8 @@ class TestQuoteProvenanceAndNegotiation:
             val = validate_action(proposal, client_id="c-1", supplier_id="s-1", matched_rfq_id="rfq-1", context_rfqs=[{"rfqs": {"id": "rfq-1", "status": "active"}}])
             assert val.is_valid is True
 
-        # Case B: At cap (3/3 attempts) -> REJECT
-        with patch("db.get_negotiation_attempts", return_value=3), \
+        # Case B: At cap (10/10 attempts) -> REJECT
+        with patch("db.get_negotiation_attempts", return_value=10), \
              patch("db.is_rfq_open", return_value=True), \
              patch("db.get_quote_by_id", return_value=mock_quote), \
              patch("db.get_quotes_for_rfq", return_value=[mock_quote]):

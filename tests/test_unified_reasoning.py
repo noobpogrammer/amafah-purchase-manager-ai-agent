@@ -315,7 +315,7 @@ class TestAgentContextAndHistory:
         )
         formatted = groq_client.format_agent_context_for_prompt(ctx)
         assert "AED 1500.0 - 2000.0" in formatted
-        assert "Negotiation Attempts Made: 2/3" in formatted
+        assert "Negotiation Attempts Made: 2/10" in formatted
         assert "Best competing quote is AED 1600" in formatted
 
 

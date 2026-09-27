@@ -415,8 +415,8 @@ class TestNegotiationAttempts:
             res = validate_action(proposal, client_id="client-p13", supplier_id="sup-p13", context_rfqs=[{"rfqs": base_rfq}], input_origin="supplier")
             assert res.is_valid is True
 
-        # Attempt 3 (limit reached) -> REJECT
-        with patch("db.get_negotiation_attempts", return_value=3), \
+        # Attempt 10 (limit reached) -> REJECT
+        with patch("db.get_negotiation_attempts", return_value=10), \
              patch("db.get_quote_by_id", return_value=mock_quote), \
              patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
             res = validate_action(proposal, client_id="client-p13", supplier_id="sup-p13", context_rfqs=[{"rfqs": base_rfq}], input_origin="supplier")
