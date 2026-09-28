@@ -306,6 +306,49 @@ class TestPhase22IntegrationFixes:
             # Verify no outbound supplier message was sent
             mock_enqueue.assert_not_called()
 
+    def test_integration_d2_session_resume_failure_leaves_flag_pending(self, auth_client):
+        client, client_id, user_id = auth_client
+        flag_id = str(uuid.uuid4())
+        rfq_id = str(uuid.uuid4())
+        supp_id = str(uuid.uuid4())
+
+        mock_flag = {
+            "id": flag_id,
+            "client_id": client_id,
+            "rfq_id": rfq_id,
+            "supplier_id": supp_id,
+            "status": "pending",
+            "metadata": {
+                "session_id": "nonexistent-or-expired-session",
+                "dimension": "delivery",
+            },
+        }
+        mock_rfq = {"id": rfq_id, "client_id": client_id, "status": "active"}
+
+        approval_payload = {
+            "dimension": "delivery",
+            "decision": "approve",
+            "constraints": {"max_days": 5},
+            "resume_negotiation": True,
+        }
+
+        # Constraint persists successfully, but session resume fails (returns None)
+        with patch.object(db, "get_flag_by_id", return_value=mock_flag), \
+             patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
+             patch.object(db, "set_rfq_negotiation_constraint", return_value={"id": "c1", "status": "authorized"}), \
+             patch.object(db, "resume_negotiation_session", return_value=None), \
+             patch.object(db, "resolve_flag_with_response") as mock_resolve, \
+             patch("main.enqueue_message", new_callable=AsyncMock) as mock_enqueue:
+
+            response = client.post(f"/flags/{flag_id}/negotiation-authorization", json=approval_payload)
+            assert response.status_code == 400
+            assert "Could not safely resume" in response.text
+
+            # Verify flag was NOT resolved because session resumption failed
+            mock_resolve.assert_not_called()
+            # Verify no outbound supplier message was sent
+            mock_enqueue.assert_not_called()
+
     # ============================================================
     # INTEGRATION TEST E — DELIVERY UNKNOWN (NULL BASELINE)
     # ============================================================

@@ -2985,14 +2985,7 @@ async def authorize_negotiation_tradeoff_endpoint(
     if not saved_constraint:
         raise HTTPException(status_code=500, detail="Failed to persist negotiation authority to database")
 
-    # 2. Resolve the flag only after successful persistence
-    db.resolve_flag_with_response(
-        flag_id=flag_id,
-        human_response=f"Operator {decision}d {dimension} trade-off",
-        client_id=client_id,
-    )
-
-    # 3. Resume negotiation if requested
+    # 2. Resume exact paused session (if resume requested)
     outbound_sent = False
     resumed_session = None
     if payload.resume_negotiation:
@@ -3011,12 +3004,21 @@ async def authorize_negotiation_tradeoff_endpoint(
             resumed_session = db.get_active_negotiation_session(client_id, rfq_id, supplier_id)
 
         if not resumed_session:
-            # Fail safely instead of silently creating a brand-new session
+            # Fail safely: keep flag pending and show error
             raise HTTPException(
                 status_code=400,
                 detail="Could not safely resume paused negotiation session. Associated session is missing, invalid, or expired.",
             )
 
+    # 3. Resolve the flag only after successful persistence and (if requested) successful session resumption
+    db.resolve_flag_with_response(
+        flag_id=flag_id,
+        human_response=f"Operator {decision}d {dimension} trade-off",
+        client_id=client_id,
+    )
+
+    # 4. Send supplier continuation message if resume requested and session resumed
+    if payload.resume_negotiation and resumed_session:
         supplier = flag.get("suppliers") or db.get_supplier_by_id(supplier_id)
         phone = supplier.get("phone_number") if supplier else None
 
