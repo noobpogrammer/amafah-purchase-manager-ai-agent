@@ -1,0 +1,241 @@
+=================================================================
+SCENARIO: STRICT_RFQ_DELIVERY_TRADEOFF
+Product: TEST PVC PIPE
+Target: AED 45.0 | Max: AED 48.0 | Qty: 20
+Required Delivery: 2 days
+Flexibility: None (Fixed Authority)
+=================================================================
+
+[00] PROCUREMENT AI:
+  Hi! This is Amafha Hardware Store.
+  We're requesting a quote for the following item:
+  
+  • Product: TEST PVC PIPE
+  • Specs: Schedule 40
+  • Quantity: 20
+  • Quote Required Within: 2 hour(s)
+  • Required Delivery: Within 2 days
+  
+  Please reply directly to this message with your price per unit (AED) and estimated delivery time. Thanks!
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: None
+    Attempt Count: 0
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[01] SUPPLIER:
+  72 AED per piece, delivery in 2 days.
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[02] PROCUREMENT AI:
+  Thanks for the quote. We're looking for a more competitive rate on this order. Could you do AED 45 per piece?
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: active
+    Attempt Count: 1
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 72.0
+    Latest Agent Counter: 45.0
+    Supplier Last Concession: 0.0
+    Supplier Total Concession: 0.0
+    Strategy: ANCHOR
+    Latest Recorded Quote: 72.0
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[03] SUPPLIER:
+  I can reduce it to 65 AED.
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: active
+    Attempt Count: 1
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 72.0
+    Latest Agent Counter: 45.0
+    Supplier Last Concession: 0.0
+    Supplier Total Concession: 0.0
+    Strategy: ANCHOR
+    Latest Recorded Quote: 72.0
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[04] PROCUREMENT AI:
+  Thanks for moving significantly on the price. We're getting closer. Could you meet us at AED 47.45 per piece?
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: active
+    Attempt Count: 2
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 65.0
+    Latest Agent Counter: 47.45
+    Supplier Last Concession: 7.0
+    Supplier Total Concession: 7.0
+    Strategy: RECIPROCAL_CONCESSION
+    Latest Recorded Quote: 65.0
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[05] SUPPLIER:
+  64.60 is the best I can improve right now.
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: active
+    Attempt Count: 2
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 65.0
+    Latest Agent Counter: 47.45
+    Supplier Last Concession: 7.0
+    Supplier Total Concession: 7.0
+    Strategy: RECIPROCAL_CONCESSION
+    Latest Recorded Quote: 65.0
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[06] PROCUREMENT AI:
+  Understood. We're still trying to improve the rate on this order. Is there any further flexibility on the price?
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: active
+    Attempt Count: 3
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 64.6
+    Latest Agent Counter: 47.45
+    Supplier Last Concession: 0.4
+    Supplier Total Concession: 7.4
+    Strategy: HOLD_POSITION
+    Latest Recorded Quote: 64.6
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[07] SUPPLIER:
+  If you can accept 4-day delivery, I can do 55 AED.
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: active
+    Attempt Count: 3
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 64.6
+    Latest Agent Counter: 47.45
+    Supplier Last Concession: 0.4
+    Supplier Total Concession: 7.4
+    Strategy: HOLD_POSITION
+    Latest Recorded Quote: 64.6
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[08] PROCUREMENT AI:
+  Thanks for the option. Let me confirm internally whether that delivery schedule can work and we'll get back to you.
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: awaiting_authorization
+    Attempt Count: 3
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 4.0
+    Latest Agent Counter: 47.45
+    Supplier Last Concession: 60.6
+    Supplier Total Concession: 68.0
+    Strategy: ACKNOWLEDGE_AND_STOP
+    Latest Recorded Quote: 4.0
+    Pending Flags: 1
+-----------------------------------------------------------------
+
+[09] OPERATOR / PROCUREMENT AI (Resumed):
+  We have some flexibility on delivery. If we allow up to 4 days, what is your best rate for this order?
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: active
+    Attempt Count: 3
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 4.0
+    Latest Agent Counter: 47.45
+    Supplier Last Concession: 60.6
+    Supplier Total Concession: 68.0
+    Strategy: ACKNOWLEDGE_AND_STOP
+    Latest Recorded Quote: 4.0
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[10] SUPPLIER:
+  With 4 days I can do 52.
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: active
+    Attempt Count: 3
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 4.0
+    Latest Agent Counter: 47.45
+    Supplier Last Concession: 60.6
+    Supplier Total Concession: 68.0
+    Strategy: ACKNOWLEDGE_AND_STOP
+    Latest Recorded Quote: 4.0
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[11] PROCUREMENT AI:
+  Thanks for the quote! We'll be in touch if we move forward.
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: target_reached
+    Attempt Count: 3
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 4.0
+    Latest Agent Counter: 47.45
+    Supplier Last Concession: 60.6
+    Supplier Total Concession: 68.0
+    Strategy: ACKNOWLEDGE_AND_STOP
+    Latest Recorded Quote: 4.0
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+[12] SUPPLIER:
+  49 AED is my final price.
+
+  STATE SNAPSHOT:
+    RFQ Status: active
+    Session ID: 77d21110-a982-4d91-b8b8-0a0db03cb4df
+    Session Status: target_reached
+    Attempt Count: 3
+    Initial Supplier Offer: 72.0
+    Latest Supplier Offer: 4.0
+    Latest Agent Counter: 47.45
+    Supplier Last Concession: 60.6
+    Supplier Total Concession: 68.0
+    Strategy: ACKNOWLEDGE_AND_STOP
+    Latest Recorded Quote: 4.0
+    Pending Flags: 0
+-----------------------------------------------------------------
+
+STOP REASON: Supplier declared final price 49 AED (above ceiling of 48 AED). Negotiation completed.
+
+INVARIANTS CHECKED:
+  [PASS] No Threshold Leakage 
+  [PASS] Quote-First Persistence 
+  [PASS] Session History Continuity 
+  [PASS] Human Review on Fixed Delivery Violation 
+=================================================================

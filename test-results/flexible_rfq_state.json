@@ -1,0 +1,297 @@
+{
+  "scenario_name": "FLEXIBLE_RFQ_DELIVERY_TRADEOFF",
+  "rfq_meta": {
+    "product_name": "TEST PVC PIPE",
+    "category": "Plumbing",
+    "specs": "Schedule 40",
+    "quantity": 20,
+    "acceptable_price_min": 45.0,
+    "acceptable_price_max": 48.0,
+    "deadline_hours": 2,
+    "required_delivery_days": 2,
+    "flexibility": {
+      "quantity": {
+        "authorized": true,
+        "min": 20,
+        "max": 30
+      },
+      "delivery": {
+        "authorized": true,
+        "max_days": 5
+      }
+    }
+  },
+  "turns": [
+    {
+      "turn_index": 0,
+      "timestamp": "2026-09-28T21:51:33.966696+00:00",
+      "speaker": "PROCUREMENT AI",
+      "message_text": "Hi! This is Amafha Hardware Store.\nWe're requesting a quote for the following item:\n\n\u2022 Product: TEST PVC PIPE\n\u2022 Specs: Schedule 40\n\u2022 Quantity: 20\n\u2022 Quote Required Within: 2 hour(s)\n\u2022 Required Delivery: Within 2 days\n\nPlease reply directly to this message with your price per unit (AED) and estimated delivery time. Thanks!",
+      "quoted_msg_id": null,
+      "state": {
+        "rfq_status": "active",
+        "session_id": null,
+        "attempt_count": 0,
+        "pending_human_review_count": 0
+      },
+      "meta": {
+        "outbound_id": "TEST-WA-OUT-0001"
+      }
+    },
+    {
+      "turn_index": 1,
+      "timestamp": "2026-09-28T21:51:35.916055+00:00",
+      "speaker": "SUPPLIER",
+      "message_text": "72 AED per piece, delivery in 2 days.",
+      "quoted_msg_id": "TEST-WA-OUT-0001",
+      "state": {
+        "rfq_status": "active",
+        "quote_count": 0,
+        "pending_human_review_count": 0
+      },
+      "meta": {}
+    },
+    {
+      "turn_index": 2,
+      "timestamp": "2026-09-28T21:51:51.972193+00:00",
+      "speaker": "PROCUREMENT AI",
+      "message_text": "Thanks for the quote. We're looking for a more competitive rate on this order. Could you do AED 45 per piece?",
+      "quoted_msg_id": null,
+      "state": {
+        "rfq_status": "active",
+        "session_id": "9126407f-fc64-4aab-afb7-327f5403695c",
+        "session_status": "active",
+        "attempt_count": 1,
+        "initial_supplier_offer": 72.0,
+        "previous_supplier_offer": null,
+        "latest_supplier_offer": 72.0,
+        "latest_agent_counter": 45.0,
+        "supplier_last_concession": 0.0,
+        "supplier_total_concession": 0.0,
+        "selected_strategy": "ANCHOR",
+        "quote_count": 1,
+        "latest_quote": 72.0,
+        "pending_human_review_count": 0
+      },
+      "meta": {
+        "outbound_id": "TEST-WA-OUT-0002"
+      }
+    },
+    {
+      "turn_index": 3,
+      "timestamp": "2026-09-28T21:51:53.506169+00:00",
+      "speaker": "SUPPLIER",
+      "message_text": "I can reduce it to 65 AED.",
+      "quoted_msg_id": null,
+      "state": {
+        "rfq_status": "active",
+        "session_id": "9126407f-fc64-4aab-afb7-327f5403695c",
+        "session_status": "active",
+        "attempt_count": 1,
+        "initial_supplier_offer": 72.0,
+        "previous_supplier_offer": null,
+        "latest_supplier_offer": 72.0,
+        "latest_agent_counter": 45.0,
+        "supplier_last_concession": 0.0,
+        "supplier_total_concession": 0.0,
+        "selected_strategy": "ANCHOR",
+        "quote_count": 1,
+        "latest_quote": 72.0,
+        "pending_human_review_count": 0
+      },
+      "meta": {}
+    },
+    {
+      "turn_index": 4,
+      "timestamp": "2026-09-28T21:52:09.046085+00:00",
+      "speaker": "PROCUREMENT AI",
+      "message_text": "Thanks for moving significantly on the price. We're getting closer. Could you meet us at AED 47.45 per piece?",
+      "quoted_msg_id": null,
+      "state": {
+        "rfq_status": "active",
+        "session_id": "9126407f-fc64-4aab-afb7-327f5403695c",
+        "session_status": "active",
+        "attempt_count": 2,
+        "initial_supplier_offer": 72.0,
+        "previous_supplier_offer": 72.0,
+        "latest_supplier_offer": 65.0,
+        "latest_agent_counter": 47.45,
+        "supplier_last_concession": 7.0,
+        "supplier_total_concession": 7.0,
+        "selected_strategy": "RECIPROCAL_CONCESSION",
+        "quote_count": 1,
+        "latest_quote": 65.0,
+        "pending_human_review_count": 0
+      },
+      "meta": {
+        "outbound_id": "TEST-WA-OUT-0003"
+      }
+    },
+    {
+      "turn_index": 5,
+      "timestamp": "2026-09-28T21:52:10.547305+00:00",
+      "speaker": "SUPPLIER",
+      "message_text": "64.60 is the best I can improve right now.",
+      "quoted_msg_id": null,
+      "state": {
+        "rfq_status": "active",
+        "session_id": "9126407f-fc64-4aab-afb7-327f5403695c",
+        "session_status": "active",
+        "attempt_count": 2,
+        "initial_supplier_offer": 72.0,
+        "previous_supplier_offer": 72.0,
+        "latest_supplier_offer": 65.0,
+        "latest_agent_counter": 47.45,
+        "supplier_last_concession": 7.0,
+        "supplier_total_concession": 7.0,
+        "selected_strategy": "RECIPROCAL_CONCESSION",
+        "quote_count": 1,
+        "latest_quote": 65.0,
+        "pending_human_review_count": 0
+      },
+      "meta": {}
+    },
+    {
+      "turn_index": 6,
+      "timestamp": "2026-09-28T21:52:26.652694+00:00",
+      "speaker": "PROCUREMENT AI",
+      "message_text": "Understood. We're still trying to improve the rate on this order. Is there any further flexibility on the price?",
+      "quoted_msg_id": null,
+      "state": {
+        "rfq_status": "active",
+        "session_id": "9126407f-fc64-4aab-afb7-327f5403695c",
+        "session_status": "active",
+        "attempt_count": 3,
+        "initial_supplier_offer": 72.0,
+        "previous_supplier_offer": 65.0,
+        "latest_supplier_offer": 64.6,
+        "latest_agent_counter": 47.45,
+        "supplier_last_concession": 0.4,
+        "supplier_total_concession": 7.4,
+        "selected_strategy": "HOLD_POSITION",
+        "quote_count": 1,
+        "latest_quote": 64.6,
+        "pending_human_review_count": 0
+      },
+      "meta": {
+        "outbound_id": "TEST-WA-OUT-0004"
+      }
+    },
+    {
+      "turn_index": 7,
+      "timestamp": "2026-09-28T21:52:28.596540+00:00",
+      "speaker": "SUPPLIER",
+      "message_text": "If you can accept 4-day delivery, I can do 55 AED.",
+      "quoted_msg_id": null,
+      "state": {
+        "rfq_status": "active",
+        "session_id": "9126407f-fc64-4aab-afb7-327f5403695c",
+        "session_status": "active",
+        "attempt_count": 3,
+        "initial_supplier_offer": 72.0,
+        "previous_supplier_offer": 65.0,
+        "latest_supplier_offer": 64.6,
+        "latest_agent_counter": 47.45,
+        "supplier_last_concession": 0.4,
+        "supplier_total_concession": 7.4,
+        "selected_strategy": "HOLD_POSITION",
+        "quote_count": 1,
+        "latest_quote": 64.6,
+        "pending_human_review_count": 0
+      },
+      "meta": {}
+    },
+    {
+      "turn_index": 8,
+      "timestamp": "2026-09-28T21:52:40.267650+00:00",
+      "speaker": "PROCUREMENT AI",
+      "message_text": "Thanks for the quote! We'll be in touch if we move forward.",
+      "quoted_msg_id": null,
+      "state": {
+        "rfq_status": "active",
+        "session_id": "9126407f-fc64-4aab-afb7-327f5403695c",
+        "session_status": "target_reached",
+        "attempt_count": 3,
+        "initial_supplier_offer": 72.0,
+        "previous_supplier_offer": 64.6,
+        "latest_supplier_offer": 4.0,
+        "latest_agent_counter": 47.45,
+        "supplier_last_concession": 60.6,
+        "supplier_total_concession": 68.0,
+        "selected_strategy": "ACKNOWLEDGE_AND_STOP",
+        "quote_count": 1,
+        "latest_quote": 4.0,
+        "pending_human_review_count": 0
+      },
+      "meta": {
+        "outbound_id": "TEST-WA-OUT-0005"
+      }
+    },
+    {
+      "turn_index": 9,
+      "timestamp": "2026-09-28T21:52:42.355938+00:00",
+      "speaker": "SUPPLIER",
+      "message_text": "With 4 days I can do 52.",
+      "quoted_msg_id": null,
+      "state": {
+        "rfq_status": "active",
+        "session_id": "9126407f-fc64-4aab-afb7-327f5403695c",
+        "session_status": "target_reached",
+        "attempt_count": 3,
+        "initial_supplier_offer": 72.0,
+        "previous_supplier_offer": 64.6,
+        "latest_supplier_offer": 4.0,
+        "latest_agent_counter": 47.45,
+        "supplier_last_concession": 60.6,
+        "supplier_total_concession": 68.0,
+        "selected_strategy": "ACKNOWLEDGE_AND_STOP",
+        "quote_count": 1,
+        "latest_quote": 4.0,
+        "pending_human_review_count": 0
+      },
+      "meta": {}
+    },
+    {
+      "turn_index": 10,
+      "timestamp": "2026-09-28T21:52:53.014654+00:00",
+      "speaker": "SUPPLIER",
+      "message_text": "49 AED is my final price.",
+      "quoted_msg_id": null,
+      "state": {
+        "rfq_status": "active",
+        "session_id": "e92994d1-f73a-4dfe-b7c3-20bf6ac06fb5",
+        "session_status": "target_reached",
+        "attempt_count": 0,
+        "initial_supplier_offer": 4.0,
+        "previous_supplier_offer": 72.0,
+        "latest_supplier_offer": 4.0,
+        "latest_agent_counter": null,
+        "supplier_last_concession": 68.0,
+        "supplier_total_concession": 0.0,
+        "selected_strategy": "ACKNOWLEDGE_AND_STOP",
+        "quote_count": 1,
+        "latest_quote": 4.0,
+        "pending_human_review_count": 0
+      },
+      "meta": {}
+    }
+  ],
+  "stop_reason": "Supplier declared final price 49 AED. Negotiation completed autonomously.",
+  "invariants": [
+    {
+      "name": "No Threshold Leakage",
+      "passed": true,
+      "details": ""
+    },
+    {
+      "name": "Zero Human Review on Pre-Authorized Trade-off",
+      "passed": true,
+      "details": ""
+    },
+    {
+      "name": "Continuous Autonomous Concession",
+      "passed": true,
+      "details": ""
+    }
+  ]
+}

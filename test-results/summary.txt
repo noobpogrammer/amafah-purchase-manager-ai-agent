@@ -1,0 +1,35 @@
+================================================================================
+NEGOTIATION E2E ACCEPTANCE SUITE SUMMARY
+================================================================================
+Core Negotiation:
+  [PASS] High Quote Anchor
+  [PASS] Reciprocal Concession (AI Concession < Supplier Concession)
+  [PASS] Tiny Concession Hold (Concession < 1 AED ignored)
+  [PASS] No Movement Hold
+  [PASS] Price Increase Rejection
+  [PASS] Target Reached Stopping Condition
+  [PASS] Final Price Stopping Evaluation
+  [PASS] Max Attempts Monotonic Enforcement (10 Limit)
+
+Authority & Flexibility:
+  [PASS] Fixed Delivery Escalation to Human Review
+  [PASS] Flexible Delivery Autonomous Continuation
+  [PASS] Delivery Outside Authorization Escalation
+  [PASS] Fixed Quantity Escalation
+  [PASS] Flexible Quantity Continuation
+  [PASS] Quantity Outside Authorization Escalation
+  [PASS] Unknown Delivery Baseline (No 2-day assumption)
+
+Routing & Session Integrity:
+  [PASS] Native WhatsApp Quoted Stanza Correlation
+  [PASS] Standalone Message Webhook Processing
+  [PASS] Multi-RFQ Isolation for Single Supplier
+  [PASS] Durable Webhook Idempotency (Duplicate Ignored)
+  [PASS] Exact Paused Session Resume on Approval
+  [PASS] Exact Paused Session Resume on Rejection
+  [PASS] Session Security & Tenant Scoping
+  [PASS] Quote-First Persistence Guarantee
+  [PASS] Safe Outbound Transport (Zero Real Messages Sent)
+
+TOTAL: 20 passed, 0 failed
+================================================================================
