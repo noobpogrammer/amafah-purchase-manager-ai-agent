@@ -1454,6 +1454,128 @@ def set_rfq_negotiation_constraint(
         return None
 
 
+def build_default_negotiation_constraints_payload(
+    client_id: str,
+    rfq_data: dict,
+    flexibility: Optional[dict] = None,
+    authorized_by: Optional[str] = None,
+) -> list[dict]:
+    """
+    Constructs the list of negotiation constraint records for all 4 dimensions
+    using the canonical nested flexibility payload format:
+    {
+      "quantity": {"authorized": bool, "min": int, "max": int},
+      "delivery": {"authorized": bool, "max_days": int},
+      "specification": {"authorized": bool, "allowed_alternatives": str}
+    }
+    """
+    flex = flexibility or {}
+    results = []
+
+    # 1. Price
+    price_constraints = {}
+    if rfq_data.get("acceptable_price_min") is not None:
+        price_constraints["preferred_target"] = float(rfq_data["acceptable_price_min"])
+    elif rfq_data.get("last_quote") is not None:
+        price_constraints["preferred_target"] = float(rfq_data["last_quote"])
+    if rfq_data.get("acceptable_price_max") is not None:
+        price_constraints["max"] = float(rfq_data["acceptable_price_max"])
+
+    results.append({
+        "client_id": client_id,
+        "dimension": "price",
+        "status": "authorized",
+        "constraints": price_constraints,
+        "source": "rfq_creation",
+        "authorized_by": authorized_by,
+    })
+
+    # 2. Quantity
+    req_qty = rfq_data.get("quantity")
+    qty_flex = flex.get("quantity") if isinstance(flex.get("quantity"), dict) else None
+    is_qty_auth = bool(
+        (qty_flex and qty_flex.get("authorized"))
+        or flex.get("quantity_flexible")
+    )
+    if is_qty_auth:
+        q_min = qty_flex.get("min") if qty_flex else flex.get("quantity_min")
+        q_max = qty_flex.get("max") if qty_flex else flex.get("quantity_max")
+        if q_min is None:
+            q_min = req_qty
+        if q_max is None:
+            q_max = req_qty
+        q_constraints = {
+            "required": req_qty,
+            "min": int(q_min) if q_min is not None else None,
+            "max": int(q_max) if q_max is not None else None,
+        }
+        q_status = "authorized"
+    else:
+        q_status = "fixed"
+        q_constraints = {"required": req_qty}
+
+    results.append({
+        "client_id": client_id,
+        "dimension": "quantity",
+        "status": q_status,
+        "constraints": q_constraints,
+        "source": "rfq_creation",
+        "authorized_by": authorized_by,
+    })
+
+    # 3. Delivery
+    req_days = rfq_data.get("required_delivery_days")
+    deliv_flex = flex.get("delivery") if isinstance(flex.get("delivery"), dict) else None
+    is_deliv_auth = bool(
+        (deliv_flex and deliv_flex.get("authorized"))
+        or flex.get("delivery_flexible")
+    )
+    if is_deliv_auth:
+        d_max = deliv_flex.get("max_days") if deliv_flex else flex.get("delivery_max_days")
+        d_constraints = {
+            "required_days": req_days,
+            "max_days": int(d_max) if d_max is not None else None,
+        }
+        d_status = "authorized"
+    else:
+        d_status = "fixed"
+        d_constraints = {"required_days": req_days}
+
+    results.append({
+        "client_id": client_id,
+        "dimension": "delivery",
+        "status": d_status,
+        "constraints": d_constraints,
+        "source": "rfq_creation",
+        "authorized_by": authorized_by,
+    })
+
+    # 4. Specification
+    spec_flex = flex.get("specification") if isinstance(flex.get("specification"), dict) else None
+    is_spec_auth = bool(
+        (spec_flex and spec_flex.get("authorized"))
+        or flex.get("specs_flexible")
+    )
+    alt = spec_flex.get("allowed_alternatives") if spec_flex else flex.get("allowed_alternatives")
+    if is_spec_auth and alt and str(alt).strip():
+        s_status = "authorized"
+        s_constraints = {"allowed_alternatives": str(alt).strip()}
+    else:
+        s_status = "fixed"
+        s_constraints = {"allowed_alternatives": None}
+
+    results.append({
+        "client_id": client_id,
+        "dimension": "specification",
+        "status": s_status,
+        "constraints": s_constraints,
+        "source": "rfq_creation",
+        "authorized_by": authorized_by,
+    })
+
+    return results
+
+
 def create_default_rfq_negotiation_constraints(
     client_id: str,
     rfq_id: str,
@@ -1468,98 +1590,25 @@ def create_default_rfq_negotiation_constraints(
     - delivery: fixed unless flexibility authorized
     - specification: fixed unless flexibility authorized
     """
-    flex = flexibility or {}
+    constraints_payload = build_default_negotiation_constraints_payload(
+        client_id=client_id,
+        rfq_data=rfq_data,
+        flexibility=flexibility,
+        authorized_by=authorized_by,
+    )
     results = []
-
-    # 1. Price
-    price_constraints = {}
-    if rfq_data.get("acceptable_price_min") is not None:
-        price_constraints["preferred_target"] = float(rfq_data["acceptable_price_min"])
-    elif rfq_data.get("last_quote") is not None:
-        price_constraints["preferred_target"] = float(rfq_data["last_quote"])
-    if rfq_data.get("acceptable_price_max") is not None:
-        price_constraints["max"] = float(rfq_data["acceptable_price_max"])
-
-    p_res = set_rfq_negotiation_constraint(
-        client_id=client_id,
-        rfq_id=rfq_id,
-        dimension="price",
-        status="authorized",
-        constraints=price_constraints,
-        source="rfq_creation",
-        authorized_by=authorized_by,
-    )
-    if p_res:
-        results.append(p_res)
-
-    # 2. Quantity
-    req_qty = rfq_data.get("quantity")
-    if flex.get("quantity_flexible"):
-        q_status = "authorized"
-        q_constraints = {
-            "required": req_qty,
-            "min": int(flex["quantity_min"]) if flex.get("quantity_min") is not None else req_qty,
-            "max": int(flex["quantity_max"]) if flex.get("quantity_max") is not None else req_qty,
-        }
-    else:
-        q_status = "fixed"
-        q_constraints = {"required": req_qty}
-
-    q_res = set_rfq_negotiation_constraint(
-        client_id=client_id,
-        rfq_id=rfq_id,
-        dimension="quantity",
-        status=q_status,
-        constraints=q_constraints,
-        source="rfq_creation",
-        authorized_by=authorized_by,
-    )
-    if q_res:
-        results.append(q_res)
-
-    # 3. Delivery
-    if flex.get("delivery_flexible"):
-        d_status = "authorized"
-        d_constraints = {
-            "required_days": flex.get("required_days"),
-            "max_days": int(flex["delivery_max_days"]) if flex.get("delivery_max_days") is not None else None,
-        }
-    else:
-        d_status = "fixed"
-        d_constraints = {"required_days": flex.get("required_days")}
-
-    d_res = set_rfq_negotiation_constraint(
-        client_id=client_id,
-        rfq_id=rfq_id,
-        dimension="delivery",
-        status=d_status,
-        constraints=d_constraints,
-        source="rfq_creation",
-        authorized_by=authorized_by,
-    )
-    if d_res:
-        results.append(d_res)
-
-    # 4. Specification
-    if flex.get("specs_flexible") and flex.get("allowed_alternatives"):
-        s_status = "authorized"
-        s_constraints = {"allowed_alternatives": str(flex["allowed_alternatives"]).strip()}
-    else:
-        s_status = "fixed"
-        s_constraints = {"allowed_alternatives": None}
-
-    s_res = set_rfq_negotiation_constraint(
-        client_id=client_id,
-        rfq_id=rfq_id,
-        dimension="specification",
-        status=s_status,
-        constraints=s_constraints,
-        source="rfq_creation",
-        authorized_by=authorized_by,
-    )
-    if s_res:
-        results.append(s_res)
-
+    for item in constraints_payload:
+        saved = set_rfq_negotiation_constraint(
+            client_id=client_id,
+            rfq_id=rfq_id,
+            dimension=item["dimension"],
+            status=item["status"],
+            constraints=item["constraints"],
+            source=item.get("source", "rfq_creation"),
+            authorized_by=item.get("authorized_by"),
+        )
+        if saved:
+            results.append(saved)
     return results
 
 
@@ -1600,34 +1649,63 @@ def build_historical_price_context(last_quote: float = None, current_quote: floa
         return None
 
 
-def create_rfq_and_match_suppliers(client_id: str, product_name: str, category: str,
-                                   deadline_hours: int = 24, specs: str = None,
-                                   quantity: int = None,
-                                   last_quote: float = None,
-                                   acceptable_price_min: float = None,
-                                   acceptable_price_max: float = None):
-    """Creates a new RFQ row, queries matching active suppliers by category, and creates rfq_suppliers join records."""
-    now_utc = datetime.now(timezone.utc)
-    due_by = (now_utc + timedelta(hours=deadline_hours)).isoformat()
-
-    insert_data = {
+def create_rfq_and_match_suppliers(
+    client_id: str,
+    product_name: str,
+    category: str,
+    deadline_hours: int = 24,
+    specs: str = None,
+    quantity: int = None,
+    last_quote: float = None,
+    acceptable_price_min: float = None,
+    acceptable_price_max: float = None,
+    required_delivery_days: int = None,
+    flexibility: Optional[dict] = None,
+    authorized_by: Optional[str] = None,
+):
+    """
+    Atomically creates a new RFQ row and initial rfq_negotiation_constraints in a single PostgreSQL transaction
+    using create_rfq_with_constraints_rpc. Then matches active suppliers by category and creates rfq_suppliers join records.
+    """
+    rfq_data = {
         "client_id": client_id,
         "product_name": product_name,
         "category": category,
         "specs": specs,
         "quantity": quantity,
         "deadline_hours": deadline_hours,
-        "due_by": due_by,
-        "status": "active",
-        "finalization_status": "pending",
         "last_quote": last_quote,
         "acceptable_price_min": acceptable_price_min,
         "acceptable_price_max": acceptable_price_max,
+        "required_delivery_days": required_delivery_days,
     }
 
-    rfq_res = supabase.table("rfqs").insert(insert_data).execute()
+    constraints_payload = build_default_negotiation_constraints_payload(
+        client_id=client_id,
+        rfq_data=rfq_data,
+        flexibility=flexibility,
+        authorized_by=authorized_by,
+    )
 
-    rfq = rfq_res.data[0]
+    rpc_params = {
+        "p_client_id": client_id,
+        "p_product_name": product_name,
+        "p_category": category,
+        "p_specs": specs,
+        "p_quantity": quantity,
+        "p_last_quote": last_quote,
+        "p_acceptable_price_min": acceptable_price_min,
+        "p_acceptable_price_max": acceptable_price_max,
+        "p_deadline_hours": deadline_hours,
+        "p_required_delivery_days": required_delivery_days,
+        "p_constraints": constraints_payload,
+    }
+
+    rpc_res = supabase.rpc("create_rfq_with_constraints_rpc", rpc_params).execute()
+    if not rpc_res or not rpc_res.data:
+        raise RuntimeError("create_rfq_with_constraints_rpc returned empty response")
+    res_data = rpc_res.data
+    rfq = res_data[0] if isinstance(res_data, list) and len(res_data) > 0 else res_data
 
     matching_suppliers = get_suppliers_by_category(client_id, category)
 
@@ -1878,16 +1956,20 @@ def complete_flag_operator_action(flag_id: str, client_id: str, human_response: 
         return None
 
 
-def resolve_flag(flag_id: str, client_id: str = None):
-    """Marks a flagged_for_review item as resolved (administrative dismissal)."""
+def resolve_flag(flag_id: str, client_id: str = None, human_response: str = None):
+    """Marks a flagged_for_review item as resolved (administrative dismissal or resolution)."""
     from datetime import datetime, timezone
+
+    update_payload = {
+        "status": "resolved",
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if human_response is not None:
+        update_payload["human_response"] = human_response
 
     query = (
         supabase.table("flagged_for_review")
-        .update({
-            "status": "resolved",
-            "resolved_at": datetime.now(timezone.utc).isoformat(),
-        })
+        .update(update_payload)
         .eq("id", flag_id)
     )
     if client_id:

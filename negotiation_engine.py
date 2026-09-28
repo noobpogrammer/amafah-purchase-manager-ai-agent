@@ -307,30 +307,24 @@ def evaluate_supplier_tradeoff(
     if deliv_match:
         proposed_days = int(deliv_match.group(1))
         deliv_constraint = constraints_by_dim.get("delivery")
-        current_req = 2
+        current_req = None
         if deliv_constraint and deliv_constraint.get("constraints"):
-            current_req = deliv_constraint["constraints"].get("required_days") or 2
+            current_req = deliv_constraint["constraints"].get("required_days")
+        if current_req is None and rfq:
+            current_req = rfq.get("required_delivery_days")
 
-        if proposed_days > current_req:
-            if deliv_constraint and deliv_constraint.get("status") == "authorized":
-                max_days = deliv_constraint.get("constraints", {}).get("max_days")
-                if max_days is not None and proposed_days <= int(max_days):
-                    return {
-                        "has_tradeoff": True,
-                        "is_authorized": True,
-                        "dimension": "delivery",
-                        "current_value": current_req,
-                        "supplier_proposed_value": proposed_days,
-                    }
-                else:
-                    return {
-                        "has_tradeoff": True,
-                        "is_authorized": False,
-                        "dimension": "delivery",
-                        "current_value": current_req,
-                        "supplier_proposed_value": proposed_days,
-                        "reason": f"Supplier proposed {proposed_days}-day delivery exceeding authorized maximum ({max_days} days).",
-                    }
+        is_authorized_deliv = bool(deliv_constraint and deliv_constraint.get("status") == "authorized")
+        max_days = deliv_constraint.get("constraints", {}).get("max_days") if deliv_constraint else None
+
+        if is_authorized_deliv:
+            if max_days is not None and proposed_days <= int(max_days):
+                return {
+                    "has_tradeoff": True,
+                    "is_authorized": True,
+                    "dimension": "delivery",
+                    "current_value": current_req,
+                    "supplier_proposed_value": proposed_days,
+                }
             else:
                 return {
                     "has_tradeoff": True,
@@ -338,7 +332,27 @@ def evaluate_supplier_tradeoff(
                     "dimension": "delivery",
                     "current_value": current_req,
                     "supplier_proposed_value": proposed_days,
-                    "reason": f"Supplier proposed {proposed_days}-day delivery but delivery is fixed at {current_req} days.",
+                    "reason": f"Supplier proposed {proposed_days}-day delivery exceeding authorized maximum ({max_days} days).",
+                }
+        else:
+            if current_req is not None:
+                if proposed_days > current_req:
+                    return {
+                        "has_tradeoff": True,
+                        "is_authorized": False,
+                        "dimension": "delivery",
+                        "current_value": current_req,
+                        "supplier_proposed_value": proposed_days,
+                        "reason": f"Supplier proposed {proposed_days}-day delivery but delivery is fixed at {current_req} days.",
+                    }
+            else:
+                return {
+                    "has_tradeoff": True,
+                    "is_authorized": False,
+                    "dimension": "delivery",
+                    "current_value": None,
+                    "supplier_proposed_value": proposed_days,
+                    "reason": f"Supplier proposed {proposed_days}-day delivery; required delivery is not specified in RFQ.",
                 }
 
     # 2. Check Conditional Quantity Trade-off

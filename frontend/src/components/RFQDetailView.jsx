@@ -305,7 +305,7 @@ export default function RFQDetailView({
                     </div>
                     <h3 className="rfq-product-title">{detailData.rfq.product_name}</h3>
                     <p className="rfq-specs-text">
-                      Specs: <strong>{detailData.rfq.specs || 'Standard'}</strong> | Quantity: <strong>{detailData.rfq.quantity || 'N/A'}</strong> | Deadline: <strong>{detailData.rfq.deadline_hours || 24} hours</strong>
+                      Specs: <strong>{detailData.rfq.specs || 'Standard'}</strong> | Quantity: <strong>{detailData.rfq.quantity || 'N/A'}</strong> | Required Delivery: <strong>{detailData.rfq.required_delivery_days ? `${detailData.rfq.required_delivery_days} days` : 'Not specified'}</strong> | Deadline: <strong>{detailData.rfq.deadline_hours || 24} hours</strong>
                       {detailData.rfq.last_quote && (
                         <> | Last Quote: <strong>AED {detailData.rfq.last_quote}</strong> (Target: <strong>AED {detailData.rfq.last_quote}</strong>, Final Tolerance: Up to <strong>AED {Number(detailData.rfq.last_quote) + 2}</strong>)</>
                       )}
@@ -444,16 +444,17 @@ export default function RFQDetailView({
                         const delConstraint = (detailData.constraints || []).find((c) => c.dimension === 'delivery');
                         const isAuth = delConstraint?.status === 'authorized';
                         const maxDays = delConstraint?.constraints?.max_days;
+                        const reqDays = detailData.rfq.required_delivery_days || delConstraint?.constraints?.required_days;
                         return (
                           <div style={{ padding: '0.75rem', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
                             <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase' }}>Delivery Timing</div>
                             <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
                               {isAuth && maxDays
                                 ? `Flexible up to ${maxDays} days`
-                                : 'Fixed / Not authorized'}
+                                : (reqDays ? `Fixed at ${reqDays} days` : 'Not specified / Fixed')}
                             </div>
                             <div style={{ fontSize: '0.825rem', color: '#475569' }}>
-                              {isAuth ? `Max: ${maxDays} days acceptable` : 'Deadline extension requires approval'}
+                              {isAuth ? `Max: ${maxDays} days acceptable` : (reqDays ? `Required: ${reqDays} days` : 'Baseline not specified')}
                             </div>
                             <span className={`badge ${isAuth ? 'badge-status responded' : 'badge-status sent'}`} style={{ marginTop: '0.4rem', display: 'inline-block' }}>
                               {isAuth ? 'Authorized' : 'Fixed'}

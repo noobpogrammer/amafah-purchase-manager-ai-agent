@@ -72,6 +72,7 @@ class RFQCreateRequest(BaseModel):
     acceptable_price_min: Optional[float] = None
     acceptable_price_max: Optional[float] = None
     deadline_hours: int = Field(..., gt=0)
+    required_delivery_days: Optional[int] = None
     flexibility: Optional[dict] = None
 
     @field_validator("product_name", "category", "specs")
@@ -81,12 +82,14 @@ class RFQCreateRequest(BaseModel):
             raise ValueError(f"'{info.field_name}' cannot be empty or blank")
         return str(v).strip()
 
-    @field_validator("deadline_hours")
+    @field_validator("deadline_hours", "required_delivery_days")
     @classmethod
-    def validate_deadline_hours(cls, v: int) -> int:
-        if v is None or v <= 0:
-            raise ValueError("'deadline_hours' must be a positive integer")
-        return int(v)
+    def validate_positive_ints(cls, v: Optional[int], info: ValidationInfo) -> Optional[int]:
+        if v is not None:
+            if int(v) <= 0:
+                raise ValueError(f"'{info.field_name}' must be a positive integer")
+            return int(v)
+        return v
 
     @field_validator("acceptable_price_min", "acceptable_price_max", "last_quote")
     @classmethod
@@ -106,8 +109,18 @@ class RFQCreateRequest(BaseModel):
         if self.acceptable_price_min is not None and self.acceptable_price_max is not None:
             if self.acceptable_price_min > self.acceptable_price_max:
                 raise ValueError("acceptable_price_min cannot be greater than acceptable_price_max")
-        if self.flexibility:
-            if self.flexibility.get("quantity_flexible"):
+        if self.flexibility and isinstance(self.flexibility, dict):
+            qty_dict = self.flexibility.get("quantity")
+            if isinstance(qty_dict, dict) and qty_dict.get("authorized"):
+                q_min = qty_dict.get("min")
+                q_max = qty_dict.get("max")
+                if q_min is not None and int(q_min) <= 0:
+                    raise ValueError("quantity min must be a positive integer")
+                if q_max is not None and int(q_max) <= 0:
+                    raise ValueError("quantity max must be a positive integer")
+                if q_min is not None and q_max is not None and int(q_min) > int(q_max):
+                    raise ValueError("quantity min cannot be greater than max")
+            elif self.flexibility.get("quantity_flexible"):
                 q_min = self.flexibility.get("quantity_min")
                 q_max = self.flexibility.get("quantity_max")
                 if q_min is not None and int(q_min) <= 0:
@@ -116,10 +129,26 @@ class RFQCreateRequest(BaseModel):
                     raise ValueError("quantity_max must be a positive integer")
                 if q_min is not None and q_max is not None and int(q_min) > int(q_max):
                     raise ValueError("quantity_min cannot be greater than quantity_max")
-            if self.flexibility.get("delivery_flexible"):
+
+            deliv_dict = self.flexibility.get("delivery")
+            if isinstance(deliv_dict, dict) and deliv_dict.get("authorized"):
+                d_max = deliv_dict.get("max_days")
+                if d_max is not None and int(d_max) <= 0:
+                    raise ValueError("delivery max_days must be a positive integer")
+            elif self.flexibility.get("delivery_flexible"):
                 d_max = self.flexibility.get("delivery_max_days")
                 if d_max is not None and int(d_max) <= 0:
                     raise ValueError("delivery_max_days must be a positive integer")
+
+            spec_dict = self.flexibility.get("specification")
+            if isinstance(spec_dict, dict) and spec_dict.get("authorized"):
+                alt = spec_dict.get("allowed_alternatives")
+                if alt is not None and not str(alt).strip():
+                    raise ValueError("specification allowed_alternatives cannot be empty when authorized")
+            elif self.flexibility.get("specs_flexible"):
+                alt = self.flexibility.get("allowed_alternatives")
+                if alt is not None and not str(alt).strip():
+                    raise ValueError("allowed_alternatives cannot be empty when authorized")
         return self
 
 
@@ -2401,6 +2430,9 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
         "deadline_hours": req.deadline_hours,
         "specs": req.specs,
         "quantity": req.quantity,
+        "required_delivery_days": req.required_delivery_days,
+        "flexibility": req.flexibility,
+        "authorized_by": current_user.get("id"),
     }
     if req.last_quote is not None:
         create_kwargs["last_quote"] = req.last_quote
@@ -2410,15 +2442,6 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
         create_kwargs["acceptable_price_max"] = req.acceptable_price_max
 
     rfq, matched_suppliers = db.create_rfq_and_match_suppliers(**create_kwargs)
-
-    # Persist default or customized negotiation constraints
-    db.create_default_rfq_negotiation_constraints(
-        client_id=client_id,
-        rfq_id=rfq["id"],
-        rfq_data=create_kwargs,
-        flexibility=req.flexibility,
-        authorized_by=current_user.get("id"),
-    )
 
     if not matched_suppliers:
         return {
@@ -2595,6 +2618,8 @@ async def bulk_create_rfq_endpoint(
             "deadline_hours": final_deadline,
             "specs": final_specs,
             "quantity": final_quantity,
+            "flexibility": None,
+            "authorized_by": current_user.get("id"),
         }
         if final_last_quote is not None:
             create_kwargs["last_quote"] = final_last_quote
@@ -2604,14 +2629,6 @@ async def bulk_create_rfq_endpoint(
             create_kwargs["acceptable_price_max"] = final_max
 
         rfq, matched_suppliers = db.create_rfq_and_match_suppliers(**create_kwargs)
-
-        db.create_default_rfq_negotiation_constraints(
-            client_id=tenant_client_id,
-            rfq_id=rfq["id"],
-            rfq_data=create_kwargs,
-            flexibility=None,
-            authorized_by=current_user.get("id"),
-        )
 
         if matched_suppliers:
             rfq_msg = (
@@ -2960,8 +2977,12 @@ async def authorize_negotiation_tradeoff_endpoint(
     if not saved_constraint:
         raise HTTPException(status_code=500, detail="Failed to persist negotiation authority to database")
 
-    # 2. Resolve the flag
-    db.resolve_flag(flag_id, human_response=f"Operator {decision}d {dimension} trade-off")
+    # 2. Resolve the flag only after successful persistence
+    db.resolve_flag_with_response(
+        flag_id=flag_id,
+        human_response=f"Operator {decision}d {dimension} trade-off",
+        client_id=client_id,
+    )
 
     # 3. Resume negotiation if requested
     outbound_sent = False

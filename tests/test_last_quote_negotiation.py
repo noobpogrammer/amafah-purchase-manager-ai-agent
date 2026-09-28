@@ -46,9 +46,7 @@ class TestLastQuotePersistence:
         assert req.last_quote == 43.0
 
     def test_2_single_rfq_persists_last_quote(self, mock_supabase):
-        table_mock = MagicMock()
-        mock_supabase.table.return_value = table_mock
-        table_mock.insert.return_value.execute.return_value.data = [{"id": RFQ_ID, "product_name": "LED Panel 60W"}]
+        mock_supabase.rpc.return_value.execute.return_value.data = [{"id": RFQ_ID, "product_name": "LED Panel 60W"}]
         with patch.object(db, "get_suppliers_by_category", return_value=[{"id": SUPPLIER_ID, "name": "Apex Lighting", "phone_number": "+971501111111"}]):
             rfq, matched = db.create_rfq_and_match_suppliers(
                 client_id=DEMO_CLIENT,
@@ -56,9 +54,9 @@ class TestLastQuotePersistence:
                 category="Electrical",
                 last_quote=43.0,
             )
-            # Verify insert payload contained last_quote
-            insert_call = table_mock.insert.call_args_list[0][0][0]
-            assert insert_call["last_quote"] == 43.0
+            # Verify RPC payload contained last_quote
+            rpc_params = mock_supabase.rpc.call_args[0][1]
+            assert rpc_params["p_last_quote"] == 43.0
 
     @pytest.mark.asyncio
     async def test_3_last_quote_returns_from_create_endpoint(self, mock_supabase):

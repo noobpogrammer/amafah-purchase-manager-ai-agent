@@ -130,6 +130,7 @@ export async function createRFQ(payload) {
       acceptable_price_min: payload.acceptable_price_min !== undefined && payload.acceptable_price_min !== null && payload.acceptable_price_min !== '' ? Number(payload.acceptable_price_min) : null,
       acceptable_price_max: payload.acceptable_price_max !== undefined && payload.acceptable_price_max !== null && payload.acceptable_price_max !== '' ? Number(payload.acceptable_price_max) : null,
       deadline_hours: payload.deadline_hours ? parseInt(payload.deadline_hours) : 24,
+      required_delivery_days: payload.required_delivery_days !== undefined && payload.required_delivery_days !== null && payload.required_delivery_days !== '' ? parseInt(payload.required_delivery_days) : null,
       flexibility: payload.flexibility || null,
     }),
   });

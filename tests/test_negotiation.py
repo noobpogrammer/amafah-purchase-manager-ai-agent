@@ -96,7 +96,7 @@ class TestRFQPriceRange:
         assert "acceptable_price_min cannot be greater than acceptable_price_max" in str(exc_info.value)
 
     def test_range_propagates_through_create_rfq_and_match_suppliers(self, mock_supabase):
-        mock_supabase.table().insert().execute.return_value.data = [{
+        mock_supabase.rpc.return_value.execute.return_value.data = [{
             "id": "rfq-101",
             "client_id": "client-1",
             "product_name": "LED Panel",
@@ -112,9 +112,9 @@ class TestRFQPriceRange:
                 acceptable_price_min=50.0,
                 acceptable_price_max=60.0,
             )
-            insert_call = mock_supabase.table("rfqs").insert.call_args[0][0]
-            assert insert_call["acceptable_price_min"] == 50.0
-            assert insert_call["acceptable_price_max"] == 60.0
+            rpc_params = mock_supabase.rpc.call_args[0][1]
+            assert rpc_params["p_acceptable_price_min"] == 50.0
+            assert rpc_params["p_acceptable_price_max"] == 60.0
 
 
 # ==============================================================================

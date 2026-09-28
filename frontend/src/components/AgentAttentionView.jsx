@@ -183,7 +183,11 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                             <div style={{ background: '#f8fafc', padding: '0.6rem', borderRadius: '6px' }}>
                               <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Current Requirement:</div>
                               <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
-                                {meta.dimension === 'delivery' ? `Delivery: ${meta.current_value ?? 2} days` : meta.dimension === 'quantity' ? `Quantity: ${meta.current_value ?? 'Standard'}` : `Specs: Fixed`}
+                                {meta.dimension === 'delivery'
+                                  ? `Delivery: ${meta.current_value != null ? `${meta.current_value} days` : 'Not specified'}`
+                                  : meta.dimension === 'quantity'
+                                  ? `Quantity: ${meta.current_value ?? 'Standard'}`
+                                  : `Specs: Fixed`}
                               </div>
                             </div>
 

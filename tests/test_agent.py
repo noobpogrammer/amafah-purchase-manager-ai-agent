@@ -43,9 +43,8 @@ class TestSupplierCategoryMatching:
     def test_create_rfq_and_match_suppliers(self, mock_supabase):
         rfq_inserted = {"id": "rfq-999", "product_name": "Cement 5kg", "category": "Building Materials"}
 
-        # Mock rfq insert
-        mock_rfq_table = MagicMock()
-        mock_rfq_table.insert.return_value.execute.return_value = MagicMock(data=[rfq_inserted])
+        # Mock rfq RPC
+        mock_supabase.rpc.return_value.execute.return_value = MagicMock(data=[rfq_inserted])
 
         # Mock category matching suppliers
         mock_suppliers = [
@@ -59,9 +58,7 @@ class TestSupplierCategoryMatching:
             mock_rfq_supp_table.insert.return_value.execute.return_value = MagicMock(data=[])
 
             def table_router(table_name):
-                if table_name == "rfqs":
-                    return mock_rfq_table
-                elif table_name == "rfq_suppliers":
+                if table_name == "rfq_suppliers":
                     return mock_rfq_supp_table
                 return MagicMock()
 
@@ -79,11 +76,10 @@ class TestSupplierCategoryMatching:
             assert len(matched) == 2
             assert [s["id"] for s in matched] == ["s1", "s2"]
 
-            # Assert due_by was computed and passed to insert
-            insert_payload = mock_rfq_table.insert.call_args[0][0]
-            assert "due_by" in insert_payload
-            assert insert_payload["due_by"] is not None
-            assert insert_payload["deadline_hours"] == 24
+            # Assert deadline_hours was passed to RPC
+            rpc_args = mock_supabase.rpc.call_args[0]
+            assert rpc_args[0] == "create_rfq_with_constraints_rpc"
+            assert rpc_args[1]["p_deadline_hours"] == 24
 
 
 class TestFlagForHumanReviewAndResolve:
@@ -1041,6 +1037,8 @@ class TestRFQCreationValidation:
             deadline_hours=12,
             specs=None,
             quantity=99,
+            flexibility=None,
+            authorized_by=None,
             last_quote=25.0,
         )
         mock_log.assert_called_once()

@@ -26,6 +26,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
   const [acceptablePriceMin, setAcceptablePriceMin] = useState('');
   const [acceptablePriceMax, setAcceptablePriceMax] = useState('');
   const [deadlineHours, setDeadlineHours] = useState(24);
+  const [requiredDeliveryDays, setRequiredDeliveryDays] = useState('');
 
   // Negotiation Flexibility (Collapsible)
   const [showFlexibility, setShowFlexibility] = useState(false);
@@ -141,6 +142,11 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
       return;
     }
 
+    if (requiredDeliveryDays && Number(requiredDeliveryDays) <= 0) {
+      setErrorMsg('Required Delivery (Days) must be a positive number.');
+      return;
+    }
+
     if (allowQtyFlex) {
       if (!qtyMin && !qtyMax) {
         setErrorMsg('Please specify at least a minimum or maximum quantity for flexibility.');
@@ -209,6 +215,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
         acceptable_price_min: acceptablePriceMin ? Number(acceptablePriceMin) : null,
         acceptable_price_max: acceptablePriceMax ? Number(acceptablePriceMax) : null,
         deadline_hours: deadlineHours,
+        required_delivery_days: requiredDeliveryDays ? Number(requiredDeliveryDays) : null,
         flexibility: Object.keys(flexibility).length > 0 ? flexibility : null,
       });
 
@@ -506,6 +513,21 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
 
               <div className="form-row">
                 <div className="form-group">
+                  <label className="form-label flex-items">
+                    <Clock size={16} /> Required Delivery (Days)
+                  </label>
+                  <input
+                    type="number"
+                    className="input-field"
+                    placeholder="e.g. 2 (Leave empty if not specified)"
+                    min="1"
+                    value={requiredDeliveryDays}
+                    onChange={(e) => setRequiredDeliveryDays(e.target.value)}
+                  />
+                  <span className="field-hint">Optional baseline delivery timeline.</span>
+                </div>
+
+                <div className="form-group">
                   <label className="form-label flex-items">Last Quote / Last Cost (AED)</label>
                   <input
                     type="number"
@@ -516,7 +538,9 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                     step="0.01"
                   />
                 </div>
+              </div>
 
+              <div className="form-row">
                 <div className="form-group">
                   <label className="form-label flex-items">Acceptable Price Min (AED)</label>
                   <input
