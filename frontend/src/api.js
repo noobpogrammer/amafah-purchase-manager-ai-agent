@@ -130,6 +130,7 @@ export async function createRFQ(payload) {
       acceptable_price_min: payload.acceptable_price_min !== undefined && payload.acceptable_price_min !== null && payload.acceptable_price_min !== '' ? Number(payload.acceptable_price_min) : null,
       acceptable_price_max: payload.acceptable_price_max !== undefined && payload.acceptable_price_max !== null && payload.acceptable_price_max !== '' ? Number(payload.acceptable_price_max) : null,
       deadline_hours: payload.deadline_hours ? parseInt(payload.deadline_hours) : 24,
+      flexibility: payload.flexibility || null,
     }),
   });
   if (!response.ok) {
@@ -167,11 +168,12 @@ export async function fetchRFQs() {
 }
 
 export async function fetchRFQDetail(rfqId) {
-  const [rfqRes, suppliersRes, quotesRes, rankingRes] = await Promise.all([
+  const [rfqRes, suppliersRes, quotesRes, rankingRes, constraintsRes] = await Promise.all([
     supabase.from('rfqs').select('*').eq('id', rfqId).single(),
     supabase.from('rfq_suppliers').select('*, suppliers(*)').eq('rfq_id', rfqId),
     supabase.from('quotes').select('*, suppliers(name)').eq('rfq_id', rfqId),
     supabase.from('rfq_rankings').select('*').eq('rfq_id', rfqId).order('created_at', { ascending: false }).limit(1),
+    supabase.from('rfq_negotiation_constraints').select('*').eq('rfq_id', rfqId),
   ]);
 
   if (rfqRes.error) throw rfqRes.error;
@@ -181,6 +183,7 @@ export async function fetchRFQDetail(rfqId) {
     suppliers: suppliersRes.data || [],
     quotes: quotesRes.data || [],
     ranking: rankingRes.data?.[0] || null,
+    constraints: constraintsRes.data || [],
   };
 }
 
@@ -247,6 +250,19 @@ export async function respondToFlag(flagId, responseText, sendToSupplier = true)
   if (!response.ok) {
     const errData = await response.json().catch(() => ({}));
     throw new Error(errData.detail || 'Failed to respond to flag');
+  }
+  return await response.json();
+}
+
+export async function authorizeNegotiationTradeoff(flagId, { dimension, decision, constraints = {}, resume_negotiation = true }) {
+  const response = await authorizedFetch(`/flags/${flagId}/negotiation-authorization`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dimension, decision, constraints, resume_negotiation }),
+  });
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Failed to process negotiation authorization');
   }
   return await response.json();
 }

@@ -72,6 +72,7 @@ class RFQCreateRequest(BaseModel):
     acceptable_price_min: Optional[float] = None
     acceptable_price_max: Optional[float] = None
     deadline_hours: int = Field(..., gt=0)
+    flexibility: Optional[dict] = None
 
     @field_validator("product_name", "category", "specs")
     @classmethod
@@ -105,6 +106,20 @@ class RFQCreateRequest(BaseModel):
         if self.acceptable_price_min is not None and self.acceptable_price_max is not None:
             if self.acceptable_price_min > self.acceptable_price_max:
                 raise ValueError("acceptable_price_min cannot be greater than acceptable_price_max")
+        if self.flexibility:
+            if self.flexibility.get("quantity_flexible"):
+                q_min = self.flexibility.get("quantity_min")
+                q_max = self.flexibility.get("quantity_max")
+                if q_min is not None and int(q_min) <= 0:
+                    raise ValueError("quantity_min must be a positive integer")
+                if q_max is not None and int(q_max) <= 0:
+                    raise ValueError("quantity_max must be a positive integer")
+                if q_min is not None and q_max is not None and int(q_min) > int(q_max):
+                    raise ValueError("quantity_min cannot be greater than quantity_max")
+            if self.flexibility.get("delivery_flexible"):
+                d_max = self.flexibility.get("delivery_max_days")
+                if d_max is not None and int(d_max) <= 0:
+                    raise ValueError("delivery_max_days must be a positive integer")
         return self
 
 
@@ -768,11 +783,12 @@ async def finalize_rfq_job(rfq: dict):
         db.log_webhook_error(str(notif_err), tb, {"job": "finalize_rfq_job", "stage": "notifications", "rfq_id": rfq_id})
         return
 
-    # 3. Mark Finalization Completed
+    # 3. Mark Finalization Completed & Expire Active Negotiation Sessions
     try:
+        db.expire_negotiation_sessions_for_rfq(rfq_id)
         marked = db.mark_rfq_finalization_completed(rfq_id)
         if marked:
-            print(f"[{now_iso}] [Finalization] RFQ '{prod}' ({rfq_id}) marked finalization_status='completed'.")
+            print(f"[{now_iso}] [Finalization] RFQ '{prod}' ({rfq_id}) marked finalization_status='completed' and active negotiation sessions expired.")
     except Exception as comp_err:
         tb = traceback.format_exc()
         print(f"[{now_iso}] [Finalization ERROR] Failed marking finalization completed for RFQ {rfq_id}: {comp_err}\n{tb}")
@@ -1049,7 +1065,7 @@ def generate_adaptive_negotiation_message(
     elif strategy == "HOLD_POSITION":
         return f"{var_prefix}Understood. We're still trying to improve the rate on this order. Is there any further flexibility on the price?"
     elif strategy == "FINAL_PUSH":
-        return f"{var_prefix}We really appreciate your effort on this. If you can meet us at AED {counter_price:g} per piece, we can finalize this."
+        return f"{var_prefix}We appreciate the effort on the pricing. Could you make AED {counter_price:g} per piece your best rate for this order?"
     elif strategy == "INFORMATION_SEEKING":
         return f"{var_prefix}Understood on the current rate. Would the pricing improve if we adjust the order quantity or delivery schedule?"
     else:
@@ -1184,23 +1200,36 @@ async def execute_validated_action(
 
             is_final = is_supplier_final_price_statement(raw_message) or bool(quote_raw and is_supplier_final_price_statement(quote_raw))
 
-            # 1. Evaluate negotiation preflight and active session
+            # 1. Evaluate negotiation preflight, constraints and active session
             active_session = db.get_active_negotiation_session(client_id, target_rfq_id, supplier_id) if target_rfq_id else None
             prior_quotes_for_rfq = [q for q in (context.prior_quotes or []) if str(q.get("rfq_id")) == str(target_rfq_id)]
-            
+            rfq_constraints = db.get_rfq_negotiation_constraints(client_id, target_rfq_id) if target_rfq_id else []
+            extracted_deliv = variants[0].get("delivery_time") if variants else None
+            extracted_q = variants[0].get("quantity") if variants else None
+            extracted_var = variants[0].get("variant_label") if variants else None
+
             preflight = negotiation_engine.build_negotiation_preflight(
                 rfq=target_rfq or {},
                 supplier_quote=price_val if price_val is not None else 0.0,
                 previous_quotes=prior_quotes_for_rfq,
                 active_session=active_session,
                 raw_message_text=raw_message,
+                rfq_constraints=rfq_constraints,
+                extracted_delivery=extracted_deliv,
+                extracted_quantity=extracted_q,
+                extracted_variant=extracted_var,
             ) if (target_rfq and price_val is not None) else None
+
+            tradeoff_info = preflight.get("tradeoff_evaluation", {}) if preflight else {}
+            is_unauthorized_tradeoff = bool(tradeoff_info.get("has_tradeoff") and not tradeoff_info.get("is_authorized"))
 
             # 2. Persist / update negotiation session
             persisted_session = None
             if preflight and target_rfq_id and price_val is not None:
                 no_mov = (active_session.get("no_movement_count", 0) + 1) if (active_session and preflight.get("supplier_behavior") in ("NO_MOVEMENT", "PRICE_INCREASED")) else 0
+                session_status = "awaiting_authorization" if is_unauthorized_tradeoff else "active"
                 session_update = {
+                    "status": session_status,
                     "preferred_target": preflight["preferred_target"],
                     "acceptable_max": preflight["acceptable_max"],
                     "tolerated_final_ceiling": preflight["tolerated_final_ceiling"],
@@ -1218,7 +1247,39 @@ async def execute_validated_action(
                     client_id, target_rfq_id, supplier_id, **session_update
                 )
 
+            # Check if unauthorized trade-off requires human authorization
+            if is_unauthorized_tradeoff and target_rfq_id and context.input_origin != "operator":
+                dim = tradeoff_info.get("dimension") or "terms"
+                prop_val = tradeoff_info.get("supplier_proposed_value")
+                curr_val = tradeoff_info.get("current_value")
+                flag_meta = {
+                    "type": "negotiation_tradeoff_authorization",
+                    "dimension": dim,
+                    "current_value": curr_val,
+                    "supplier_proposed_value": prop_val,
+                    "supplier_latest_price": price_val,
+                    "supplier_message": raw_message,
+                    "session_id": persisted_session.get("id") if persisted_session else None,
+                    "quote_id": str(persisted_quote_id) if persisted_quote_id else None,
+                }
+                db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=target_rfq_id,
+                    reason=tradeoff_info.get("reason") or f"Supplier proposed {dim} trade-off requiring buyer authorization.",
+                    category="negotiation_tradeoff_authorization",
+                    raw_message=raw_message,
+                    metadata=flag_meta,
+                )
+                dim_phrase = "delivery schedule" if dim == "delivery" else ("order quantity" if dim == "quantity" else "specification")
+                holding_msg = f"Thanks for the option. Let me confirm internally whether that {dim_phrase} can work and we'll get back to you."
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", holding_msg, related_rfq_id=target_rfq_id)
+                if phone_number and msg_log_id:
+                    await enqueue_message(phone_number, holding_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+                return {"status": "awaiting_authorization", "rfq_id": target_rfq_id, "quote_id": str(persisted_quote_id)}
+
             # 3. Check whether to trigger adaptive autonomous counteroffer
+            has_valid_session = bool(persisted_session and persisted_session.get("id"))
             can_auto_negotiate = (
                 context.input_origin != "operator"
                 and preflight
@@ -1228,7 +1289,31 @@ async def execute_validated_action(
                 and len(variants) == 1
                 and variants[0].get("is_available", True) is True
                 and variants[0].get("variant_label") is None
+                and has_valid_session
             )
+
+            if (
+                context.input_origin != "operator"
+                and preflight
+                and preflight.get("should_counter")
+                and not is_final
+                and attempts_made < MAX_NEGOTIATION_ATTEMPTS
+                and not has_valid_session
+            ):
+                logger.error(
+                    "Durable negotiation session persistence failed for RFQ %s and supplier %s; stopping autonomous negotiation to fail closed.",
+                    target_rfq_id,
+                    supplier_id,
+                )
+                supp_name = supplier.get("name") or "Supplier"
+                db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=target_rfq_id,
+                    reason=f"Negotiation Session Persistence Error: Unable to save durable negotiation state for {supp_name}. Autonomous counter withheld.",
+                    category="system_error",
+                    raw_message=raw_message,
+                )
 
             if can_auto_negotiate and persisted_quote_id:
                 counter_price = float(preflight["recommended_anchor"])
@@ -1504,7 +1589,7 @@ async def execute_validated_action(
             if active_session:
                 prev_counter = active_session.get("latest_agent_counter")
                 pref_t = active_session.get("preferred_target") or counter_price
-                db.create_or_update_negotiation_session(
+                updated_sess = db.create_or_update_negotiation_session(
                     client_id=client_id,
                     rfq_id=target_rfq_id,
                     supplier_id=supplier_id,
@@ -1515,6 +1600,15 @@ async def execute_validated_action(
                     agent_total_concession=round(counter_price - float(pref_t), 2),
                     last_outbound_message_id=msg_log_id,
                 )
+                if not updated_sess or not updated_sess.get("id"):
+                    logger.error("Failed to durably update negotiation session state after sending counter for RFQ %s", target_rfq_id)
+                    db.flag_for_human_review(
+                        client_id=client_id,
+                        supplier_id=supplier_id,
+                        rfq_id=target_rfq_id,
+                        reason=f"Negotiation Session State Desync: Outbound counter AED {counter_price} was sent, but durable session update failed. Requires operational review.",
+                        category="system_error",
+                    )
 
             if decision_id:
                 updated_args = dict(args)
@@ -2317,6 +2411,15 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
 
     rfq, matched_suppliers = db.create_rfq_and_match_suppliers(**create_kwargs)
 
+    # Persist default or customized negotiation constraints
+    db.create_default_rfq_negotiation_constraints(
+        client_id=client_id,
+        rfq_id=rfq["id"],
+        rfq_data=create_kwargs,
+        flexibility=req.flexibility,
+        authorized_by=current_user.get("id"),
+    )
+
     if not matched_suppliers:
         return {
             "status": "no_matching_suppliers",
@@ -2501,6 +2604,14 @@ async def bulk_create_rfq_endpoint(
             create_kwargs["acceptable_price_max"] = final_max
 
         rfq, matched_suppliers = db.create_rfq_and_match_suppliers(**create_kwargs)
+
+        db.create_default_rfq_negotiation_constraints(
+            client_id=tenant_client_id,
+            rfq_id=rfq["id"],
+            rfq_data=create_kwargs,
+            flexibility=None,
+            authorized_by=current_user.get("id"),
+        )
 
         if matched_suppliers:
             rfq_msg = (
@@ -2773,6 +2884,137 @@ async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, cu
         if "decision_id" in locals() and decision_id:
             db.update_agent_decision(decision_id, execution_status="failed", execution_error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to process operator instruction: {str(e)}")
+
+
+class NegotiationAuthorizationRequest(BaseModel):
+    dimension: str
+    decision: str  # "approve" | "reject"
+    constraints: Optional[dict] = None
+    resume_negotiation: bool = True
+
+
+@app.post("/flags/{flag_id}/negotiation-authorization")
+async def authorize_negotiation_tradeoff_endpoint(
+    flag_id: str,
+    payload: NegotiationAuthorizationRequest,
+    current_user=Depends(get_current_user),
+):
+    """
+    Handles structured human operator decisions for negotiation trade-offs.
+    Persists updated negotiation authority, resolves the flag, and resumes negotiation if requested.
+    """
+    client_id = current_user.get("client_id")
+    user_id = current_user.get("id")
+
+    flag = db.get_flag_by_id(flag_id, client_id=client_id)
+    if not flag:
+        raise HTTPException(status_code=404, detail="Flagged review item not found")
+
+    rfq_id = flag.get("rfq_id")
+    supplier_id = flag.get("supplier_id")
+    if not rfq_id or not supplier_id:
+        raise HTTPException(status_code=400, detail="Flag is missing RFQ or supplier association")
+
+    rfq = db.get_rfq_by_id(rfq_id)
+    if not rfq:
+        raise HTTPException(status_code=404, detail="Associated RFQ not found")
+    if rfq.get("status") != "active":
+        raise HTTPException(status_code=400, detail=f"Cannot authorize negotiation on a {rfq.get('status')} RFQ")
+
+    dimension = payload.dimension
+    if dimension not in ("price", "quantity", "delivery", "specification"):
+        raise HTTPException(status_code=400, detail=f"Invalid dimension '{dimension}'")
+
+    decision = payload.decision.lower()
+    if decision not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="Decision must be 'approve' or 'reject'")
+
+    status = "authorized" if decision == "approve" else "fixed"
+    persisted_constraints = payload.constraints or {}
+
+    if decision == "approve":
+        if dimension == "delivery":
+            max_days = persisted_constraints.get("max_days")
+            if max_days is None or int(max_days) <= 0:
+                raise HTTPException(status_code=400, detail="max_days must be a positive integer for delivery authorization")
+        elif dimension == "quantity":
+            q_min = persisted_constraints.get("min")
+            q_max = persisted_constraints.get("max")
+            if q_min is not None and q_max is not None and int(q_min) > int(q_max):
+                raise HTTPException(status_code=400, detail="Quantity min cannot be greater than max")
+        elif dimension == "specification":
+            alt = persisted_constraints.get("allowed_alternatives")
+            if not alt or not str(alt).strip():
+                raise HTTPException(status_code=400, detail="allowed_alternatives cannot be empty for specification authorization")
+
+    # 1. Persist negotiation authority
+    saved_constraint = db.set_rfq_negotiation_constraint(
+        client_id=client_id,
+        rfq_id=rfq_id,
+        dimension=dimension,
+        status=status,
+        constraints=persisted_constraints,
+        source="operator_review",
+        authorized_by=user_id,
+    )
+    if not saved_constraint:
+        raise HTTPException(status_code=500, detail="Failed to persist negotiation authority to database")
+
+    # 2. Resolve the flag
+    db.resolve_flag(flag_id, human_response=f"Operator {decision}d {dimension} trade-off")
+
+    # 3. Resume negotiation if requested
+    outbound_sent = False
+    if payload.resume_negotiation:
+        session = db.get_active_negotiation_session(client_id, rfq_id, supplier_id)
+        if not session:
+            session = db.create_or_update_negotiation_session(
+                client_id, rfq_id, supplier_id, status="active"
+            )
+
+        supplier = flag.get("suppliers") or db.get_supplier_by_id(supplier_id)
+        phone = supplier.get("phone_number") if supplier else None
+
+        if decision == "approve":
+            if dimension == "delivery":
+                days = persisted_constraints.get("max_days")
+                resume_msg = f"We have some flexibility on delivery. If we allow up to {days} days, what is your best rate for this order?"
+            elif dimension == "quantity":
+                q_max = persisted_constraints.get("max")
+                resume_msg = f"We can be flexible on quantity up to {q_max} units. What would be your best rate at that volume?"
+            else:
+                resume_msg = f"We can consider that alternative option. Could you improve the rate further?"
+        else:
+            if dimension == "delivery":
+                resume_msg = f"We need to keep the requested delivery schedule. Is there any further flexibility on the price within that requirement?"
+            elif dimension == "quantity":
+                qty = rfq.get("quantity") or "requested"
+                resume_msg = f"We need to maintain the required quantity of {qty} units. Is there any flexibility on the unit price?"
+            else:
+                resume_msg = f"We need to stick to the requested specifications. Is there any further flexibility on the price?"
+
+        if phone:
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", resume_msg, related_rfq_id=rfq_id)
+            if msg_log_id:
+                await enqueue_message(phone, resume_msg, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+                outbound_sent = True
+
+    return {
+        "status": "resolved",
+        "flag_id": flag_id,
+        "decision": decision,
+        "dimension": dimension,
+        "constraint": saved_constraint,
+        "outbound_sent": outbound_sent,
+    }
+
+
+@app.get("/rfq/{rfq_id}/constraints")
+async def get_rfq_constraints_endpoint(rfq_id: str, current_user=Depends(get_current_user)):
+    """Fetches structured negotiation constraints for an RFQ."""
+    client_id = current_user.get("client_id")
+    constraints = db.get_rfq_negotiation_constraints(client_id, rfq_id)
+    return {"rfq_id": rfq_id, "constraints": constraints}
 
 
 # ============================================================

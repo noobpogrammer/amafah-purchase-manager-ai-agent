@@ -1232,9 +1232,50 @@ def increment_negotiation_attempts(rfq_id: str, supplier_id: str, max_attempts: 
     return -1
 
 
-def get_active_negotiation_session(client_id: str, rfq_id: str, supplier_id: str) -> dict | None:
-    """Retrieves active negotiation session for a specific rfq and supplier."""
+def expire_negotiation_sessions_for_rfq(rfq_id: str) -> int:
+    """Idempotently expires all active or awaiting negotiation sessions for an RFQ."""
+    now_utc = datetime.now(timezone.utc).isoformat()
     try:
+        try:
+            res = supabase.rpc("expire_negotiation_sessions_for_rfq_rpc", {"p_rfq_id": rfq_id}).execute()
+            if res.data is not None:
+                return int(res.data)
+        except Exception:
+            pass
+
+        res = (
+            supabase.table("negotiation_sessions")
+            .update({
+                "status": "expired",
+                "completed_at": now_utc,
+                "updated_at": now_utc,
+            })
+            .eq("rfq_id", rfq_id)
+            .in_("status", ["active", "awaiting_human_review", "awaiting_authorization"])
+            .execute()
+        )
+        return len(res.data) if res.data else 0
+    except Exception as e:
+        logger.error("expire_negotiation_sessions_for_rfq error for RFQ %s: %s", rfq_id, e)
+        return 0
+
+
+def get_active_negotiation_session(client_id: str, rfq_id: str, supplier_id: str) -> dict | None:
+    """Retrieves active negotiation session for a specific rfq and supplier, verifying RFQ is active and not expired."""
+    try:
+        rfq = get_rfq_by_id(rfq_id)
+        if rfq and rfq.get("status") != "active":
+            expire_negotiation_sessions_for_rfq(rfq_id)
+            return None
+        if rfq and rfq.get("due_by"):
+            try:
+                due_dt = datetime.fromisoformat(str(rfq["due_by"]).replace("Z", "+00:00"))
+                if due_dt <= datetime.now(timezone.utc):
+                    expire_negotiation_sessions_for_rfq(rfq_id)
+                    return None
+            except Exception:
+                pass
+
         res = (
             supabase.table("negotiation_sessions")
             .select("*")
@@ -1254,7 +1295,7 @@ def get_active_negotiation_session(client_id: str, rfq_id: str, supplier_id: str
 
 
 def get_active_negotiation_session_for_supplier(client_id: str, supplier_id: str) -> dict | None:
-    """Retrieves the most recently updated active negotiation session for a supplier across any open RFQ."""
+    """Retrieves the most recently updated active negotiation session for a supplier across any open, unexpired RFQ."""
     try:
         res = (
             supabase.table("negotiation_sessions")
@@ -1263,18 +1304,39 @@ def get_active_negotiation_session_for_supplier(client_id: str, supplier_id: str
             .eq("supplier_id", supplier_id)
             .eq("status", "active")
             .order("updated_at", desc=True)
-            .limit(1)
             .execute()
         )
         if res.data and len(res.data) > 0:
-            return res.data[0]
+            now_dt = datetime.now(timezone.utc)
+            for row in res.data:
+                rfq = row.get("rfqs")
+                rfq_id = row.get("rfq_id")
+                if not rfq or not isinstance(rfq, dict):
+                    rfq = get_rfq_by_id(rfq_id) if rfq_id else None
+                if not rfq or rfq.get("status") != "active":
+                    if rfq_id:
+                        expire_negotiation_sessions_for_rfq(rfq_id)
+                    continue
+                due_by = rfq.get("due_by")
+                if due_by:
+                    try:
+                        due_dt = datetime.fromisoformat(str(due_by).replace("Z", "+00:00"))
+                        if due_dt <= now_dt:
+                            if rfq_id:
+                                expire_negotiation_sessions_for_rfq(rfq_id)
+                            continue
+                    except Exception:
+                        pass
+                return row
     except Exception as e:
         logger.error("get_active_negotiation_session_for_supplier error: %s", e)
     return None
 
 
-def create_or_update_negotiation_session(client_id: str, rfq_id: str, supplier_id: str, **kwargs) -> dict:
-    """Creates a new active negotiation session or updates the existing active session."""
+def create_or_update_negotiation_session(client_id: str, rfq_id: str, supplier_id: str, **kwargs) -> dict | None:
+    """Creates a new active negotiation session or updates the existing active session.
+    Fails closed (returns None) if persistence fails.
+    """
     now_utc = datetime.now(timezone.utc).isoformat()
     try:
         existing = get_active_negotiation_session(client_id, rfq_id, supplier_id)
@@ -1286,7 +1348,7 @@ def create_or_update_negotiation_session(client_id: str, rfq_id: str, supplier_i
                 .eq("id", existing["id"])
                 .execute()
             )
-            return res.data[0] if (res.data and len(res.data) > 0) else {**existing, **update_data}
+            return res.data[0] if (res.data and len(res.data) > 0) else None
         else:
             insert_data = {
                 "client_id": client_id,
@@ -1298,16 +1360,10 @@ def create_or_update_negotiation_session(client_id: str, rfq_id: str, supplier_i
                 **kwargs,
             }
             res = supabase.table("negotiation_sessions").insert(insert_data).execute()
-            return res.data[0] if (res.data and len(res.data) > 0) else insert_data
+            return res.data[0] if (res.data and len(res.data) > 0) else None
     except Exception as e:
         logger.error("create_or_update_negotiation_session error: %s", e)
-        return {
-            "client_id": client_id,
-            "rfq_id": rfq_id,
-            "supplier_id": supplier_id,
-            "status": "active",
-            **kwargs,
-        }
+        return None
 
 
 def complete_negotiation_session(session_id: str, status: str, **kwargs) -> dict | None:
@@ -1335,6 +1391,176 @@ def complete_negotiation_session(session_id: str, status: str, **kwargs) -> dict
 def deactivate_negotiation_session(session_id: str, reason: str = "deactivated"):
     """Deactivates a negotiation session (e.g. on RFQ close or operator switch)."""
     return complete_negotiation_session(session_id, status="expired")
+
+
+def get_rfq_negotiation_constraints(client_id: str, rfq_id: str) -> list[dict]:
+    """Retrieves all negotiation constraint dimensions for an RFQ."""
+    try:
+        res = (
+            supabase.table("rfq_negotiation_constraints")
+            .select("*")
+            .eq("client_id", client_id)
+            .eq("rfq_id", rfq_id)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error("get_rfq_negotiation_constraints error: %s", e)
+        return []
+
+
+def set_rfq_negotiation_constraint(
+    client_id: str,
+    rfq_id: str,
+    dimension: str,
+    status: str,
+    constraints: dict,
+    source: str = "rfq_creation",
+    authorized_by: Optional[str] = None,
+) -> dict | None:
+    """Upserts a specific dimension negotiation constraint for an RFQ."""
+    now_utc = datetime.now(timezone.utc).isoformat()
+    try:
+        existing = (
+            supabase.table("rfq_negotiation_constraints")
+            .select("id")
+            .eq("rfq_id", rfq_id)
+            .eq("dimension", dimension)
+            .execute()
+        )
+        payload = {
+            "client_id": client_id,
+            "rfq_id": rfq_id,
+            "dimension": dimension,
+            "status": status,
+            "constraints": constraints or {},
+            "source": source,
+            "authorized_by": authorized_by,
+            "updated_at": now_utc,
+        }
+        if existing.data and len(existing.data) > 0:
+            res = (
+                supabase.table("rfq_negotiation_constraints")
+                .update(payload)
+                .eq("id", existing.data[0]["id"])
+                .execute()
+            )
+        else:
+            payload["created_at"] = now_utc
+            res = supabase.table("rfq_negotiation_constraints").insert(payload).execute()
+        return res.data[0] if (res.data and len(res.data) > 0) else None
+    except Exception as e:
+        logger.error("set_rfq_negotiation_constraint error: %s", e)
+        return None
+
+
+def create_default_rfq_negotiation_constraints(
+    client_id: str,
+    rfq_id: str,
+    rfq_data: dict,
+    flexibility: Optional[dict] = None,
+    authorized_by: Optional[str] = None,
+) -> list[dict]:
+    """
+    Initializes default negotiation constraints for all 4 dimensions:
+    - price: authorized from acceptable_price_min / max / last_quote
+    - quantity: fixed unless flexibility authorized
+    - delivery: fixed unless flexibility authorized
+    - specification: fixed unless flexibility authorized
+    """
+    flex = flexibility or {}
+    results = []
+
+    # 1. Price
+    price_constraints = {}
+    if rfq_data.get("acceptable_price_min") is not None:
+        price_constraints["preferred_target"] = float(rfq_data["acceptable_price_min"])
+    elif rfq_data.get("last_quote") is not None:
+        price_constraints["preferred_target"] = float(rfq_data["last_quote"])
+    if rfq_data.get("acceptable_price_max") is not None:
+        price_constraints["max"] = float(rfq_data["acceptable_price_max"])
+
+    p_res = set_rfq_negotiation_constraint(
+        client_id=client_id,
+        rfq_id=rfq_id,
+        dimension="price",
+        status="authorized",
+        constraints=price_constraints,
+        source="rfq_creation",
+        authorized_by=authorized_by,
+    )
+    if p_res:
+        results.append(p_res)
+
+    # 2. Quantity
+    req_qty = rfq_data.get("quantity")
+    if flex.get("quantity_flexible"):
+        q_status = "authorized"
+        q_constraints = {
+            "required": req_qty,
+            "min": int(flex["quantity_min"]) if flex.get("quantity_min") is not None else req_qty,
+            "max": int(flex["quantity_max"]) if flex.get("quantity_max") is not None else req_qty,
+        }
+    else:
+        q_status = "fixed"
+        q_constraints = {"required": req_qty}
+
+    q_res = set_rfq_negotiation_constraint(
+        client_id=client_id,
+        rfq_id=rfq_id,
+        dimension="quantity",
+        status=q_status,
+        constraints=q_constraints,
+        source="rfq_creation",
+        authorized_by=authorized_by,
+    )
+    if q_res:
+        results.append(q_res)
+
+    # 3. Delivery
+    if flex.get("delivery_flexible"):
+        d_status = "authorized"
+        d_constraints = {
+            "required_days": flex.get("required_days"),
+            "max_days": int(flex["delivery_max_days"]) if flex.get("delivery_max_days") is not None else None,
+        }
+    else:
+        d_status = "fixed"
+        d_constraints = {"required_days": flex.get("required_days")}
+
+    d_res = set_rfq_negotiation_constraint(
+        client_id=client_id,
+        rfq_id=rfq_id,
+        dimension="delivery",
+        status=d_status,
+        constraints=d_constraints,
+        source="rfq_creation",
+        authorized_by=authorized_by,
+    )
+    if d_res:
+        results.append(d_res)
+
+    # 4. Specification
+    if flex.get("specs_flexible") and flex.get("allowed_alternatives"):
+        s_status = "authorized"
+        s_constraints = {"allowed_alternatives": str(flex["allowed_alternatives"]).strip()}
+    else:
+        s_status = "fixed"
+        s_constraints = {"allowed_alternatives": None}
+
+    s_res = set_rfq_negotiation_constraint(
+        client_id=client_id,
+        rfq_id=rfq_id,
+        dimension="specification",
+        status=s_status,
+        constraints=s_constraints,
+        source="rfq_creation",
+        authorized_by=authorized_by,
+    )
+    if s_res:
+        results.append(s_res)
+
+    return results
 
 
 
@@ -1499,8 +1725,15 @@ def get_supplier_prior_quotes(supplier_id: str, rfq_ids: list = None):
     return res.data
 
 
-def flag_for_human_review(client_id: str, supplier_id: str, rfq_id: str = None,
-                         reason: str = "", category: str = "other", raw_message: str = ""):
+def flag_for_human_review(
+    client_id: str,
+    supplier_id: str,
+    rfq_id: str = None,
+    reason: str = "",
+    category: str = "other",
+    raw_message: str = "",
+    metadata: dict = None,
+):
     """Inserts a new human review escalation into flagged_for_review table."""
     payload = {
         "client_id": client_id,
@@ -1509,6 +1742,7 @@ def flag_for_human_review(client_id: str, supplier_id: str, rfq_id: str = None,
         "category": category,
         "raw_message": raw_message,
         "status": "pending",
+        "metadata": metadata or {},
     }
     if rfq_id:
         payload["rfq_id"] = rfq_id
@@ -1721,6 +1955,9 @@ def close_rfq(rfq_id: str, target_status: str = "closed"):
             supabase.table("pending_clarifications").update(
                 {"status": "abandoned"}
             ).eq("id", p["id"]).execute()
+
+    # 4. Expire any active/awaiting negotiation sessions for this RFQ
+    expire_negotiation_sessions_for_rfq(rfq_id)
 
     return rfq_res.data[0] if rfq_res.data else None
 

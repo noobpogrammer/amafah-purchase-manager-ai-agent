@@ -488,8 +488,8 @@ class TestWebhookNegotiationIntegration:
                      "rfq_id": "rfq-1",
                      "quote_id": "q-1",
                      "quoted_price": 68.0,
-                     "counter_price": 60.0,
-                     "negotiation_message": "Thank you. Could you consider revising closer to AED 60 per unit?",
+                     "counter_price": 50.0,
+                     "negotiation_message": "Thank you. Could you consider revising closer to AED 50 per unit?",
                      "delivery_time": "2 days",
                  },
              }):
@@ -499,7 +499,7 @@ class TestWebhookNegotiationIntegration:
             assert resp.json()["attempts"] == 1
             mock_inc.assert_called_once_with("rfq-1", "sup-1")
             mock_enq.assert_called_once()
-            assert "Thank you. Could you consider revising closer to AED 60" in mock_enq.call_args[0][1]
+            assert "Thank you. Could you consider revising closer to AED 50" in mock_enq.call_args[0][1]
 
     @pytest.mark.asyncio
     async def test_webhook_negotiation_failed_atomic_increment_suppresses_counteroffer(self, mock_supabase):
@@ -558,7 +558,7 @@ class TestWebhookNegotiationIntegration:
                      "rfq_id": "rfq-1",
                      "quote_id": "q-1",
                      "quoted_price": 68.0,
-                     "counter_price": 60.0,
+                     "counter_price": 50.0,
                      "negotiation_message": "Counter-offer message that should be suppressed",
                  },
              }):

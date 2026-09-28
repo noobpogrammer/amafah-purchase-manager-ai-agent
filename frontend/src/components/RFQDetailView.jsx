@@ -384,6 +384,107 @@ export default function RFQDetailView({
 
               {activeSection === 'overview' && (
                 <>
+                  {/* Negotiation Authority Card */}
+                  <div className="card" style={{ marginBottom: '1.25rem' }}>
+                    <div className="card-header flex-between">
+                      <h4 className="card-title flex-items gap-2" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <Sliders size={16} /> Negotiation Authority
+                      </h4>
+                      <span className="badge badge-sm" style={{ textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                        Autonomous Policy Bounds
+                      </span>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem', marginTop: '0.75rem' }}>
+                      {/* Price Authority */}
+                      {(() => {
+                        const priceConstraint = (detailData.constraints || []).find((c) => c.dimension === 'price');
+                        const target = priceConstraint?.constraints?.preferred_target ?? detailData.rfq.acceptable_price_min ?? detailData.rfq.last_quote;
+                        const maxPrice = priceConstraint?.constraints?.max ?? detailData.rfq.acceptable_price_max;
+                        return (
+                          <div style={{ padding: '0.75rem', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase' }}>Price</div>
+                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
+                              {target ? `Target: AED ${target}` : 'No target set'}
+                            </div>
+                            <div style={{ fontSize: '0.825rem', color: '#475569' }}>
+                              {maxPrice ? `Max: AED ${maxPrice}` : 'Max: Not capped'}
+                            </div>
+                            <span className="badge badge-status responded" style={{ marginTop: '0.4rem', display: 'inline-block' }}>
+                              Authorized Range
+                            </span>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Quantity Authority */}
+                      {(() => {
+                        const qtyConstraint = (detailData.constraints || []).find((c) => c.dimension === 'quantity');
+                        const isAuth = qtyConstraint?.status === 'authorized';
+                        const c = qtyConstraint?.constraints || {};
+                        return (
+                          <div style={{ padding: '0.75rem', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase' }}>Quantity</div>
+                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
+                              {isAuth
+                                ? `Flexible: ${c.min ?? 'Min'} - ${c.max ?? 'Max'} units`
+                                : `Fixed at ${detailData.rfq.quantity ?? 'Standard'}`}
+                            </div>
+                            <div style={{ fontSize: '0.825rem', color: '#475569' }}>
+                              {isAuth ? 'Trade-offs permitted' : 'Trade-offs require approval'}
+                            </div>
+                            <span className={`badge ${isAuth ? 'badge-status responded' : 'badge-status sent'}`} style={{ marginTop: '0.4rem', display: 'inline-block' }}>
+                              {isAuth ? 'Authorized' : 'Fixed'}
+                            </span>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Delivery Authority */}
+                      {(() => {
+                        const delConstraint = (detailData.constraints || []).find((c) => c.dimension === 'delivery');
+                        const isAuth = delConstraint?.status === 'authorized';
+                        const maxDays = delConstraint?.constraints?.max_days;
+                        return (
+                          <div style={{ padding: '0.75rem', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase' }}>Delivery Timing</div>
+                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
+                              {isAuth && maxDays
+                                ? `Flexible up to ${maxDays} days`
+                                : 'Fixed / Not authorized'}
+                            </div>
+                            <div style={{ fontSize: '0.825rem', color: '#475569' }}>
+                              {isAuth ? `Max: ${maxDays} days acceptable` : 'Deadline extension requires approval'}
+                            </div>
+                            <span className={`badge ${isAuth ? 'badge-status responded' : 'badge-status sent'}`} style={{ marginTop: '0.4rem', display: 'inline-block' }}>
+                              {isAuth ? 'Authorized' : 'Fixed'}
+                            </span>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Specification Authority */}
+                      {(() => {
+                        const specConstraint = (detailData.constraints || []).find((c) => c.dimension === 'specification');
+                        const isAuth = specConstraint?.status === 'authorized';
+                        const allowed = specConstraint?.constraints?.allowed_alternatives;
+                        return (
+                          <div style={{ padding: '0.75rem', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase' }}>Specification</div>
+                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
+                              {isAuth ? (allowed ? `Allowed: ${allowed}` : 'Flexible') : 'Fixed'}
+                            </div>
+                            <div style={{ fontSize: '0.825rem', color: '#475569', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {isAuth ? allowed || 'Substitutes allowed' : 'Substitutes require approval'}
+                            </div>
+                            <span className={`badge ${isAuth ? 'badge-status responded' : 'badge-status sent'}`} style={{ marginTop: '0.4rem', display: 'inline-block' }}>
+                              {isAuth ? 'Authorized' : 'Fixed'}
+                            </span>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  </div>
+
                   {/* Supplier Response Tracking Table */}
                   <div className="card">
                     <div className="card-header flex-between">

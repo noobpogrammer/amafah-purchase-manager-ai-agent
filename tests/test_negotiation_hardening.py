@@ -27,7 +27,7 @@ def base_rfq():
         "product_name": "60W LED Panel",
         "specs": "600x600 IP65",
         "quantity": 100,
-        "acceptable_price_min": 40.0,
+        "acceptable_price_min": 45.0,
         "acceptable_price_max": 50.0,
         "status": "active",
         "due_by": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
@@ -351,7 +351,7 @@ class TestMultiVariantNegotiation:
         with patch("db.get_quote_by_id", return_value=india_quote), \
              patch("db.get_quotes_for_rfq", return_value=[india_quote, china_quote]), \
              patch("db.get_negotiation_attempts", return_value=0):
-            res = validate_action(proposal, client_id="client-p13", supplier_id="sup-p13", context_rfqs=[{"rfqs": base_rfq}])
+            res = validate_action(proposal, client_id="client-p13", supplier_id="sup-p13", context_rfqs=[{"rfqs": {**base_rfq, "acceptable_price_min": 42.0}}])
             assert res.is_valid is True
             assert res.sanitized_args["quote_id"] == "q-india-1"
             assert res.sanitized_args["variant_label"] == "India"

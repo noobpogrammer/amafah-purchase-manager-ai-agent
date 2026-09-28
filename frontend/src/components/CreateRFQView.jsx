@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import * as XLSX from 'xlsx';
-import { Send, CheckCircle, AlertTriangle, ArrowRight, Tag, Clock, Package, FileText, Upload } from 'lucide-react';
+import { Send, CheckCircle, AlertTriangle, ArrowRight, Tag, Clock, Package, FileText, Upload, ChevronDown, ChevronRight, Sliders } from 'lucide-react';
 import { createRFQ, fetchCategories, createCustomCategory, bulkCreateRFQs } from '../api';
 // client_id is derived server-side from authenticated user; do not import DEMO_CLIENT_ID
 
@@ -26,6 +26,16 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
   const [acceptablePriceMin, setAcceptablePriceMin] = useState('');
   const [acceptablePriceMax, setAcceptablePriceMax] = useState('');
   const [deadlineHours, setDeadlineHours] = useState(24);
+
+  // Negotiation Flexibility (Collapsible)
+  const [showFlexibility, setShowFlexibility] = useState(false);
+  const [allowQtyFlex, setAllowQtyFlex] = useState(false);
+  const [qtyMin, setQtyMin] = useState('');
+  const [qtyMax, setQtyMax] = useState('');
+  const [allowDeliveryFlex, setAllowDeliveryFlex] = useState(false);
+  const [deliveryMaxDays, setDeliveryMaxDays] = useState('');
+  const [allowSpecFlex, setAllowSpecFlex] = useState(false);
+  const [allowedSpecs, setAllowedSpecs] = useState('');
 
   const [showCustomCatInput, setShowCustomCatInput] = useState(false);
   const [customCatName, setCustomCatName] = useState('');
@@ -131,6 +141,60 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
       return;
     }
 
+    if (allowQtyFlex) {
+      if (!qtyMin && !qtyMax) {
+        setErrorMsg('Please specify at least a minimum or maximum quantity for flexibility.');
+        return;
+      }
+      if (qtyMin && Number(qtyMin) <= 0) {
+        setErrorMsg('Minimum quantity must be a positive number.');
+        return;
+      }
+      if (qtyMax && Number(qtyMax) <= 0) {
+        setErrorMsg('Maximum quantity must be a positive number.');
+        return;
+      }
+      if (qtyMin && qtyMax && Number(qtyMin) > Number(qtyMax)) {
+        setErrorMsg('Minimum quantity cannot be greater than maximum quantity.');
+        return;
+      }
+    }
+
+    if (allowDeliveryFlex) {
+      if (!deliveryMaxDays || Number(deliveryMaxDays) <= 0) {
+        setErrorMsg('Maximum acceptable delivery days must be greater than 0.');
+        return;
+      }
+    }
+
+    if (allowSpecFlex) {
+      if (!allowedSpecs.trim()) {
+        setErrorMsg('Please describe the explicitly allowed specification alternatives.');
+        return;
+      }
+    }
+
+    const flexibility = {};
+    if (allowQtyFlex) {
+      flexibility.quantity = {
+        authorized: true,
+        min: qtyMin ? Number(qtyMin) : null,
+        max: qtyMax ? Number(qtyMax) : null,
+      };
+    }
+    if (allowDeliveryFlex) {
+      flexibility.delivery = {
+        authorized: true,
+        max_days: Number(deliveryMaxDays),
+      };
+    }
+    if (allowSpecFlex) {
+      flexibility.specification = {
+        authorized: true,
+        allowed_alternatives: allowedSpecs.trim(),
+      };
+    }
+
     setLoading(true);
     setErrorMsg('');
     setMatchedResult(null);
@@ -145,6 +209,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
         acceptable_price_min: acceptablePriceMin ? Number(acceptablePriceMin) : null,
         acceptable_price_max: acceptablePriceMax ? Number(acceptablePriceMax) : null,
         deadline_hours: deadlineHours,
+        flexibility: Object.keys(flexibility).length > 0 ? flexibility : null,
       });
 
       setMatchedResult(res);
@@ -475,6 +540,126 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                     step="0.01"
                   />
                 </div>
+              </div>
+
+              {/* Optional Collapsible Negotiation Flexibility Section */}
+              <div style={{ marginTop: '1.25rem', marginBottom: '1.25rem', border: '1px solid var(--border-color, #e2e8f0)', borderRadius: '8px', overflow: 'hidden' }}>
+                <button
+                  type="button"
+                  onClick={() => setShowFlexibility((prev) => !prev)}
+                  style={{
+                    width: '100%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '0.875rem 1rem',
+                    background: 'var(--bg-secondary, #f8fafc)',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontSize: '0.95rem',
+                    fontWeight: '600',
+                    color: 'var(--text-primary, #1e293b)'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <Sliders size={18} />
+                    <span>Negotiation Flexibility (Optional)</span>
+                  </div>
+                  {showFlexibility ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+                </button>
+
+                {showFlexibility && (
+                  <div style={{ padding: '1rem', background: 'var(--bg-card, #ffffff)', borderTop: '1px solid var(--border-color, #e2e8f0)' }}>
+                    <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary, #64748b)', marginBottom: '1rem' }}>
+                      Define what trade-offs the AI is authorized to negotiate autonomously. Any unconfigured dimension remains strictly fixed.
+                    </p>
+
+                    {/* Quantity Flexibility */}
+                    <div style={{ marginBottom: '1.25rem', paddingBottom: '1rem', borderBottom: '1px dashed var(--border-color, #e2e8f0)' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontWeight: '500', marginBottom: '0.5rem' }}>
+                        <input
+                          type="checkbox"
+                          checked={allowQtyFlex}
+                          onChange={(e) => setAllowQtyFlex(e.target.checked)}
+                        />
+                        <span>Allow AI to negotiate quantity</span>
+                      </label>
+                      {allowQtyFlex && (
+                        <div className="form-row" style={{ marginTop: '0.5rem' }}>
+                          <div className="form-group">
+                            <label className="form-label" style={{ fontSize: '0.85rem' }}>Minimum Quantity</label>
+                            <input
+                              type="number"
+                              className="input-field"
+                              placeholder="e.g. 15"
+                              value={qtyMin}
+                              onChange={(e) => setQtyMin(e.target.value)}
+                            />
+                          </div>
+                          <div className="form-group">
+                            <label className="form-label" style={{ fontSize: '0.85rem' }}>Maximum Quantity</label>
+                            <input
+                              type="number"
+                              className="input-field"
+                              placeholder="e.g. 30"
+                              value={qtyMax}
+                              onChange={(e) => setQtyMax(e.target.value)}
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Delivery Flexibility */}
+                    <div style={{ marginBottom: '1.25rem', paddingBottom: '1rem', borderBottom: '1px dashed var(--border-color, #e2e8f0)' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontWeight: '500', marginBottom: '0.5rem' }}>
+                        <input
+                          type="checkbox"
+                          checked={allowDeliveryFlex}
+                          onChange={(e) => setAllowDeliveryFlex(e.target.checked)}
+                        />
+                        <span>Allow AI to negotiate delivery timing</span>
+                      </label>
+                      {allowDeliveryFlex && (
+                        <div className="form-group" style={{ marginTop: '0.5rem', maxWidth: '300px' }}>
+                          <label className="form-label" style={{ fontSize: '0.85rem' }}>Maximum Acceptable Delivery Days</label>
+                          <input
+                            type="number"
+                            className="input-field"
+                            placeholder="e.g. 5"
+                            value={deliveryMaxDays}
+                            onChange={(e) => setDeliveryMaxDays(e.target.value)}
+                            min="1"
+                          />
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Specs Flexibility */}
+                    <div>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontWeight: '500', marginBottom: '0.5rem' }}>
+                        <input
+                          type="checkbox"
+                          checked={allowSpecFlex}
+                          onChange={(e) => setAllowSpecFlex(e.target.checked)}
+                        />
+                        <span>Allow AI to discuss specification alternatives</span>
+                      </label>
+                      {allowSpecFlex && (
+                        <div className="form-group" style={{ marginTop: '0.5rem' }}>
+                          <label className="form-label" style={{ fontSize: '0.85rem' }}>Explicitly Allowed Alternatives</label>
+                          <input
+                            type="text"
+                            className="input-field"
+                            placeholder="e.g. Equivalent brands: Schneider or ABB acceptable; Grade 304 or 316"
+                            value={allowedSpecs}
+                            onChange={(e) => setAllowedSpecs(e.target.value)}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="form-actions">

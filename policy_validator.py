@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 import db
 import guardrails
+import negotiation_engine
 
 logger = logging.getLogger(__name__)
 
@@ -822,6 +823,59 @@ def validate_action(
                 reason=f"Counter price '{counter_price}' exceeds RFQ acceptable_price_max '{acc_max}'.",
             )
 
+        # Reconstruct trusted preflight & deterministic allowed counter range
+        active_session = None
+        try:
+            active_session = db.get_active_negotiation_session(client_id, rfq_id, supplier_id)
+        except Exception as e:
+            logger.warning("Error fetching active session in validator: %s", e)
+
+        prior_quotes_for_rfq = []
+        try:
+            quotes_res = db.get_quotes_for_rfq(rfq_id)
+            if quotes_res:
+                prior_quotes_for_rfq = [
+                    q for q in quotes_res
+                    if str(q.get("supplier_id")) == str(supplier_id) and str(q.get("id")) != str(quote_id)
+                ]
+        except Exception as e:
+            logger.warning("Error fetching prior quotes in validator: %s", e)
+
+        rfq_constraints = []
+        try:
+            rfq_constraints = db.get_rfq_negotiation_constraints(client_id, rfq_id)
+        except Exception as e:
+            logger.warning("Error fetching rfq_constraints in validator: %s", e)
+
+        preflight = negotiation_engine.build_negotiation_preflight(
+            rfq=target_rfq,
+            supplier_quote=trusted_price,
+            previous_quotes=prior_quotes_for_rfq,
+            active_session=active_session,
+            raw_message_text=proposal.raw_message,
+            rfq_constraints=rfq_constraints,
+        )
+
+        allowed_min = preflight.get("allowed_counter_min")
+        allowed_max = preflight.get("allowed_counter_max")
+
+        if input_origin != "operator":
+            if allowed_min is not None and float(counter_price) < round(float(allowed_min) - 0.01, 2):
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=f"Counter price '{counter_price}' is below allowed deterministic minimum '{allowed_min}'.",
+                )
+
+            if allowed_max is not None and float(counter_price) > round(float(allowed_max) + 0.01, 2):
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=f"Counter price '{counter_price}' exceeds allowed deterministic maximum '{allowed_max}'.",
+                )
+
         sanitized_delivery = args.get("delivery_time") or target_quote.get("delivery_time")
         if sanitized_delivery is not None and not isinstance(sanitized_delivery, str):
             sanitized_delivery = str(sanitized_delivery)
@@ -839,6 +893,10 @@ def validate_action(
             "variant_label": target_quote.get("variant_label"),
             "delivery_time": sanitized_delivery,
             "quality_notes": sanitized_notes,
+            "allowed_counter_min": allowed_min,
+            "allowed_counter_max": allowed_max,
+            "selected_strategy": preflight.get("selected_strategy"),
+            "reason_code": preflight.get("reason_code"),
         }
 
         # Attach trusted historical price context if last_quote is present on RFQ

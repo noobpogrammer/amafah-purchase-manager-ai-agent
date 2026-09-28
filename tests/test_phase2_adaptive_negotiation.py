@@ -186,6 +186,15 @@ class TestPhase2AdaptiveNegotiation:
         rfq_id = str(uuid.uuid4())
         mock_rfq = {"id": rfq_id, "client_id": CLIENT_ID, "status": "active", "acceptable_price_min": 45.0, "acceptable_price_max": 48.0}
         mock_quote = {"id": "quote-1", "rfq_id": rfq_id, "supplier_id": SUPPLIER_ID, "price": 50.0}
+        mock_session = {
+            "id": "sess-1",
+            "rfq_id": rfq_id,
+            "supplier_id": SUPPLIER_ID,
+            "initial_supplier_offer": 72.0,
+            "latest_supplier_offer": 55.0,
+            "latest_agent_counter": 45.5,
+            "attempt_count": 8,
+        }
 
         proposal = ActionProposal(
             tool_name="negotiate_price",
@@ -196,6 +205,7 @@ class TestPhase2AdaptiveNegotiation:
              patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
              patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
              patch.object(db, "is_rfq_open", return_value=True), \
+             patch.object(db, "get_active_negotiation_session", return_value=mock_session), \
              patch.object(db, "get_negotiation_attempts", return_value=8):
             res_9 = validate_action(proposal, client_id=CLIENT_ID, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
             assert res_9.is_valid is True
@@ -204,6 +214,7 @@ class TestPhase2AdaptiveNegotiation:
              patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
              patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
              patch.object(db, "is_rfq_open", return_value=True), \
+             patch.object(db, "get_active_negotiation_session", return_value=mock_session), \
              patch.object(db, "get_negotiation_attempts", return_value=9):
             res_10 = validate_action(proposal, client_id=CLIENT_ID, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
             assert res_10.is_valid is True
@@ -213,6 +224,15 @@ class TestPhase2AdaptiveNegotiation:
         rfq_id = str(uuid.uuid4())
         mock_rfq = {"id": rfq_id, "client_id": CLIENT_ID, "status": "active", "acceptable_price_min": 45.0, "acceptable_price_max": 48.0}
         mock_quote = {"id": "quote-1", "rfq_id": rfq_id, "supplier_id": SUPPLIER_ID, "price": 50.0}
+        mock_session = {
+            "id": "sess-1",
+            "rfq_id": rfq_id,
+            "supplier_id": SUPPLIER_ID,
+            "initial_supplier_offer": 72.0,
+            "latest_supplier_offer": 55.0,
+            "latest_agent_counter": 45.5,
+            "attempt_count": 10,
+        }
 
         proposal = ActionProposal(
             tool_name="negotiate_price",
@@ -223,6 +243,7 @@ class TestPhase2AdaptiveNegotiation:
              patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
              patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
              patch.object(db, "is_rfq_open", return_value=True), \
+             patch.object(db, "get_active_negotiation_session", return_value=mock_session), \
              patch.object(db, "get_negotiation_attempts", return_value=10):
             res_11 = validate_action(proposal, client_id=CLIENT_ID, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
             assert res_11.is_valid is False
@@ -375,7 +396,8 @@ class TestPhase2AdaptiveNegotiation:
         assert "further flexibility" in msg_hold.lower()
 
         msg_push = main.generate_adaptive_negotiation_message("FINAL_PUSH", 47.5)
-        assert "finalize this" in msg_push.lower()
+        assert "finalize this" not in msg_push.lower()
+        assert "best rate" in msg_push.lower() or "could you make" in msg_push.lower() or "could you meet" in msg_push.lower()
 
     # 22. Information-seeking does not invent buyer flexibility
     def test_22_information_seeking_does_not_invent_flexibility(self):
@@ -698,3 +720,247 @@ class TestPhase2AdaptiveNegotiation:
             res = validate_action(proposal_accept, client_id=CLIENT_ID, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
             assert res.is_valid is False
             assert "autonomous acceptance" in res.reason.lower()
+
+    # 45. Validator enforces allowed range 45-47: 46 passes
+    def test_45_validator_enforces_allowed_range_pass(self):
+        rfq_id = str(uuid.uuid4())
+        mock_rfq = {"id": rfq_id, "client_id": CLIENT_ID, "status": "active", "acceptable_price_min": 45.0, "acceptable_price_max": 48.0}
+        mock_quote = {"id": "quote-1", "rfq_id": rfq_id, "supplier_id": SUPPLIER_ID, "price": 65.0}
+        mock_session = {
+            "id": "sess-1",
+            "rfq_id": rfq_id,
+            "supplier_id": SUPPLIER_ID,
+            "initial_supplier_offer": 72.0,
+            "latest_supplier_offer": 72.0,
+            "latest_agent_counter": 45.0,
+            "attempt_count": 1,
+        }
+        # Supplier moved 72 -> 65 (concession = 7). Allowed range is 45.0 to 47.45.
+        proposal = ActionProposal(
+            tool_name="negotiate_price",
+            arguments={"rfq_id": rfq_id, "quote_id": "quote-1", "quoted_price": 65.0, "counter_price": 46.0, "negotiation_message": "Could you do 46?"},
+        )
+        context_rfqs = [{"rfqs": mock_rfq, "supplier_id": SUPPLIER_ID, "status": "sent"}]
+        with patch.object(db, "get_quote_by_id", return_value=mock_quote), \
+             patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
+             patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
+             patch.object(db, "is_rfq_open", return_value=True), \
+             patch.object(db, "get_active_negotiation_session", return_value=mock_session), \
+             patch.object(db, "get_negotiation_attempts", return_value=1):
+            res = validate_action(proposal, client_id=CLIENT_ID, supplier_id=SUPPLIER_ID, context_rfqs=context_rfqs)
+            assert res.is_valid is True
+            assert res.sanitized_args["allowed_counter_min"] == 45.0
+            assert res.sanitized_args["allowed_counter_max"] >= 46.0
+
+    # 46. Counter 48 fails when allowed range is 45-47 (even if acceptable_max is 48)
+    def test_46_counter_48_fails_when_allowed_max_is_47(self):
+        rfq_id = str(uuid.uuid4())
+        mock_rfq = {"id": rfq_id, "client_id": CLIENT_ID, "status": "active", "acceptable_price_min": 45.0, "acceptable_price_max": 48.0}
+        mock_quote = {"id": "quote-1", "rfq_id": rfq_id, "supplier_id": SUPPLIER_ID, "price": 65.0}
+        mock_session = {
+            "id": "sess-1",
+            "rfq_id": rfq_id,
+            "supplier_id": SUPPLIER_ID,
+            "initial_supplier_offer": 72.0,
+            "latest_supplier_offer": 72.0,
+            "latest_agent_counter": 45.0,
+            "attempt_count": 1,
+        }
+        # Supplier moved 72 -> 65 (concession = 7). Allowed range max is 47.45.
+        # Proposing 48.0 exceeds the calculated allowed_max (47.45) and must be rejected!
+        proposal = ActionProposal(
+            tool_name="negotiate_price",
+            arguments={"rfq_id": rfq_id, "quote_id": "quote-1", "quoted_price": 65.0, "counter_price": 48.0, "negotiation_message": "Could you do 48?"},
+        )
+        context_rfqs = [{"rfqs": mock_rfq, "supplier_id": SUPPLIER_ID, "status": "sent"}]
+        with patch.object(db, "get_quote_by_id", return_value=mock_quote), \
+             patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
+             patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
+             patch.object(db, "is_rfq_open", return_value=True), \
+             patch.object(db, "get_active_negotiation_session", return_value=mock_session), \
+             patch.object(db, "get_negotiation_attempts", return_value=1):
+            res = validate_action(proposal, client_id=CLIENT_ID, supplier_id=SUPPLIER_ID, context_rfqs=context_rfqs)
+            assert res.is_valid is False
+            assert "exceeds allowed deterministic maximum" in res.reason.lower()
+
+    # 47. Counter below allowed minimum fails
+    def test_47_counter_below_allowed_min_fails(self):
+        rfq_id = str(uuid.uuid4())
+        mock_rfq = {"id": rfq_id, "client_id": CLIENT_ID, "status": "active", "acceptable_price_min": 45.0, "acceptable_price_max": 48.0}
+        mock_quote = {"id": "quote-1", "rfq_id": rfq_id, "supplier_id": SUPPLIER_ID, "price": 65.0}
+        mock_session = {
+            "id": "sess-1",
+            "rfq_id": rfq_id,
+            "supplier_id": SUPPLIER_ID,
+            "initial_supplier_offer": 72.0,
+            "latest_supplier_offer": 72.0,
+            "latest_agent_counter": 45.0,
+            "attempt_count": 1,
+        }
+        proposal = ActionProposal(
+            tool_name="negotiate_price",
+            arguments={"rfq_id": rfq_id, "quote_id": "quote-1", "quoted_price": 65.0, "counter_price": 44.0, "negotiation_message": "Could you do 44?"},
+        )
+        context_rfqs = [{"rfqs": mock_rfq, "supplier_id": SUPPLIER_ID, "status": "sent"}]
+        with patch.object(db, "get_quote_by_id", return_value=mock_quote), \
+             patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
+             patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
+             patch.object(db, "is_rfq_open", return_value=True), \
+             patch.object(db, "get_active_negotiation_session", return_value=mock_session), \
+             patch.object(db, "get_negotiation_attempts", return_value=1):
+            res = validate_action(proposal, client_id=CLIENT_ID, supplier_id=SUPPLIER_ID, context_rfqs=context_rfqs)
+            assert res.is_valid is False
+            assert "below allowed deterministic minimum" in res.reason.lower()
+
+    # 48. Validator recomputes safe range from DB and ignores LLM-supplied fake range
+    def test_48_llm_supplied_fake_allowed_range_is_ignored(self):
+        rfq_id = str(uuid.uuid4())
+        mock_rfq = {"id": rfq_id, "client_id": CLIENT_ID, "status": "active", "acceptable_price_min": 45.0, "acceptable_price_max": 48.0}
+        mock_quote = {"id": "quote-1", "rfq_id": rfq_id, "supplier_id": SUPPLIER_ID, "price": 65.0}
+        mock_session = {
+            "id": "sess-1",
+            "rfq_id": rfq_id,
+            "supplier_id": SUPPLIER_ID,
+            "initial_supplier_offer": 72.0,
+            "latest_supplier_offer": 72.0,
+            "latest_agent_counter": 45.0,
+            "attempt_count": 1,
+        }
+        # LLM claims allowed range is 40 to 60, but real DB allowed max is 47.45
+        proposal = ActionProposal(
+            tool_name="negotiate_price",
+            arguments={
+                "rfq_id": rfq_id,
+                "quote_id": "quote-1",
+                "quoted_price": 65.0,
+                "counter_price": 50.0,
+                "allowed_counter_min": 40.0,
+                "allowed_counter_max": 60.0,
+                "negotiation_message": "Could you do 50?",
+            },
+        )
+        context_rfqs = [{"rfqs": mock_rfq, "supplier_id": SUPPLIER_ID, "status": "sent"}]
+        with patch.object(db, "get_quote_by_id", return_value=mock_quote), \
+             patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
+             patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
+             patch.object(db, "is_rfq_open", return_value=True), \
+             patch.object(db, "get_active_negotiation_session", return_value=mock_session), \
+             patch.object(db, "get_negotiation_attempts", return_value=1):
+            res = validate_action(proposal, client_id=CLIENT_ID, supplier_id=SUPPLIER_ID, context_rfqs=context_rfqs)
+            assert res.is_valid is False
+            assert "exceeds" in res.reason.lower()
+
+    # 49. Supplier 65 -> 64.80: tiny concession (0.20 < 1.0 threshold) results in HOLD_POSITION
+    def test_49_supplier_tiny_concession_holds_position(self):
+        bounds = negotiation_engine.build_allowed_counter_range(
+            preferred_target=45.0,
+            acceptable_max=48.0,
+            tolerated_final_ceiling=51.0,
+            latest_supplier_offer=64.80,
+            previous_supplier_offer=65.00,  # Concession = 0.20 AED
+            latest_agent_counter=45.00,
+            attempt_count=1,
+        )
+        assert bounds["selected_strategy"] == "HOLD_POSITION"
+        assert bounds["can_concede"] is False
+        assert bounds["recommended_anchor"] == 45.00
+        assert bounds["allowed_counter_max"] == 45.00
+
+    # 50. Supplier 65 -> 64.20: concession 0.80 < 1.0 threshold results in HOLD_POSITION
+    def test_50_supplier_concession_0_80_holds_position(self):
+        bounds = negotiation_engine.build_allowed_counter_range(
+            preferred_target=45.0,
+            acceptable_max=48.0,
+            tolerated_final_ceiling=51.0,
+            latest_supplier_offer=64.20,
+            previous_supplier_offer=65.00,  # Concession = 0.80 AED
+            latest_agent_counter=45.00,
+            attempt_count=1,
+        )
+        assert bounds["selected_strategy"] == "HOLD_POSITION"
+        assert bounds["can_concede"] is False
+        assert bounds["recommended_anchor"] == 45.00
+
+    # 51. Supplier 65 -> 63: concession 2.0 >= 1.0 allows reciprocal concession strictly < 2.0
+    def test_51_supplier_concession_2_allows_smaller_reciprocal_concession(self):
+        bounds = negotiation_engine.build_allowed_counter_range(
+            preferred_target=45.0,
+            acceptable_max=48.0,
+            tolerated_final_ceiling=51.0,
+            latest_supplier_offer=63.00,
+            previous_supplier_offer=65.00,  # Concession = 2.0 AED
+            latest_agent_counter=45.00,
+            attempt_count=1,
+        )
+        assert bounds["selected_strategy"] == "RECIPROCAL_CONCESSION"
+        assert bounds["can_concede"] is True
+        agent_step = bounds["recommended_anchor"] - 45.00
+        assert 0 < agent_step < 2.00
+        assert bounds["recommended_anchor"] <= 45.70
+
+    # 52. Agent concession is always strictly smaller than supplier last concession
+    @pytest.mark.parametrize("supp_prev, supp_curr", [
+        (100.0, 98.0),  # Concession = 2.0
+        (80.0, 75.0),   # Concession = 5.0
+        (50.0, 48.5),   # Concession = 1.5
+        (50.0, 49.0),   # Concession = 1.0
+    ])
+    def test_52_agent_concession_strictly_smaller_than_supplier_concession(self, supp_prev, supp_curr):
+        supp_concession = supp_prev - supp_curr
+        bounds = negotiation_engine.build_allowed_counter_range(
+            preferred_target=40.0,
+            acceptable_max=50.0,
+            tolerated_final_ceiling=53.0,
+            latest_supplier_offer=supp_curr,
+            previous_supplier_offer=supp_prev,
+            latest_agent_counter=40.0,
+            attempt_count=1,
+        )
+        agent_step = bounds["recommended_anchor"] - 40.0
+        assert agent_step < supp_concession
+
+    # 53. Session DB insert failure fails closed: no negotiation message sent
+    @pytest.mark.asyncio
+    async def test_53_session_insert_failure_fails_closed(self, mock_supabase):
+        rfq_id = str(uuid.uuid4())
+        mock_rfq = {
+            "id": rfq_id,
+            "client_id": CLIENT_ID,
+            "product_name": "Steel Elbow 2 Inch",
+            "acceptable_price_min": 45.0,
+            "acceptable_price_max": 48.0,
+            "status": "active",
+        }
+        context = AgentContext(client_id=CLIENT_ID, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
+        val = ValidationResult(
+            is_valid=True,
+            action="record_quote",
+            category=ActionCategory.MUTATION,
+            sanitized_args={"rfq_id": rfq_id, "price": 72.0, "variants": [{"price": 72.0, "variant_label": None}]},
+        )
+
+        with patch.object(db, "record_quote", return_value={"id": "q-1"}), \
+             patch.object(db, "get_negotiation_attempts", return_value=0), \
+             patch.object(db, "log_message", return_value="msg-1"), \
+             patch("main.enqueue_message", new_callable=AsyncMock) as mock_enq, \
+             patch.object(db, "create_or_update_negotiation_session", return_value=None), \
+             patch.object(db, "flag_for_human_review") as mock_flag:
+
+            res = await main.execute_validated_action(
+                val, context, "72 AED", {"id": SUPPLIER_ID, "name": "Steel Corp", "phone_number": PHONE_NUMBER}, CLIENT_ID
+            )
+            # Must NOT send an autonomous counteroffer when session cannot be saved
+            assert res["status"] in ("recorded", "recorded_via_quoted_message")
+            # Enqueued message must only be thank you (not a counter-offer)
+            for call in mock_enq.call_args_list:
+                msg_text = call.args[1] if len(call.args) > 1 else call.kwargs.get("message_text", "")
+                assert "45" not in msg_text
+            # System error flagged
+            mock_flag.assert_called_once()
+            assert "Persistence Error" in mock_flag.call_args.kwargs["reason"]
+
+    # 54. Session DB update returns None on failure (does not return fake dict)
+    def test_54_db_create_or_update_session_returns_none_on_error(self, mock_supabase):
+        mock_supabase.table().insert().execute.side_effect = Exception("DB connection timeout")
+        res = db.create_or_update_negotiation_session(CLIENT_ID, str(uuid.uuid4()), SUPPLIER_ID, preferred_target=45.0)
+        assert res is None

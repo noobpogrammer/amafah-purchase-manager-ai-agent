@@ -16,6 +16,7 @@ from typing import Dict, Any, Optional, Tuple
 
 MAX_NEGOTIATION_ATTEMPTS = int(os.environ.get("MAX_NEGOTIATION_ATTEMPTS", 10))
 PRICE_TOLERANCE_AED = 3.0
+MIN_MEANINGFUL_SUPPLIER_CONCESSION_AED = 1.0
 
 
 FINAL_PRICE_PATTERNS = [
@@ -25,8 +26,8 @@ FINAL_PRICE_PATTERNS = [
     r"\bfixed\s+price\b",
     r"\blast\s+price\b",
     r"\bnon-?negotiable\b",
-    r"\bcan'?t\s+go\s+lower\b",
-    r"\bcannot\s+(reduce|go\s+lower|discount|drop)\b",
+    r"\bcan'?t\s+go\s+(lower|below)\b",
+    r"\bcannot\s+(reduce|go\s+lower|go\s+below|discount|drop)\b",
     r"\bno\s+more\s+discount\b",
     r"\bthat'?s\s+(my\s+)?final\b",
     r"\bfinal\s+(offer|price|rate|quote)\b",
@@ -115,10 +116,12 @@ def classify_supplier_movement(
         return "PRICE_INCREASED", last_concession, total_concession
     elif abs(last_concession) <= 0.01:
         return "NO_MOVEMENT", 0.0, total_concession
+    elif last_concession < MIN_MEANINGFUL_SUPPLIER_CONCESSION_AED:
+        return "MOVED_SLIGHTLY", last_concession, total_concession
     elif last_concession >= 5.0 or (previous_offer and (last_concession / previous_offer) >= 0.08):
         return "MOVED_SIGNIFICANTLY", last_concession, total_concession
     else:
-        return "MOVED_SLIGHTLY", last_concession, total_concession
+        return "MOVED_SIGNIFICANTLY", last_concession, total_concession
 
 
 def build_allowed_counter_range(
@@ -220,35 +223,37 @@ def build_allowed_counter_range(
         supplier_last_concession = round(previous_supplier_offer - latest_supplier_offer, 2)
 
     # Upper hard ceiling: counter must be <= acceptable_max and strictly < latest_supplier_offer
-    max_possible_counter = min(effective_cap, latest_supplier_offer - 0.5)
+    max_possible_counter = min(effective_cap, latest_supplier_offer - 0.01)
     if max_possible_counter < current_counter:
         max_possible_counter = current_counter
 
-    # A. Supplier increased price or did not move -> HOLD POSITION
-    if supplier_last_concession <= 0.01:
+    # A. Supplier increased price, did not move, or conceded less than MIN_MEANINGFUL_SUPPLIER_CONCESSION_AED -> HOLD POSITION
+    if supplier_last_concession < MIN_MEANINGFUL_SUPPLIER_CONCESSION_AED:
         strategy = "HOLD_POSITION"
         if no_movement_count >= 2:
             strategy = "INFORMATION_SEEKING"
+        reason = "NO_SUPPLIER_MOVEMENT" if supplier_last_concession <= 0.01 else "SUPPLIER_CONCESSION_BELOW_MIN_THRESHOLD"
         return {
             "allowed_counter_min": round(current_counter, 2),
             "allowed_counter_max": round(current_counter, 2),
             "recommended_anchor": round(current_counter, 2),
             "can_concede": False,
             "selected_strategy": strategy,
-            "reason_code": "NO_SUPPLIER_MOVEMENT",
+            "reason_code": reason,
             "should_counter": True,
         }
 
-    # B. Supplier made meaningful concession -> Controlled reciprocal concession
-    # Rule: our concession must normally be smaller than supplier's concession
-    # Step proportion: ~25% - 40% of supplier concession, capped at remaining gap to acceptable_max
-    raw_step = supplier_last_concession * 0.35
-    # Ensure step is at least 0.5 AED if room allows, but strictly smaller than supplier concession
-    concession_step = max(0.5, round(min(raw_step, supplier_last_concession - 0.5), 2))
-    if concession_step >= supplier_last_concession and supplier_last_concession > 1.0:
-        concession_step = round(supplier_last_concession / 2.0, 2)
+    # B. Supplier made meaningful concession (>= MIN_MEANINGFUL_SUPPLIER_CONCESSION_AED) -> Controlled reciprocal concession
+    # Rule: our concession must strictly be smaller than supplier's concession (0 < agent_concession < supplier_last_concession)
+    # Step proportion: ~25% - 35% of supplier concession, capped at remaining gap to acceptable_max
+    raw_step = round(supplier_last_concession * 0.35, 2)
+    # Ensure agent concession is strictly smaller than supplier concession
+    max_step = max(0.01, round(supplier_last_concession - 0.01, 2))
+    concession_step = min(raw_step, max_step)
+    if concession_step < 0.25 and supplier_last_concession >= 1.0:
+        concession_step = min(0.25, max_step)
 
-    new_counter_max = min(max_possible_counter, current_counter + concession_step)
+    new_counter_max = min(max_possible_counter, round(current_counter + concession_step, 2))
     new_counter_min = current_counter  # Never oscillate backward
 
     # Check if near attempt limit (e.g. attempt >= 8) -> FINAL PUSH
@@ -273,12 +278,163 @@ def build_allowed_counter_range(
     }
 
 
+def evaluate_supplier_tradeoff(
+    message_text: Optional[str],
+    rfq_constraints: Optional[list] = None,
+    rfq: Optional[Dict[str, Any]] = None,
+    extracted_delivery: Optional[str] = None,
+    extracted_quantity: Optional[int] = None,
+    extracted_variant: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Evaluates whether the supplier proposes a conditional trade-off
+    (delivery, quantity, specification) and verifies if it is authorized under rfq_negotiation_constraints.
+    """
+    if not message_text:
+        return {"has_tradeoff": False, "is_authorized": True}
+
+    text = message_text or ""
+    constraints_by_dim = {c.get("dimension"): c for c in (rfq_constraints or [])}
+
+    # 1. Check Conditional Delivery Trade-off
+    # Examples: "if you can accept 5 days, I can do 55", "can reduce price if delivery is 5 days", "if delivery is 4 days"
+    deliv_match = re.search(
+        r"\b(?:if\s+(?:you\s+(?:can\s+)?)?(?:accept|allow|take|do)\s+|if\s+delivery\s+is\s+|can\s+reduce\s+(?:price|rate)\s+if\s+(?:delivery\s+is\s+)?|ready\s+in\s+)(\d+)\s*(?:days?|working\s*days?|business\s*days?)\b",
+        text,
+        re.IGNORECASE,
+    )
+
+    if deliv_match:
+        proposed_days = int(deliv_match.group(1))
+        deliv_constraint = constraints_by_dim.get("delivery")
+        current_req = 2
+        if deliv_constraint and deliv_constraint.get("constraints"):
+            current_req = deliv_constraint["constraints"].get("required_days") or 2
+
+        if proposed_days > current_req:
+            if deliv_constraint and deliv_constraint.get("status") == "authorized":
+                max_days = deliv_constraint.get("constraints", {}).get("max_days")
+                if max_days is not None and proposed_days <= int(max_days):
+                    return {
+                        "has_tradeoff": True,
+                        "is_authorized": True,
+                        "dimension": "delivery",
+                        "current_value": current_req,
+                        "supplier_proposed_value": proposed_days,
+                    }
+                else:
+                    return {
+                        "has_tradeoff": True,
+                        "is_authorized": False,
+                        "dimension": "delivery",
+                        "current_value": current_req,
+                        "supplier_proposed_value": proposed_days,
+                        "reason": f"Supplier proposed {proposed_days}-day delivery exceeding authorized maximum ({max_days} days).",
+                    }
+            else:
+                return {
+                    "has_tradeoff": True,
+                    "is_authorized": False,
+                    "dimension": "delivery",
+                    "current_value": current_req,
+                    "supplier_proposed_value": proposed_days,
+                    "reason": f"Supplier proposed {proposed_days}-day delivery but delivery is fixed at {current_req} days.",
+                }
+
+    # 2. Check Conditional Quantity Trade-off
+    # Examples: "if you order 30 pcs", "moq is 30", "if you take 50 units"
+    qty_match = re.search(
+        r"\b(?:if\s+you\s+(?:can\s+)?(?:take|order|buy)|moq\s*(?:is|of)?|minimum\s+(?:order|quantity)\s*(?:is|of)?)\s*(\d+)\s*(?:pcs|pieces|units|nos)?\b",
+        text,
+        re.IGNORECASE,
+    )
+
+    if qty_match:
+        proposed_qty = int(qty_match.group(1))
+        qty_constraint = constraints_by_dim.get("quantity")
+        current_qty = rfq.get("quantity") if rfq else 20
+        if qty_constraint and qty_constraint.get("constraints"):
+            current_qty = qty_constraint["constraints"].get("required") or current_qty
+
+        if proposed_qty != current_qty:
+            if qty_constraint and qty_constraint.get("status") == "authorized":
+                q_min = qty_constraint.get("constraints", {}).get("min")
+                q_max = qty_constraint.get("constraints", {}).get("max")
+                if q_min is not None and q_max is not None and int(q_min) <= proposed_qty <= int(q_max):
+                    return {
+                        "has_tradeoff": True,
+                        "is_authorized": True,
+                        "dimension": "quantity",
+                        "current_value": current_qty,
+                        "supplier_proposed_value": proposed_qty,
+                    }
+                else:
+                    return {
+                        "has_tradeoff": True,
+                        "is_authorized": False,
+                        "dimension": "quantity",
+                        "current_value": current_qty,
+                        "supplier_proposed_value": proposed_qty,
+                        "reason": f"Supplier proposed quantity {proposed_qty} outside authorized range [{q_min}, {q_max}].",
+                    }
+            else:
+                return {
+                    "has_tradeoff": True,
+                    "is_authorized": False,
+                    "dimension": "quantity",
+                    "current_value": current_qty,
+                    "supplier_proposed_value": proposed_qty,
+                    "reason": f"Supplier proposed quantity {proposed_qty} but quantity is fixed at {current_qty}.",
+                }
+
+    # 3. Check Specification Trade-off
+    # Examples: "alternative brand: ABB", "substitute: Grade 316", "instead of copper: PVC"
+    spec_match = re.search(r"\b(?:alternative|substitute|option|instead\s+of|brand)\s*:\s*([A-Za-z0-9\s]+)", text, re.IGNORECASE)
+    if spec_match:
+        proposed_spec = spec_match.group(1).strip()
+        spec_constraint = constraints_by_dim.get("specification")
+        if spec_constraint and spec_constraint.get("status") == "authorized":
+            allowed = spec_constraint.get("constraints", {}).get("allowed_alternatives")
+            if allowed and proposed_spec.lower() in str(allowed).lower():
+                return {
+                    "has_tradeoff": True,
+                    "is_authorized": True,
+                    "dimension": "specification",
+                    "current_value": rfq.get("specs") if rfq else "Standard",
+                    "supplier_proposed_value": proposed_spec,
+                }
+            else:
+                return {
+                    "has_tradeoff": True,
+                    "is_authorized": False,
+                    "dimension": "specification",
+                    "current_value": rfq.get("specs") if rfq else "Standard",
+                    "supplier_proposed_value": proposed_spec,
+                    "reason": f"Supplier proposed specification '{proposed_spec}' not in authorized alternatives.",
+                }
+        else:
+            return {
+                "has_tradeoff": True,
+                "is_authorized": False,
+                "dimension": "specification",
+                "current_value": rfq.get("specs") if rfq else "Standard",
+                "supplier_proposed_value": proposed_spec,
+                "reason": f"Supplier proposed alternative specification '{proposed_spec}' but specifications are fixed.",
+            }
+
+    return {"has_tradeoff": False, "is_authorized": True}
+
+
 def build_negotiation_preflight(
     rfq: Dict[str, Any],
     supplier_quote: float,
     previous_quotes: list,
     active_session: Optional[Dict[str, Any]] = None,
     raw_message_text: Optional[str] = None,
+    rfq_constraints: Optional[list] = None,
+    extracted_delivery: Optional[str] = None,
+    extracted_quantity: Optional[int] = None,
+    extracted_variant: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Builds the internal structured preflight plan before reasoning or countering.
@@ -341,6 +497,19 @@ def build_negotiation_preflight(
         no_movement_count=no_mov_count,
     )
 
+    tradeoff_eval = evaluate_supplier_tradeoff(
+        message_text=raw_message_text,
+        rfq_constraints=rfq_constraints,
+        rfq=rfq,
+        extracted_delivery=extracted_delivery,
+        extracted_quantity=extracted_quantity,
+        extracted_variant=extracted_variant,
+    )
+
+    should_counter = bounds["should_counter"]
+    if tradeoff_eval.get("has_tradeoff") and not tradeoff_eval.get("is_authorized"):
+        should_counter = False
+
     return {
         "primary_objective": "Negotiate commercially optimal price towards preferred target without exceeding acceptable max",
         "preferred_target": preferred_target,
@@ -358,9 +527,10 @@ def build_negotiation_preflight(
         "supplier_final_detected": is_final,
         "selected_strategy": bounds["selected_strategy"],
         "reason_code": bounds["reason_code"],
-        "should_counter": bounds["should_counter"],
+        "should_counter": should_counter,
         "allowed_counter_min": bounds["allowed_counter_min"],
         "allowed_counter_max": bounds["allowed_counter_max"],
         "recommended_anchor": bounds["recommended_anchor"],
         "can_concede": bounds["can_concede"],
+        "tradeoff_evaluation": tradeoff_eval,
     }

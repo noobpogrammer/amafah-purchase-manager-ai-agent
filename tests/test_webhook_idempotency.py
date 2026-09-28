@@ -185,8 +185,8 @@ class TestWebhookIdempotencyIntegration:
                      "rfq_id": RFQ_UUID,
                      "quote_id": "q-1",
                      "quoted_price": 68.0,
-                     "counter_price": 60.0,
-                     "negotiation_message": "Could you do 60 AED?",
+                     "counter_price": 50.0,
+                     "negotiation_message": "Could you do 50 AED?",
                  },
              }):
 
