@@ -13,6 +13,7 @@ Integration Test Suite for Phase 2.2 Post-Integration Fixes:
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 import uuid
+from datetime import datetime, timezone, timedelta
 from fastapi.testclient import TestClient
 
 import main
@@ -529,6 +530,11 @@ class TestPhase22IntegrationFixes:
             "rfq_id": rfq_id,
             "supplier_id": supp_id,
             "status": "pending",
+            "metadata": {
+                "session_id": "sess-1",
+                "dimension": "delivery",
+                "supplier_proposed_value": 5,
+            },
             "suppliers": mock_supplier,
         }
 
@@ -536,7 +542,7 @@ class TestPhase22IntegrationFixes:
              patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
              patch.object(db, "set_rfq_negotiation_constraint", return_value={"id": "c-del", "dimension": "delivery", "status": "authorized"}) as mock_set_c, \
              patch.object(db, "resolve_flag_with_response", return_value=[{"id": flag_id, "status": "resolved"}]) as mock_resolve, \
-             patch.object(db, "get_active_negotiation_session", return_value={"id": "sess-1", "attempt_count": 1}), \
+             patch.object(db, "resume_negotiation_session", return_value={"id": "sess-1", "attempt_count": 1, "status": "active"}) as mock_resume_session, \
              patch.object(db, "log_message", return_value="msg-log-resume"), \
              patch("main.enqueue_message", new_callable=AsyncMock) as mock_enqueue_resume:
 
@@ -554,6 +560,7 @@ class TestPhase22IntegrationFixes:
             appr_data = approval_resp.json()
             assert appr_data["status"] == "resolved"
             assert appr_data["outbound_sent"] is True
+            assert appr_data["session_id"] == "sess-1"
 
             # Verify constraint persisted
             mock_set_c.assert_called_once_with(
@@ -573,8 +580,323 @@ class TestPhase22IntegrationFixes:
                 client_id=client_id,
             )
 
+            # Verify exact session resumed
+            mock_resume_session.assert_called_once_with(
+                session_id="sess-1",
+                client_id=client_id,
+                rfq_id=rfq_id,
+                supplier_id=supp_id,
+            )
+
             # Verify resumed negotiation message sent with new authority
             mock_enqueue_resume.assert_called_once()
             resumed_text = mock_enqueue_resume.call_args[0][1]
             assert "5 days" in resumed_text
             assert "best rate" in resumed_text.lower()
+
+    # ============================================================
+    # INTEGRATION TEST I — EXACT PAUSED SESSION RESUME ON APPROVAL
+    # ============================================================
+    @pytest.mark.asyncio
+    async def test_integration_paused_session_exact_resume_on_approval(self, auth_client):
+        client, client_id, user_id = auth_client
+        session_id = f"SESSION-A-{uuid.uuid4()}"
+        rfq_id = f"RFQ-A-{uuid.uuid4()}"
+        supp_id = f"SUPP-A-{uuid.uuid4()}"
+        flag_id = f"FLAG-A-{uuid.uuid4()}"
+
+        paused_session = {
+            "id": session_id,
+            "client_id": client_id,
+            "rfq_id": rfq_id,
+            "supplier_id": supp_id,
+            "status": "awaiting_authorization",
+            "attempt_count": 2,
+            "initial_supplier_offer": 72.0,
+            "previous_supplier_offer": 72.0,
+            "latest_supplier_offer": 65.0,
+            "latest_agent_counter": 46.0,
+            "supplier_total_concession": 7.0,
+            "supplier_last_concession": 7.0,
+        }
+
+        resumed_session = {
+            **paused_session,
+            "status": "active",
+        }
+
+        mock_flag = {
+            "id": flag_id,
+            "client_id": client_id,
+            "rfq_id": rfq_id,
+            "supplier_id": supp_id,
+            "status": "pending",
+            "category": "negotiation_tradeoff_authorization",
+            "metadata": {
+                "session_id": session_id,
+                "dimension": "delivery",
+                "supplier_proposed_value": 5,
+            },
+            "suppliers": {"id": supp_id, "name": "Supplier A", "phone_number": "+971501234567"},
+        }
+
+        mock_rfq = {
+            "id": rfq_id,
+            "client_id": client_id,
+            "product_name": "Gate Valve",
+            "status": "active",
+        }
+
+        with patch.object(db, "get_flag_by_id", return_value=mock_flag), \
+             patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
+             patch.object(db, "set_rfq_negotiation_constraint", return_value={"id": "c-1", "dimension": "delivery", "status": "authorized"}), \
+             patch.object(db, "resolve_flag_with_response", return_value=[{"id": flag_id, "status": "resolved"}]), \
+             patch.object(db, "resume_negotiation_session", return_value=resumed_session) as mock_resume, \
+             patch.object(db, "create_or_update_negotiation_session") as mock_create_session, \
+             patch.object(db, "log_message", return_value="log-1"), \
+             patch("main.enqueue_message", new_callable=AsyncMock) as mock_enqueue:
+
+            resp = client.post(
+                f"/flags/{flag_id}/negotiation-authorization",
+                json={
+                    "dimension": "delivery",
+                    "decision": "approve",
+                    "constraints": {"max_days": 5},
+                    "resume_negotiation": True,
+                },
+            )
+
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["status"] == "resolved"
+            assert data["session_id"] == session_id
+
+            # Verify exact session resume called with correct parameters
+            mock_resume.assert_called_once_with(
+                session_id=session_id,
+                client_id=client_id,
+                rfq_id=rfq_id,
+                supplier_id=supp_id,
+            )
+
+            # Assert NO new session created
+            mock_create_session.assert_not_called()
+
+            # Verify outbound message sent
+            mock_enqueue.assert_called_once()
+            sent_msg = mock_enqueue.call_args[0][1]
+            assert "5 days" in sent_msg
+
+    # ============================================================
+    # INTEGRATION TEST J — EXACT PAUSED SESSION RESUME ON REJECTION
+    # ============================================================
+    @pytest.mark.asyncio
+    async def test_integration_paused_session_exact_resume_on_rejection(self, auth_client):
+        client, client_id, user_id = auth_client
+        session_id = f"SESSION-B-{uuid.uuid4()}"
+        rfq_id = f"RFQ-B-{uuid.uuid4()}"
+        supp_id = f"SUPP-B-{uuid.uuid4()}"
+        flag_id = f"FLAG-B-{uuid.uuid4()}"
+
+        paused_session = {
+            "id": session_id,
+            "client_id": client_id,
+            "rfq_id": rfq_id,
+            "supplier_id": supp_id,
+            "status": "awaiting_authorization",
+            "attempt_count": 2,
+            "initial_supplier_offer": 72.0,
+            "latest_supplier_offer": 65.0,
+            "latest_agent_counter": 46.0,
+        }
+
+        resumed_session = {
+            **paused_session,
+            "status": "active",
+        }
+
+        mock_flag = {
+            "id": flag_id,
+            "client_id": client_id,
+            "rfq_id": rfq_id,
+            "supplier_id": supp_id,
+            "status": "pending",
+            "category": "negotiation_tradeoff_authorization",
+            "metadata": {
+                "session_id": session_id,
+                "dimension": "delivery",
+                "supplier_proposed_value": 5,
+            },
+            "suppliers": {"id": supp_id, "name": "Supplier B", "phone_number": "+971507654321"},
+        }
+
+        mock_rfq = {
+            "id": rfq_id,
+            "client_id": client_id,
+            "product_name": "Gate Valve",
+            "status": "active",
+        }
+
+        with patch.object(db, "get_flag_by_id", return_value=mock_flag), \
+             patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
+             patch.object(db, "set_rfq_negotiation_constraint", return_value={"id": "c-2", "dimension": "delivery", "status": "fixed"}), \
+             patch.object(db, "resolve_flag_with_response", return_value=[{"id": flag_id, "status": "resolved"}]), \
+             patch.object(db, "resume_negotiation_session", return_value=resumed_session) as mock_resume, \
+             patch.object(db, "create_or_update_negotiation_session") as mock_create_session, \
+             patch.object(db, "log_message", return_value="log-2"), \
+             patch("main.enqueue_message", new_callable=AsyncMock) as mock_enqueue:
+
+            resp = client.post(
+                f"/flags/{flag_id}/negotiation-authorization",
+                json={
+                    "dimension": "delivery",
+                    "decision": "reject",
+                    "constraints": {},
+                    "resume_negotiation": True,
+                },
+            )
+
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["status"] == "resolved"
+            assert data["session_id"] == session_id
+
+            # Verify exact session resume called
+            mock_resume.assert_called_once_with(
+                session_id=session_id,
+                client_id=client_id,
+                rfq_id=rfq_id,
+                supplier_id=supp_id,
+            )
+            mock_create_session.assert_not_called()
+
+            # Verify outbound message requires original delivery schedule
+            mock_enqueue.assert_called_once()
+            sent_msg = mock_enqueue.call_args[0][1]
+            assert "keep the requested delivery schedule" in sent_msg.lower()
+
+    # ============================================================
+    # INTEGRATION TEST K — SESSION SECURITY AND TENANT VALIDATION
+    # ============================================================
+    def test_integration_session_security_and_tenant_validation(self, auth_client):
+        client, client_id, user_id = auth_client
+        session_id = str(uuid.uuid4())
+        rfq_id = str(uuid.uuid4())
+        supp_id = str(uuid.uuid4())
+        other_client = str(uuid.uuid4())
+        other_rfq = str(uuid.uuid4())
+        other_supp = str(uuid.uuid4())
+
+        # 1. Closed RFQ cannot be resumed
+        closed_rfq = {"id": rfq_id, "status": "closed"}
+        with patch.object(db, "get_rfq_by_id", return_value=closed_rfq):
+            res = db.resume_negotiation_session(session_id, client_id, rfq_id, supp_id)
+            assert res is None
+
+        # 2. Expired RFQ deadline cannot be resumed
+        expired_rfq = {
+            "id": rfq_id,
+            "status": "active",
+            "due_by": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+        }
+        with patch.object(db, "get_rfq_by_id", return_value=expired_rfq):
+            res = db.resume_negotiation_session(session_id, client_id, rfq_id, supp_id)
+            assert res is None
+
+        # 3. Session belonging to another client is rejected by get_negotiation_session_by_id
+        active_rfq = {"id": rfq_id, "status": "active", "due_by": None}
+        with patch.object(db, "get_rfq_by_id", return_value=active_rfq), \
+             patch.object(db, "get_negotiation_session_by_id", return_value=None) as mock_get_sess:
+            res = db.resume_negotiation_session(session_id, other_client, rfq_id, supp_id)
+            assert res is None
+
+        # 4. Session in completed / expired status cannot be resumed
+        expired_session = {"id": session_id, "status": "expired", "client_id": client_id, "rfq_id": rfq_id, "supplier_id": supp_id}
+        with patch.object(db, "get_rfq_by_id", return_value=active_rfq), \
+             patch.object(db, "get_negotiation_session_by_id", return_value=expired_session):
+            res = db.resume_negotiation_session(session_id, client_id, rfq_id, supp_id)
+            assert res is None
+
+    # ============================================================
+    # INTEGRATION TEST L — REQUIRED DELIVERY INITIAL RFQ MESSAGE
+    # ============================================================
+    @pytest.mark.asyncio
+    async def test_integration_required_delivery_supplier_message(self, auth_client):
+        client, client_id, user_id = auth_client
+
+        # 1. RFQ with required_delivery_days = 2 and deadline_hours = 3
+        payload_with_del = {
+            "product_name": "GI Conduit 20mm",
+            "category": "Electrical",
+            "specs": "Class 4",
+            "quantity": 50,
+            "deadline_hours": 3,
+            "required_delivery_days": 2,
+        }
+
+        mock_rfq_1 = {
+            "id": str(uuid.uuid4()),
+            "client_id": client_id,
+            "product_name": "GI Conduit 20mm",
+            "category": "Electrical",
+            "specs": "Class 4",
+            "quantity": 50,
+            "deadline_hours": 3,
+            "required_delivery_days": 2,
+            "status": "active",
+        }
+        mock_suppliers = [{"id": str(uuid.uuid4()), "name": "Al Noor Electricals", "phone_number": "+971501112233"}]
+
+        with patch.object(db, "create_rfq_and_match_suppliers", return_value=(mock_rfq_1, mock_suppliers)), \
+             patch.object(db, "log_message", return_value="log-del-1"), \
+             patch("main.enqueue_message", new_callable=AsyncMock) as mock_enqueue_1:
+
+            resp1 = client.post("/rfq/create", json=payload_with_del)
+            assert resp1.status_code == 200
+
+            mock_enqueue_1.assert_called_once()
+            msg_text_1 = mock_enqueue_1.call_args[0][1]
+
+            # Verify Quote Required Within and Required Delivery are both present and separate
+            assert "Quote Required Within: 3 hour(s)" in msg_text_1
+            assert "Required Delivery: Within 2 days" in msg_text_1
+            # Ensure price bounds and internal fields are never exposed
+            assert "acceptable_price" not in msg_text_1
+            assert "flexibility" not in msg_text_1
+
+        # 2. RFQ with required_delivery_days = None
+        payload_without_del = {
+            "product_name": "GI Conduit 20mm",
+            "category": "Electrical",
+            "specs": "Class 4",
+            "quantity": 50,
+            "deadline_hours": 3,
+            "required_delivery_days": None,
+        }
+
+        mock_rfq_2 = {
+            "id": str(uuid.uuid4()),
+            "client_id": client_id,
+            "product_name": "GI Conduit 20mm",
+            "category": "Electrical",
+            "specs": "Class 4",
+            "quantity": 50,
+            "deadline_hours": 3,
+            "required_delivery_days": None,
+            "status": "active",
+        }
+
+        with patch.object(db, "create_rfq_and_match_suppliers", return_value=(mock_rfq_2, mock_suppliers)), \
+             patch.object(db, "log_message", return_value="log-del-2"), \
+             patch("main.enqueue_message", new_callable=AsyncMock) as mock_enqueue_2:
+
+            resp2 = client.post("/rfq/create", json=payload_without_del)
+            assert resp2.status_code == 200
+
+            mock_enqueue_2.assert_called_once()
+            msg_text_2 = mock_enqueue_2.call_args[0][1]
+
+            assert "Quote Required Within: 3 hour(s)" in msg_text_2
+            assert "Required Delivery:" not in msg_text_2
+
+

@@ -2451,13 +2451,21 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
             "message": f"RFQ created (ID: {rfq['id']}), but no active suppliers matched category '{req.category}'.",
         }
 
+    rfq_lines = [
+        f"• Product: {req.product_name}",
+        f"• Specs: {req.specs or 'Standard'}",
+        f"• Quantity: {req.quantity or 'N/A'}",
+        f"• Quote Required Within: {req.deadline_hours} hour(s)",
+    ]
+    if req.required_delivery_days is not None and req.required_delivery_days > 0:
+        day_str = "day" if req.required_delivery_days == 1 else "days"
+        rfq_lines.append(f"• Required Delivery: Within {req.required_delivery_days} {day_str}")
+
+    items_text = "\n".join(rfq_lines)
     rfq_msg = (
         f"Hi! This is Amafha Hardware Store.\n"
         f"We're requesting a quote for the following item:\n\n"
-        f"• Product: {req.product_name}\n"
-        f"• Specs: {req.specs or 'Standard'}\n"
-        f"• Quantity: {req.quantity or 'N/A'}\n"
-        f"• Quote Required Within: {req.deadline_hours} hour(s)\n\n"
+        f"{items_text}\n\n"
         f"Please reply directly to this message with your price per unit (AED) and estimated delivery time. Thanks!"
     )
 
@@ -2986,11 +2994,27 @@ async def authorize_negotiation_tradeoff_endpoint(
 
     # 3. Resume negotiation if requested
     outbound_sent = False
+    resumed_session = None
     if payload.resume_negotiation:
-        session = db.get_active_negotiation_session(client_id, rfq_id, supplier_id)
-        if not session:
-            session = db.create_or_update_negotiation_session(
-                client_id, rfq_id, supplier_id, status="active"
+        flag_meta = flag.get("metadata") or {}
+        session_id = flag_meta.get("session_id")
+
+        if session_id:
+            resumed_session = db.resume_negotiation_session(
+                session_id=str(session_id),
+                client_id=client_id,
+                rfq_id=rfq_id,
+                supplier_id=supplier_id,
+            )
+        else:
+            # Fallback to active session check only if session_id is absent from metadata
+            resumed_session = db.get_active_negotiation_session(client_id, rfq_id, supplier_id)
+
+        if not resumed_session:
+            # Fail safely instead of silently creating a brand-new session
+            raise HTTPException(
+                status_code=400,
+                detail="Could not safely resume paused negotiation session. Associated session is missing, invalid, or expired.",
             )
 
         supplier = flag.get("suppliers") or db.get_supplier_by_id(supplier_id)
@@ -3027,6 +3051,7 @@ async def authorize_negotiation_tradeoff_endpoint(
         "dimension": dimension,
         "constraint": saved_constraint,
         "outbound_sent": outbound_sent,
+        "session_id": resumed_session.get("id") if resumed_session else None,
     }
 
 

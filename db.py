@@ -1333,6 +1333,96 @@ def get_active_negotiation_session_for_supplier(client_id: str, supplier_id: str
     return None
 
 
+def get_negotiation_session_by_id(
+    session_id: str,
+    client_id: str,
+    rfq_id: Optional[str] = None,
+    supplier_id: Optional[str] = None,
+) -> dict | None:
+    """Retrieves a specific negotiation session by id strictly scoped to client_id, optionally validating rfq_id and supplier_id."""
+    if not session_id or not client_id:
+        return None
+    try:
+        query = (
+            supabase.table("negotiation_sessions")
+            .select("*")
+            .eq("id", session_id)
+            .eq("client_id", client_id)
+        )
+        if rfq_id:
+            query = query.eq("rfq_id", rfq_id)
+        if supplier_id:
+            query = query.eq("supplier_id", supplier_id)
+        res = query.limit(1).execute()
+        if res.data and len(res.data) > 0:
+            return res.data[0]
+    except Exception as e:
+        logger.error("get_negotiation_session_by_id error: %s", e)
+    return None
+
+
+def resume_negotiation_session(
+    session_id: str,
+    client_id: str,
+    rfq_id: str,
+    supplier_id: str,
+) -> dict | None:
+    """
+    Resumes a paused negotiation session (e.g. from awaiting_authorization or awaiting_human_review back to active).
+    Validates tenant isolation, matching RFQ and supplier, that RFQ is active and deadline has not passed.
+    Preserves all negotiation history, attempt counts, offers, and strategy states.
+    """
+    if not session_id or not client_id or not rfq_id or not supplier_id:
+        return None
+
+    try:
+        # 1. Verify RFQ active and not expired
+        rfq = get_rfq_by_id(rfq_id)
+        if not rfq or rfq.get("status") != "active":
+            return None
+        if rfq.get("due_by"):
+            try:
+                due_dt = datetime.fromisoformat(str(rfq["due_by"]).replace("Z", "+00:00"))
+                if due_dt <= datetime.now(timezone.utc):
+                    return None
+            except Exception:
+                pass
+
+        # 2. Get session and verify status and ownership
+        session = get_negotiation_session_by_id(
+            session_id=session_id,
+            client_id=client_id,
+            rfq_id=rfq_id,
+            supplier_id=supplier_id,
+        )
+        if not session:
+            return None
+
+        current_status = session.get("status")
+        if current_status not in ("awaiting_authorization", "awaiting_human_review", "active"):
+            return None
+
+        now_utc = datetime.now(timezone.utc).isoformat()
+        res = (
+            supabase.table("negotiation_sessions")
+            .update({
+                "status": "active",
+                "completed_at": None,
+                "updated_at": now_utc,
+            })
+            .eq("id", session_id)
+            .eq("client_id", client_id)
+            .eq("rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .execute()
+        )
+        if res.data and len(res.data) > 0:
+            return res.data[0]
+    except Exception as e:
+        logger.error("resume_negotiation_session error: %s", e)
+    return None
+
+
 def create_or_update_negotiation_session(client_id: str, rfq_id: str, supplier_id: str, **kwargs) -> dict | None:
     """Creates a new active negotiation session or updates the existing active session.
     Fails closed (returns None) if persistence fails.
