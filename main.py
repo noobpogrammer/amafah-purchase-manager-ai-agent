@@ -3017,34 +3017,131 @@ async def authorize_negotiation_tradeoff_endpoint(
         client_id=client_id,
     )
 
-    # 4. Send supplier continuation message if resume requested and session resumed
+    # 4. Continue from the supplier's EXISTING conditional offer.
+    # Do not ask the supplier to repeat a price already captured in the flag/session.
     if payload.resume_negotiation and resumed_session:
         supplier = flag.get("suppliers") or db.get_supplier_by_id(supplier_id)
         phone = supplier.get("phone_number") if supplier else None
+        flag_meta = flag.get("metadata") or {}
 
         if decision == "approve":
+            supplier_price = flag_meta.get("supplier_latest_price")
+            if supplier_price is None:
+                supplier_price = resumed_session.get("latest_supplier_offer")
+
+            counter_price = None
+            strategy = None
+            if supplier_price is not None:
+                try:
+                    supplier_price = float(supplier_price)
+                    bounds = negotiation_engine.build_allowed_counter_range(
+                        preferred_target=float(resumed_session.get("preferred_target")) if resumed_session.get("preferred_target") is not None else None,
+                        acceptable_max=float(resumed_session.get("acceptable_max")) if resumed_session.get("acceptable_max") is not None else None,
+                        tolerated_final_ceiling=float(resumed_session.get("tolerated_final_ceiling")) if resumed_session.get("tolerated_final_ceiling") is not None else None,
+                        latest_supplier_offer=supplier_price,
+                        previous_supplier_offer=float(resumed_session.get("previous_supplier_offer")) if resumed_session.get("previous_supplier_offer") is not None else None,
+                        latest_agent_counter=float(resumed_session.get("latest_agent_counter")) if resumed_session.get("latest_agent_counter") is not None else None,
+                        attempt_count=int(resumed_session.get("attempt_count") or 0),
+                        max_attempts=MAX_NEGOTIATION_ATTEMPTS,
+                        supplier_final_detected=bool(resumed_session.get("supplier_final_detected")),
+                        no_movement_count=int(resumed_session.get("no_movement_count") or 0),
+                    )
+                    strategy = bounds.get("selected_strategy")
+                    if bounds.get("should_counter") and bounds.get("recommended_anchor") is not None:
+                        counter_price = float(bounds["recommended_anchor"])
+                except (TypeError, ValueError):
+                    logger.exception(
+                        "Failed to calculate post-authorization counter for RFQ %s / supplier %s",
+                        rfq_id,
+                        supplier_id,
+                    )
+
             if dimension == "delivery":
                 days = persisted_constraints.get("max_days")
-                resume_msg = f"We have some flexibility on delivery. If we allow up to {days} days, what is your best rate for this order?"
+                if counter_price is not None:
+                    resume_msg = (
+                        f"Thanks, {days}-day delivery works for us. "
+                        f"We have noted your AED {supplier_price:g} offer. "
+                        f"Could you do AED {counter_price:g} per piece?"
+                    )
+                else:
+                    resume_msg = (
+                        f"Thanks, {days}-day delivery works for us. "
+                        f"We have noted your AED {supplier_price:g} offer for evaluation."
+                        if supplier_price is not None
+                        else f"Thanks, {days}-day delivery works for us. We have noted the updated terms."
+                    )
             elif dimension == "quantity":
                 q_max = persisted_constraints.get("max")
-                resume_msg = f"We can be flexible on quantity up to {q_max} units. What would be your best rate at that volume?"
+                if counter_price is not None:
+                    resume_msg = (
+                        f"Thanks, we can work with quantity up to {q_max} units. "
+                        f"We have noted your AED {supplier_price:g} offer. "
+                        f"Could you do AED {counter_price:g} per piece?"
+                    )
+                else:
+                    resume_msg = (
+                        f"Thanks, we can work with quantity up to {q_max} units. "
+                        f"We have noted your AED {supplier_price:g} offer for evaluation."
+                        if supplier_price is not None
+                        else f"Thanks, we can work with quantity up to {q_max} units. We have noted the updated terms."
+                    )
             else:
-                resume_msg = f"We can consider that alternative option. Could you improve the rate further?"
+                if counter_price is not None:
+                    resume_msg = (
+                        f"Thanks, we can consider that alternative. "
+                        f"We have noted your AED {supplier_price:g} offer. "
+                        f"Could you do AED {counter_price:g} per piece?"
+                    )
+                else:
+                    resume_msg = (
+                        f"Thanks, we can consider that alternative. "
+                        f"We have noted your AED {supplier_price:g} offer for evaluation."
+                        if supplier_price is not None
+                        else "Thanks, we can consider that alternative. We have noted the updated terms."
+                    )
         else:
+            counter_price = None
+            strategy = None
             if dimension == "delivery":
-                resume_msg = f"We need to keep the requested delivery schedule. Is there any further flexibility on the price within that requirement?"
+                resume_msg = "We need to keep the requested delivery schedule. Is there any further flexibility on the price within that requirement?"
             elif dimension == "quantity":
                 qty = rfq.get("quantity") or "requested"
                 resume_msg = f"We need to maintain the required quantity of {qty} units. Is there any flexibility on the unit price?"
             else:
-                resume_msg = f"We need to stick to the requested specifications. Is there any further flexibility on the price?"
+                resume_msg = "We need to stick to the requested specifications. Is there any further flexibility on the price?"
 
         if phone:
             msg_log_id = db.log_message(client_id, supplier_id, "outbound", resume_msg, related_rfq_id=rfq_id)
             if msg_log_id:
                 await enqueue_message(phone, resume_msg, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
                 outbound_sent = True
+
+                # A post-approval counter is a real negotiation attempt. Preserve the same
+                # session and advance it instead of creating a new conversation/session.
+                if decision == "approve" and counter_price is not None:
+                    previous_counter = resumed_session.get("latest_agent_counter")
+                    preferred_target = resumed_session.get("preferred_target")
+                    next_attempt = int(resumed_session.get("attempt_count") or 0) + 1
+                    db.create_or_update_negotiation_session(
+                        client_id=client_id,
+                        rfq_id=rfq_id,
+                        supplier_id=supplier_id,
+                        status="active",
+                        previous_agent_counter=previous_counter,
+                        latest_agent_counter=counter_price,
+                        attempt_count=next_attempt,
+                        agent_last_concession=(
+                            round(counter_price - float(previous_counter), 2)
+                            if previous_counter is not None else 0.0
+                        ),
+                        agent_total_concession=(
+                            round(counter_price - float(preferred_target), 2)
+                            if preferred_target is not None else 0.0
+                        ),
+                        selected_strategy=strategy or resumed_session.get("selected_strategy"),
+                        last_outbound_message_id=msg_log_id,
+                    )
 
     return {
         "status": "resolved",
