@@ -27,14 +27,52 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-asyncio anyio
 
-      - name: Run Unit Tests & Deterministic E2E Acceptance Suite
+      - name: Run Unit Tests
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL || 'https://mock.supabase.co' }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY || 'mock-key' }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY || 'mock-service-key' }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET || 'mock-jwt-secret' }}
+          SUPABASE_URL: https://mock.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: mock-service-key
+          JWT_SECRET: mock-jwt-secret
         run: |
-          PYTHONPATH=. pytest -v -m "not live_llm"
+          PYTHONPATH=. pytest -v -m "not e2e and not live_llm"
+
+      - name: Validate Dedicated E2E Database Configuration
+        env:
+          E2E_SUPABASE_URL: ${{ secrets.E2E_SUPABASE_URL }}
+          E2E_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.E2E_SUPABASE_SERVICE_ROLE_KEY }}
+          PRODUCTION_SUPABASE_URL: ${{ secrets.PRODUCTION_SUPABASE_URL }}
+        run: |
+          if [ -z "$E2E_SUPABASE_URL" ]; then
+            echo "::error::Missing GitHub Actions secret E2E_SUPABASE_URL"
+            exit 1
+          fi
+          if [ -z "$E2E_SUPABASE_SERVICE_ROLE_KEY" ]; then
+            echo "::error::Missing GitHub Actions secret E2E_SUPABASE_SERVICE_ROLE_KEY"
+            exit 1
+          fi
+          if [ -z "$PRODUCTION_SUPABASE_URL" ]; then
+            echo "::error::Missing GitHub Actions secret PRODUCTION_SUPABASE_URL"
+            exit 1
+          fi
+          if [ "$E2E_SUPABASE_URL" = "$PRODUCTION_SUPABASE_URL" ]; then
+            echo "::error::E2E Supabase project must be different from production."
+            exit 1
+          fi
+          case "$E2E_SUPABASE_URL" in
+            *mock.supabase.co*|*placeholder*)
+              echo "::error::E2E Supabase URL cannot be a mock or placeholder."
+              exit 1
+              ;;
+          esac
+
+      - name: Run Deterministic E2E Acceptance Suite
+        env:
+          SUPABASE_URL: ${{ secrets.E2E_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.E2E_SUPABASE_SERVICE_ROLE_KEY }}
+          PRODUCTION_SUPABASE_URL: ${{ secrets.PRODUCTION_SUPABASE_URL }}
+          E2E_DB_CONFIRM: "1"
+          JWT_SECRET: mock-jwt-secret
+        run: |
+          PYTHONPATH=. pytest tests/e2e -v -s -m "e2e and not live_llm"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
