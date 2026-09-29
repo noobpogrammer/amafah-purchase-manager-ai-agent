@@ -285,112 +285,141 @@ def evaluate_supplier_tradeoff(
     extracted_delivery: Optional[str] = None,
     extracted_quantity: Optional[int] = None,
     extracted_variant: Optional[str] = None,
+    commercial_parse: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Evaluates whether the supplier proposes a conditional trade-off
-    (delivery, quantity, specification) and verifies if it is authorized under rfq_negotiation_constraints.
+    (delivery, quantity, specification, payment) and deterministically verifies
+    if it is authorized under rfq_negotiation_constraints.
     """
-    if not message_text:
+    if not message_text and not commercial_parse:
         return {"has_tradeoff": False, "is_authorized": True}
 
     text = message_text or ""
     constraints_by_dim = {c.get("dimension"): c for c in (rfq_constraints or [])}
 
-    # 1. Check Conditional Delivery Trade-off
-    # Examples: "if you can accept 5 days, I can do 55", "can reduce price if delivery is 5 days", "if delivery is 4 days"
-    deliv_match = re.search(
-        r"\b(?:if\s+(?:you\s+(?:can\s+)?)?(?:accept|allow|take|do)\s+|if\s+delivery\s+is\s+|can\s+reduce\s+(?:price|rate)\s+if\s+(?:delivery\s+is\s+)?|ready\s+in\s+)(\d+)\s*(?:days?|working\s*days?|business\s*days?)\b",
-        text,
-        re.IGNORECASE,
-    )
+    if commercial_parse is None and text:
+        try:
+            import groq_client
+            commercial_parse = groq_client.parse_commercial_message(text)
+        except Exception:
+            commercial_parse = None
 
-    if deliv_match:
-        proposed_days = int(deliv_match.group(1))
-        deliv_constraint = constraints_by_dim.get("delivery")
-        current_req = None
-        if deliv_constraint and deliv_constraint.get("constraints"):
-            current_req = deliv_constraint["constraints"].get("required_days")
-        if current_req is None and rfq:
-            current_req = rfq.get("required_delivery_days")
+    tradeoff = (commercial_parse.get("tradeoff") or {}) if commercial_parse else {}
+    has_tradeoff_flag = bool(tradeoff.get("present"))
+    tradeoff_dim = tradeoff.get("dimension")
+    deliv_info = (commercial_parse.get("delivery") or {}) if commercial_parse else {}
+    qty_info = (commercial_parse.get("quantity") or {}) if commercial_parse else {}
+    spec_info = (commercial_parse.get("specification") or {}) if commercial_parse else {}
+    payment_info = (commercial_parse.get("payment_terms") or {}) if commercial_parse else {}
 
+    # 1. Check Delivery Trade-off
+    proposed_days = deliv_info.get("days")
+    if proposed_days is None and extracted_delivery:
+        m = re.search(r"(\d+)", str(extracted_delivery))
+        if m:
+            proposed_days = int(m.group(1))
+
+    # Regex fallback if structured parse missed delivery
+    if proposed_days is None and text:
+        deliv_match = re.search(
+            r"\b(?:if\s+(?:you\s+(?:can\s+)?)?(?:accept|allow|take|do)\s+|if\s+delivery\s+is\s+|can\s+reduce\s+(?:price|rate)\s+if\s+(?:delivery\s+is\s+)?|ready\s+in\s+|lead\s+time\s+(?:is\s+|around\s+)?|delivery\s+(?:in\s+|is\s+)?|delivery\s*:?\s*)(\d+)\s*(?:-day|day|days|working\s*days?|business\s*days?|week|weeks)?\b",
+            text,
+            re.IGNORECASE,
+        )
+        if deliv_match:
+            val = int(deliv_match.group(1))
+            if "week" in deliv_match.group(0).lower():
+                val = val * 7
+            proposed_days = val
+
+    deliv_constraint = constraints_by_dim.get("delivery")
+    current_deliv_req = None
+    if deliv_constraint and deliv_constraint.get("constraints"):
+        current_deliv_req = deliv_constraint["constraints"].get("required_days")
+    if current_deliv_req is None and rfq:
+        current_deliv_req = rfq.get("required_delivery_days")
+
+    if proposed_days is not None:
         is_authorized_deliv = bool(deliv_constraint and deliv_constraint.get("status") == "authorized")
         max_days = deliv_constraint.get("constraints", {}).get("max_days") if deliv_constraint else None
 
-        if is_authorized_deliv:
-            if max_days is not None and proposed_days <= int(max_days):
-                return {
-                    "has_tradeoff": True,
-                    "is_authorized": True,
-                    "dimension": "delivery",
-                    "current_value": current_req,
-                    "supplier_proposed_value": proposed_days,
-                }
-            else:
-                return {
-                    "has_tradeoff": True,
-                    "is_authorized": False,
-                    "dimension": "delivery",
-                    "current_value": current_req,
-                    "supplier_proposed_value": proposed_days,
-                    "reason": f"Supplier proposed {proposed_days}-day delivery exceeding authorized maximum ({max_days} days).",
-                }
-        else:
-            if current_req is not None:
-                if proposed_days > current_req:
-                    return {
-                        "has_tradeoff": True,
-                        "is_authorized": False,
-                        "dimension": "delivery",
-                        "current_value": current_req,
-                        "supplier_proposed_value": proposed_days,
-                        "reason": f"Supplier proposed {proposed_days}-day delivery but delivery is fixed at {current_req} days.",
-                    }
-            else:
-                return {
-                    "has_tradeoff": True,
-                    "is_authorized": False,
-                    "dimension": "delivery",
-                    "current_value": None,
-                    "supplier_proposed_value": proposed_days,
-                    "reason": f"Supplier proposed {proposed_days}-day delivery; required delivery is not specified in RFQ.",
-                }
+        is_conditional_or_different = (
+            has_tradeoff_flag
+            or tradeoff_dim == "delivery"
+            or (current_deliv_req is not None and proposed_days > current_deliv_req)
+            or (max_days is not None and proposed_days > int(max_days))
+        )
 
-    # 2. Check Conditional Quantity Trade-off
-    # Examples: "if you order 30 pcs", "moq is 30", "if you take 50 units"
-    qty_match = re.search(
-        r"\b(?:if\s+you\s+(?:can\s+)?(?:take|order|buy)|moq\s*(?:is|of)?|minimum\s+(?:order|quantity)\s*(?:is|of)?)\s*(\d+)\s*(?:pcs|pieces|units|nos)?\b",
-        text,
-        re.IGNORECASE,
-    )
-
-    if qty_match:
-        proposed_qty = int(qty_match.group(1))
-        qty_constraint = constraints_by_dim.get("quantity")
-        current_qty = rfq.get("quantity") if rfq else 20
-        if qty_constraint and qty_constraint.get("constraints"):
-            current_qty = qty_constraint["constraints"].get("required") or current_qty
-
-        if proposed_qty != current_qty:
-            if qty_constraint and qty_constraint.get("status") == "authorized":
-                q_min = qty_constraint.get("constraints", {}).get("min")
-                q_max = qty_constraint.get("constraints", {}).get("max")
-                if q_min is not None and q_max is not None and int(q_min) <= proposed_qty <= int(q_max):
+        if is_conditional_or_different:
+            if is_authorized_deliv:
+                if max_days is not None and proposed_days <= int(max_days):
                     return {
                         "has_tradeoff": True,
                         "is_authorized": True,
-                        "dimension": "quantity",
-                        "current_value": current_qty,
-                        "supplier_proposed_value": proposed_qty,
+                        "dimension": "delivery",
+                        "current_value": current_deliv_req,
+                        "supplier_proposed_value": proposed_days,
                     }
                 else:
                     return {
                         "has_tradeoff": True,
                         "is_authorized": False,
-                        "dimension": "quantity",
-                        "current_value": current_qty,
-                        "supplier_proposed_value": proposed_qty,
-                        "reason": f"Supplier proposed quantity {proposed_qty} outside authorized range [{q_min}, {q_max}].",
+                        "dimension": "delivery",
+                        "current_value": current_deliv_req,
+                        "supplier_proposed_value": proposed_days,
+                        "reason": f"Supplier proposed {proposed_days}-day delivery exceeding authorized maximum ({max_days} days).",
                     }
+            else:
+                if current_deliv_req is not None and proposed_days <= current_deliv_req:
+                    pass
+                elif current_deliv_req is not None:
+                    return {
+                        "has_tradeoff": True,
+                        "is_authorized": False,
+                        "dimension": "delivery",
+                        "current_value": current_deliv_req,
+                        "supplier_proposed_value": proposed_days,
+                        "reason": f"Supplier proposed {proposed_days}-day delivery but delivery is fixed at {current_deliv_req} days.",
+                    }
+                elif has_tradeoff_flag or tradeoff_dim == "delivery":
+                    return {
+                        "has_tradeoff": True,
+                        "is_authorized": False,
+                        "dimension": "delivery",
+                        "current_value": None,
+                        "supplier_proposed_value": proposed_days,
+                        "reason": f"Supplier proposed conditional {proposed_days}-day delivery trade-off requiring buyer authorization.",
+                    }
+
+    # 2. Check Quantity Trade-off
+    proposed_qty = qty_info.get("minimum_order_quantity") or qty_info.get("value") or extracted_quantity
+    if proposed_qty is None and text:
+        qty_match = re.search(
+            r"\b(?:if\s+you\s+(?:can\s+)?(?:take|order|buy)|moq\s*(?:is|of)?|minimum\s+(?:order|quantity)\s*(?:is|of)?)\s*(\d+)\s*(?:pcs|pieces|units|nos)?\b",
+            text,
+            re.IGNORECASE,
+        )
+        if qty_match:
+            proposed_qty = int(qty_match.group(1))
+
+    qty_constraint = constraints_by_dim.get("quantity")
+    current_qty = rfq.get("quantity") if rfq else 20
+    if qty_constraint and qty_constraint.get("constraints"):
+        current_qty = qty_constraint["constraints"].get("required") or current_qty
+
+    if proposed_qty is not None and (proposed_qty != current_qty or has_tradeoff_flag or tradeoff_dim == "quantity"):
+        if qty_constraint and qty_constraint.get("status") == "authorized":
+            q_min = qty_constraint.get("constraints", {}).get("min")
+            q_max = qty_constraint.get("constraints", {}).get("max")
+            if q_min is not None and q_max is not None and int(q_min) <= proposed_qty <= int(q_max):
+                return {
+                    "has_tradeoff": True,
+                    "is_authorized": True,
+                    "dimension": "quantity",
+                    "current_value": current_qty,
+                    "supplier_proposed_value": proposed_qty,
+                }
             else:
                 return {
                     "has_tradeoff": True,
@@ -398,23 +427,36 @@ def evaluate_supplier_tradeoff(
                     "dimension": "quantity",
                     "current_value": current_qty,
                     "supplier_proposed_value": proposed_qty,
-                    "reason": f"Supplier proposed quantity {proposed_qty} but quantity is fixed at {current_qty}.",
+                    "reason": f"Supplier proposed quantity {proposed_qty} outside authorized range [{q_min}, {q_max}].",
                 }
+        else:
+            return {
+                "has_tradeoff": True,
+                "is_authorized": False,
+                "dimension": "quantity",
+                "current_value": current_qty,
+                "supplier_proposed_value": proposed_qty,
+                "reason": f"Supplier proposed quantity {proposed_qty} but quantity is fixed at {current_qty}.",
+            }
 
     # 3. Check Specification Trade-off
-    # Examples: "alternative brand: ABB", "substitute: Grade 316", "instead of copper: PVC"
-    spec_match = re.search(r"\b(?:alternative|substitute|option|instead\s+of|brand)\s*:\s*([A-Za-z0-9\s]+)", text, re.IGNORECASE)
-    if spec_match:
-        proposed_spec = spec_match.group(1).strip()
+    proposed_spec = spec_info.get("alternative") or extracted_variant
+    if not proposed_spec and text:
+        spec_match = re.search(r"\b(?:alternative|substitute|option|instead\s+of|brand)\s*:\s*([A-Za-z0-9\s]+)", text, re.IGNORECASE)
+        if spec_match:
+            proposed_spec = spec_match.group(1).strip()
+
+    if proposed_spec:
         spec_constraint = constraints_by_dim.get("specification")
+        current_spec = rfq.get("specs") if rfq else "Standard"
         if spec_constraint and spec_constraint.get("status") == "authorized":
             allowed = spec_constraint.get("constraints", {}).get("allowed_alternatives")
-            if allowed and proposed_spec.lower() in str(allowed).lower():
+            if allowed and (proposed_spec.lower() in str(allowed).lower() or any(str(a).lower() in proposed_spec.lower() for a in (allowed if isinstance(allowed, list) else [allowed]))):
                 return {
                     "has_tradeoff": True,
                     "is_authorized": True,
                     "dimension": "specification",
-                    "current_value": rfq.get("specs") if rfq else "Standard",
+                    "current_value": current_spec,
                     "supplier_proposed_value": proposed_spec,
                 }
             else:
@@ -422,7 +464,7 @@ def evaluate_supplier_tradeoff(
                     "has_tradeoff": True,
                     "is_authorized": False,
                     "dimension": "specification",
-                    "current_value": rfq.get("specs") if rfq else "Standard",
+                    "current_value": current_spec,
                     "supplier_proposed_value": proposed_spec,
                     "reason": f"Supplier proposed specification '{proposed_spec}' not in authorized alternatives.",
                 }
@@ -431,10 +473,22 @@ def evaluate_supplier_tradeoff(
                 "has_tradeoff": True,
                 "is_authorized": False,
                 "dimension": "specification",
-                "current_value": rfq.get("specs") if rfq else "Standard",
+                "current_value": current_spec,
                 "supplier_proposed_value": proposed_spec,
                 "reason": f"Supplier proposed alternative specification '{proposed_spec}' but specifications are fixed.",
             }
+
+    # 4. Check Payment Terms Trade-off
+    proposed_payment = payment_info.get("text")
+    if proposed_payment or (has_tradeoff_flag and tradeoff_dim in ("payment", "payment_terms")):
+        return {
+            "has_tradeoff": True,
+            "is_authorized": False,
+            "dimension": "payment",
+            "current_value": "Standard",
+            "supplier_proposed_value": proposed_payment or "Non-standard payment terms",
+            "reason": f"Supplier proposed non-standard payment terms '{proposed_payment or 'conditional'}' requiring human review.",
+        }
 
     return {"has_tradeoff": False, "is_authorized": True}
 
@@ -449,6 +503,7 @@ def build_negotiation_preflight(
     extracted_delivery: Optional[str] = None,
     extracted_quantity: Optional[int] = None,
     extracted_variant: Optional[str] = None,
+    commercial_parse: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Builds the internal structured preflight plan before reasoning or countering.
@@ -487,6 +542,8 @@ def build_negotiation_preflight(
     is_final = is_final_price_declared(raw_message_text)
     if active_session and active_session.get("supplier_final_detected"):
         is_final = True
+    if commercial_parse and commercial_parse.get("supplier_final"):
+        is_final = True
 
     no_mov_count = active_session.get("no_movement_count", 0) if active_session else 0
 
@@ -518,6 +575,7 @@ def build_negotiation_preflight(
         extracted_delivery=extracted_delivery,
         extracted_quantity=extracted_quantity,
         extracted_variant=extracted_variant,
+        commercial_parse=commercial_parse,
     )
 
     should_counter = bounds["should_counter"]

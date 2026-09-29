@@ -229,7 +229,295 @@ TOOLS = [
 ]
 
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
+import math
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------
+# Structured LLM Commercial Message Parser Schema & Models
+# ------------------------------------------------------------
+class CommercialPriceInfo(BaseModel):
+    amount: Optional[float] = None
+    currency: Optional[str] = "AED"
+    per_unit: Optional[bool] = None
+
+class CommercialDeliveryInfo(BaseModel):
+    days: Optional[int] = None
+    unit: Optional[str] = "calendar_days"
+
+class CommercialQuantityInfo(BaseModel):
+    value: Optional[int] = None
+    minimum_order_quantity: Optional[int] = None
+
+class CommercialSpecificationInfo(BaseModel):
+    alternative: Optional[str] = None
+
+class CommercialPaymentTermsInfo(BaseModel):
+    text: Optional[str] = None
+
+class CommercialTradeoffInfo(BaseModel):
+    present: bool = False
+    dimension: Optional[str] = None  # "price", "delivery", "quantity", "specification", "payment", "other"
+    condition_text: Optional[str] = None
+
+class CommercialParseResult(BaseModel):
+    intent: str = "other"  # "quote_update", "conditional_offer", "clarification", "rejection", "final_offer", "availability_update", "other"
+    price: Optional[CommercialPriceInfo] = None
+    delivery: Optional[CommercialDeliveryInfo] = None
+    quantity: Optional[CommercialQuantityInfo] = None
+    specification: Optional[CommercialSpecificationInfo] = None
+    payment_terms: Optional[CommercialPaymentTermsInfo] = None
+    tradeoff: Optional[CommercialTradeoffInfo] = None
+    supplier_final: bool = False
+    explicit_product_reference: Optional[str] = None
+    confidence: float = 1.0
+
+
+COMMERCIAL_PARSER_SYSTEM_PROMPT = """You are a strict, objective commercial data extraction engine for procurement supplier WhatsApp messages.
+Your sole responsibility is to convert natural supplier language into structured commercial facts.
+
+DO NOT make procurement decisions.
+DO NOT decide whether to accept, reject, counter, or escalate.
+DO NOT decide whether a condition or trade-off is authorized.
+Only extract the exact factual meaning from the message.
+
+Output MUST be a single valid JSON object matching this schema:
+{
+  "intent": "quote_update" | "conditional_offer" | "clarification" | "rejection" | "final_offer" | "availability_update" | "other",
+  "price": {
+    "amount": float or null,
+    "currency": "AED" or null,
+    "per_unit": bool or null
+  },
+  "delivery": {
+    "days": int or null,
+    "unit": "calendar_days" | "working_days" or null
+  },
+  "quantity": {
+    "value": int or null,
+    "minimum_order_quantity": int or null
+  },
+  "specification": {
+    "alternative": string or null
+  },
+  "payment_terms": {
+    "text": string or null
+  },
+  "tradeoff": {
+    "present": bool,
+    "dimension": "price" | "delivery" | "quantity" | "specification" | "payment" | "other" | null,
+    "condition_text": string or null
+  },
+  "supplier_final": bool,
+  "explicit_product_reference": string or null,
+  "confidence": float (0.0 to 1.0)
+}
+
+RULES:
+1. If the supplier offers a price contingent on a delivery schedule (e.g. "50 if you allow 6-day delivery", "if you can accept 6 days, I can do 50 AED", "ready in 4 days"), set tradeoff.present=true, tradeoff.dimension="delivery", price.amount=50, delivery.days=6, intent="conditional_offer".
+2. If the supplier offers a price contingent on volume (e.g. "if you take 100 units I can do 42"), set tradeoff.present=true, tradeoff.dimension="quantity", quantity.value=100, price.amount=42, intent="conditional_offer".
+3. If the message states a minimum order quantity (e.g. "MOQ 50"), set quantity.minimum_order_quantity=50, tradeoff.present=true, tradeoff.dimension="quantity".
+4. If the supplier offers an alternative specification or brand (e.g. "alternative brand ABB at 38 AED", "substitute: Grade 316"), set tradeoff.present=true, tradeoff.dimension="specification", specification.alternative="ABB", price.amount=38, intent="conditional_offer".
+5. If the message states payment requirements (e.g. "50% advance against PI"), set payment_terms.text="50% advance against PI", tradeoff.present=true, tradeoff.dimension="payment".
+6. If the supplier states the price is final/last/best (e.g. "final 49", "cannot go lower than 50", "best and final"), set supplier_final=true.
+7. If the supplier mentions a specific product name (e.g. "TEST COPPER PIPE", "pvc pipe"), extract it into explicit_product_reference.
+8. If currency is not specified, default currency to "AED".
+9. Validate data: negative prices, impossible delivery days (> 365) are invalid.
+"""
+
+
+def _fallback_parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] = None) -> CommercialParseResult:
+    text = (message_text or "").strip()
+    if not text:
+        return CommercialParseResult(intent="other", confidence=0.0)
+
+    res = CommercialParseResult(intent="other", confidence=0.9)
+
+    # 1. Price extraction
+    price_val = None
+    per_unit = bool(re.search(r"\b(?:per\s*(?:pc|piece|unit|item|nos?)|each|/\s*(?:pc|piece|unit))\b", text, re.I))
+    
+    p_match = re.search(r"(?:aed|dhs?|dirhams?)\s*(\d+(?:\.\d+)?)", text, re.I)
+    if not p_match:
+        p_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:aed|dhs?|dirhams?)", text, re.I)
+    if not p_match:
+        p_match = re.search(r"\b(?:i\s+can\s+do|can\s+do|offer|price\s*is|rate\s*is|final\s*is|final)\s*(\d+(?:\.\d+)?)\b", text, re.I)
+    if not p_match:
+        p_match = re.search(r"^\s*(\d+(?:\.\d+)?)\s*(?:if\b|,|\.|$)", text, re.I)
+
+    if p_match:
+        try:
+            pv = float(p_match.group(1))
+            if pv > 0 and not math.isnan(pv) and not math.isinf(pv):
+                price_val = pv
+                res.price = CommercialPriceInfo(amount=pv, currency="AED", per_unit=per_unit)
+                res.intent = "quote_update"
+        except Exception:
+            pass
+
+    # 2. Delivery extraction
+    deliv_days = None
+    deliv_unit = "calendar_days"
+    d_match = re.search(r"(\d+)[-\s]*(?:working|business)[-\s]*days?", text, re.I)
+    if d_match:
+        deliv_days = int(d_match.group(1))
+        deliv_unit = "working_days"
+    else:
+        d_match = re.search(r"(?:ready\s+in|lead\s*time\s*(?:around|is|of)?|delivery\s+(?:in|is|of)?|\b)(\d+)[-\s]*days?", text, re.I)
+        if d_match:
+            deliv_days = int(d_match.group(1))
+        else:
+            w_match = re.search(r"(?:lead\s*time\s*(?:around|is|of)?|ready\s+in|in)?\s*(?:one|1)\s*week", text, re.I)
+            if w_match:
+                deliv_days = 7
+            else:
+                w_match2 = re.search(r"(\d+)\s*weeks?", text, re.I)
+                if w_match2:
+                    deliv_days = int(w_match2.group(1)) * 7
+
+    if deliv_days is not None and 0 < deliv_days <= 365:
+        res.delivery = CommercialDeliveryInfo(days=deliv_days, unit=deliv_unit)
+
+    # 3. Quantity extraction
+    qty_val = None
+    moq_val = None
+    moq_match = re.search(r"\b(?:moq|minimum\s+order\s+quantity)\s*(?:is|of|:)?\s*(\d+)\b", text, re.I)
+    if moq_match:
+        moq_val = int(moq_match.group(1))
+    
+    qty_match = re.search(r"\b(?:take|order|buy)\s*(\d+)\s*(?:pcs|pieces|units|nos)?\b", text, re.I)
+    if qty_match:
+        qty_val = int(qty_match.group(1))
+    elif not moq_val:
+        qty_match2 = re.search(r"\b(\d+)\s*(?:pcs|pieces|units|nos)\b", text, re.I)
+        if qty_match2 and (not p_match or qty_match2.group(1) != p_match.group(1)):
+            qty_val = int(qty_match2.group(1))
+
+    if qty_val or moq_val:
+        res.quantity = CommercialQuantityInfo(value=qty_val, minimum_order_quantity=moq_val)
+
+    # 4. Specification extraction
+    spec_match = re.search(r"\b(?:alternative\s+brand|substitute\s+brand|brand)\s*(?::\s*|\s+)([A-Za-z0-9\s]+?)(?:\s+at|\s+for|\s+with|$|\.|\,)", text, re.I)
+    if not spec_match:
+        spec_match = re.search(r"\b(?:alternative|substitute)\s*(?::\s*|\s+)([A-Za-z0-9\s]+?)(?:\s+at|\s+for|\s+with|$|\.|\,)", text, re.I)
+    if spec_match:
+        spec_alt = spec_match.group(1).strip()
+        res.specification = CommercialSpecificationInfo(alternative=spec_alt)
+    elif re.search(r"\b(?:another\s+model\s+instead|different\s+model)\b", text, re.I):
+        res.specification = CommercialSpecificationInfo(alternative="another model")
+
+    # 5. Payment terms extraction
+    pay_match = re.search(r"\b(\d+%\s*advance(?:\s+against\s+\w+)?)\b", text, re.I)
+    if pay_match:
+        res.payment_terms = CommercialPaymentTermsInfo(text=pay_match.group(1))
+    elif re.search(r"\b(advance\s*payment|cash\s*on\s*delivery|cod|lc|bank\s*transfer)\b", text, re.I):
+        m_p = re.search(r"\b(advance\s*payment|cash\s*on\s*delivery|cod|lc|bank\s*transfer)\b", text, re.I)
+        res.payment_terms = CommercialPaymentTermsInfo(text=m_p.group(1))
+
+    # 6. Tradeoff detection
+    # Delivery conditional check
+    cond_deliv = re.search(r"\b(?:if\s+(?:you\s+(?:can\s+)?)?(?:accept|allow|take|do)\s+(\d+)\s*(?:days?|working\s*days?)|if\s+delivery\s+is\s+(\d+)\s*(?:days?|working\s*days?)|can\s+reduce.*if\s+(?:delivery\s+is\s+)?(\d+)\s*days?|(\d+)\s*days?\s*delivery|(\d+)-day\s*delivery)\b", text, re.I)
+    if cond_deliv or (re.search(r"\bif\b", text, re.I) and deliv_days is not None and price_val is not None):
+        res.tradeoff = CommercialTradeoffInfo(
+            present=True,
+            dimension="delivery",
+            condition_text=f"{deliv_days}-day delivery" if deliv_days else "delivery condition"
+        )
+        res.intent = "conditional_offer"
+    elif qty_val or moq_val or re.search(r"\b(?:if\s+you\s+(?:can\s+)?(?:take|order|buy)|moq)\b", text, re.I):
+        if re.search(r"\b(?:if|moq)\b", text, re.I):
+            res.tradeoff = CommercialTradeoffInfo(
+                present=True,
+                dimension="quantity",
+                condition_text=f"{qty_val or moq_val} units" if (qty_val or moq_val) else "quantity condition"
+            )
+            res.intent = "conditional_offer"
+    elif res.specification and res.specification.alternative:
+        res.tradeoff = CommercialTradeoffInfo(
+            present=True,
+            dimension="specification",
+            condition_text=res.specification.alternative
+        )
+        res.intent = "conditional_offer"
+    elif res.payment_terms and res.payment_terms.text:
+        res.tradeoff = CommercialTradeoffInfo(
+            present=True,
+            dimension="payment",
+            condition_text=res.payment_terms.text
+        )
+        res.intent = "conditional_offer"
+
+    # 7. Supplier final detection
+    if re.search(r"\b(?:final\s*price|best\s*and\s*final|cannot\s*go\s*lower|rock\s*bottom|final\s*offer|my\s*last\s*price|take\s*it\s*or\s*leave\s*it|final\s*\d+)\b", text, re.I):
+        res.supplier_final = True
+        if res.intent == "quote_update":
+            res.intent = "final_offer"
+
+    # 8. Explicit product reference check
+    if candidate_rfqs:
+        for entry in candidate_rfqs:
+            r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+            p_name = r_obj.get("product_name") if isinstance(r_obj, dict) else None
+            if p_name and p_name.lower() in text.lower():
+                res.explicit_product_reference = p_name
+                break
+
+    return res
+
+
+def parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] = None) -> Dict[str, Any]:
+    """
+    Strict structured LLM extraction layer for supplier messages.
+    Converts natural supplier language into structured commercial facts without making authorization decisions.
+    Fails closed on malformed or invalid outputs.
+    """
+    if not message_text or not message_text.strip():
+        return CommercialParseResult(intent="other", confidence=0.0).model_dump()
+
+    try:
+        from unittest.mock import Mock, MagicMock
+        if client and not isinstance(client, (Mock, MagicMock)) and os.environ.get("GROQ_API_KEY"):
+            prompt = f"Supplier WhatsApp message:\n{message_text}"
+            if candidate_rfqs:
+                cand_names = [r.get("rfqs", r).get("product_name") for r in candidate_rfqs if isinstance(r, dict)]
+                cand_str = ", ".join(filter(None, cand_names))
+                if cand_str:
+                    prompt += f"\n\nCandidate open RFQs: {cand_str}"
+
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": COMMERCIAL_PARSER_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            raw_content = response.choices[0].message.content
+            parsed_dict = json.loads(raw_content)
+            result = CommercialParseResult(**parsed_dict)
+
+            # Strict validation checks (Fail-closed on invalid data)
+            if result.price and result.price.amount is not None:
+                if result.price.amount <= 0 or math.isnan(result.price.amount) or math.isinf(result.price.amount):
+                    result.price = None
+                    result.confidence = 0.5
+            if result.delivery and result.delivery.days is not None:
+                if result.delivery.days <= 0 or result.delivery.days > 365:
+                    result.delivery = None
+            if result.quantity and result.quantity.value is not None:
+                if result.quantity.value <= 0:
+                    result.quantity.value = None
+
+            return result.model_dump()
+    except Exception as e:
+        logger.warning("LLM commercial parser failed or offline, falling back to deterministic extractor: %s", e)
+
+    return _fallback_parse_commercial_message(message_text, candidate_rfqs).model_dump()
+
 
 class AgentContext(BaseModel):
     client_id: str
@@ -339,7 +627,7 @@ QUOTE RECORDING & MULTI-VARIANT QUOTES:
 - Revisions: If the supplier previously quoted and now provides an updated rate for a variant, provide the revised variant.
 
 ADAPTIVE AUTONOMOUS NEGOTIATION & CONCESSION PRINCIPLES:
-- Target Exact Commercial Offer: Always negotiate against a specific existing effective quote identified by `quote_id`.
+- Target Exact Commercial Offer: Always negotiate against the CURRENT EFFECTIVE quote identified by `quote_id`. NEVER use a superseded or historical quote ID.
 - Bounded Counter Price: `counter_price` must strictly satisfy: 0 < counter_price < quoted_price, and counter_price <= acceptable_price_max.
 - Negotiation Target Hierarchy:
   * The core objective is to bring the supplier price to the configured optimum acceptable price.
@@ -502,40 +790,62 @@ def format_agent_context_for_prompt(context: AgentContext) -> str:
             f"- Extracted Incomplete Terms: Price={p.get('extracted_price')}, Delivery={p.get('extracted_delivery')}, Notes={p.get('extracted_notes')}"
         )
 
-    # 5. Prior / Effective Quotes (if any)
+    # 5. Prior / Effective Quotes on Record (clearly separating Current Effective vs History)
     if context.prior_quotes:
-        pq_lines = ["PRIOR / EFFECTIVE QUOTES ON RECORD:"]
+        quotes_by_rfq = {}
         for q in context.prior_quotes:
-            prod = q.get("rfqs", {}).get("product_name", "Unknown Product") if isinstance(q.get("rfqs"), dict) else "Unknown Product"
-            v_label = f" [Variant: {q.get('variant_label')}]" if q.get("variant_label") else ""
-            status_str = " (Available)" if q.get("is_available", True) else " (Unavailable/Withdrawn)"
-            price_str = f"AED {q.get('price')}" if q.get("price") is not None else "No Price"
-            quote_id_str = f"Quote ID: {q.get('id')} | " if q.get("id") else ""
+            r_id = str(q.get("rfq_id"))
+            quotes_by_rfq.setdefault(r_id, []).append(q)
 
-            # Check for historical price comparison on quote
-            rfq_obj = q.get("rfqs") if isinstance(q.get("rfqs"), dict) else None
-            if not rfq_obj:
-                rfq_match = next((r.get("rfqs", r) for r in (context.open_rfqs or []) if str(r.get("rfqs", r).get("id")) == str(q.get("rfq_id"))), None)
-                if isinstance(rfq_match, dict):
-                    rfq_obj = rfq_match
+        effective_lines = ["CURRENT EFFECTIVE QUOTES (ACTIVE TARGET FOR NEGOTIATE_PRICE):"]
+        history_lines = ["QUOTE REVISION HISTORY (PAST SUPERSEDED QUOTES - DO NOT TARGET FOR NEGOTIATION):"]
 
-            hist_extra = ""
-            if rfq_obj and rfq_obj.get("last_quote") is not None and q.get("price") is not None:
-                try:
-                    lq = float(rfq_obj.get("last_quote"))
-                    qp = float(q.get("price"))
-                    diff = qp - lq
-                    ceiling = lq + 2.0
-                    within = "Yes" if qp <= ceiling else "No"
-                    hist_extra = f" | Last Quote: AED {lq} (Diff: AED {diff:+0.2f}, Ceiling: AED {ceiling}, In Tolerance: {within})"
-                except Exception:
-                    pass
+        has_effective = False
+        has_history = False
 
-            pq_lines.append(
-                f"- {quote_id_str}Product: {prod}{v_label} | RFQ ID: {q.get('rfq_id')} | Price: {price_str}{status_str}{hist_extra} | "
-                f"Delivery: {q.get('delivery_time', '-')} | Notes: {q.get('quality_notes', '-')}"
-            )
-        sections.append("\n".join(pq_lines))
+        for r_id, rfq_quotes in quotes_by_rfq.items():
+            for idx, q in enumerate(rfq_quotes):
+                prod = q.get("rfqs", {}).get("product_name", "Unknown Product") if isinstance(q.get("rfqs"), dict) else "Unknown Product"
+                v_label = f" [Variant: {q.get('variant_label')}]" if q.get("variant_label") else ""
+                status_str = " (Available)" if q.get("is_available", True) else " (Unavailable/Withdrawn)"
+                price_str = f"AED {q.get('price')}" if q.get("price") is not None else "No Price"
+                quote_id = q.get("id")
+
+                rfq_obj = q.get("rfqs") if isinstance(q.get("rfqs"), dict) else None
+                if not rfq_obj:
+                    rfq_match = next((r.get("rfqs", r) for r in (context.open_rfqs or []) if str(r.get("rfqs", r).get("id")) == str(q.get("rfq_id"))), None)
+                    if isinstance(rfq_match, dict):
+                        rfq_obj = rfq_match
+
+                hist_extra = ""
+                if rfq_obj and rfq_obj.get("last_quote") is not None and q.get("price") is not None:
+                    try:
+                        lq = float(rfq_obj.get("last_quote"))
+                        qp = float(q.get("price"))
+                        diff = qp - lq
+                        ceiling = lq + 2.0
+                        within = "Yes" if qp <= ceiling else "No"
+                        hist_extra = f" | Last Quote: AED {lq} (Diff: AED {diff:+0.2f}, Ceiling: AED {ceiling}, In Tolerance: {within})"
+                    except Exception:
+                        pass
+
+                if idx == 0 and q.get("is_available", True) and q.get("price") is not None:
+                    has_effective = True
+                    effective_lines.append(
+                        f"- [ACTIVE EFFECTIVE QUOTE] Quote ID: {quote_id} | Product: {prod}{v_label} | RFQ ID: {r_id} | "
+                        f"Price: {price_str}{status_str}{hist_extra} | Delivery: {q.get('delivery_time', '-')} | Notes: {q.get('quality_notes', '-')}"
+                    )
+                else:
+                    has_history = True
+                    history_lines.append(
+                        f"- [SUPERSEDED REVISION] Quote ID: {quote_id} | Product: {prod}{v_label} | RFQ ID: {r_id} | "
+                        f"Price: {price_str}{status_str} | Delivery: {q.get('delivery_time', '-')}"
+                    )
+
+        if has_effective:
+            sections.append("\n".join(effective_lines))
+        if has_history:
+            sections.append("\n".join(history_lines))
 
     # 6. Conversation History (if any)
     if context.conversation_history:

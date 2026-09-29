@@ -1135,6 +1135,15 @@ async def execute_validated_action(
                     "is_available": args.get("is_available", True),
                 }]
 
+            # Fallback to preserved commercial terms from pending_clarification if supplier response only identified the product
+            if variants and len(variants) == 1 and context.pending_clarification:
+                if variants[0].get("price") is None and context.pending_clarification.get("extracted_price") is not None:
+                    variants[0]["price"] = context.pending_clarification.get("extracted_price")
+                if variants[0].get("delivery_time") is None and context.pending_clarification.get("extracted_delivery") is not None:
+                    variants[0]["delivery_time"] = context.pending_clarification.get("extracted_delivery")
+                if variants[0].get("quality_notes") is None and context.pending_clarification.get("extracted_notes") is not None:
+                    variants[0]["quality_notes"] = context.pending_clarification.get("extracted_notes")
+
             # Ensure quote provenance reflects supplier's original message, not operator instruction
             quote_raw = context.review_raw_message if (context.input_origin == "operator" and context.review_raw_message) else raw_message
 
@@ -2083,80 +2092,166 @@ async def whatsapp_webhook(request: Request):
             logger.warning(f"Error loading conversation history: {e}")
             conv_history = []
 
-        # 4. Route candidate RFQs by strict priority
-        if matched_rfq_supplier:
-            # Tier 1: Exact WhatsApp Stanza Match always wins & locks
-            open_rfqs = [matched_rfq_supplier]
-        elif pending:
-            # Tier 2: Active Pending Clarification strictly limits candidates to pending_rfq_ids
-            candidate_ids = pending.get("pending_rfq_ids", [])
-            open_rfqs = db.get_rfqs_by_ids(candidate_ids) if candidate_ids else []
-        else:
-            # Check Active Negotiation Session Continuity (Tier 3)
-            active_session = db.get_active_negotiation_session_for_supplier(client_id, supplier["id"])
-            session_entry = None
-            if active_session:
-                session_rfq_id = str(active_session.get("rfq_id"))
-                session_entry = next(
-                    (e for e in all_open_rfqs if str(e.get("rfqs", e).get("id")) == session_rfq_id),
-                    None,
-                )
+        # Classify open RFQs into Unanswered (Awaiting Initial Response) vs Responded (Open for Revisions)
+        unanswered_rfqs = []
+        responded_rfqs = []
+        for entry in all_open_rfqs:
+            r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+            r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
+            status = entry.get("status") if isinstance(entry, dict) else None
+            has_quote = any(str(q.get("rfq_id")) == r_id for q in prior_quotes)
+            if status == "sent" and not has_quote:
+                unanswered_rfqs.append(entry)
+            else:
+                responded_rfqs.append(entry)
 
-            # Classify open RFQs into Unanswered (Awaiting Initial Response) vs Responded (Open for Revisions)
-            unanswered_rfqs = []
-            responded_rfqs = []
+        # Check Active Negotiation Session
+        active_session = db.get_active_negotiation_session_for_supplier(client_id, supplier["id"])
+        session_entry = None
+        if active_session:
+            session_rfq_id = str(active_session.get("rfq_id"))
+            session_entry = next(
+                (e for e in all_open_rfqs if str(e.get("rfqs", e).get("id")) == session_rfq_id),
+                None,
+            )
+
+        # 4. Route candidate RFQs by strict priority
+        # 1. Exact quoted stanza match (always wins, deterministic)
+        # 2. Explicit RFQ ID / product reference
+        # 3. Active pending clarification
+        # 4. Problem 1 Fix: Active session + Unanswered RFQ + Generic Standalone Message -> Pending Clarification
+        # 5. Single unanswered RFQ / Single open RFQ -> Route automatically
+        # 6. Active session continuity (when no unanswered RFQs exist)
+
+        # Perform structured LLM commercial parsing on inbound supplier message
+        commercial_parse = None
+        try:
+            commercial_parse = groq_client.parse_commercial_message(message_text)
+        except Exception as parse_err:
+            logger.warning(f"Error in parse_commercial_message: {parse_err}")
+
+        explicit_prod = commercial_parse.get("explicit_product_reference") if commercial_parse else None
+        msg_lower = (message_text or "").lower()
+
+        if matched_rfq_supplier:
+            # Priority 1: Exact WhatsApp Stanza Match always wins & locks
+            open_rfqs = [matched_rfq_supplier]
+        else:
+            # Check for Priority 2: Explicit RFQ ID or Product Reference
+            explicit_candidates = []
             for entry in all_open_rfqs:
                 r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
                 r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
-                status = entry.get("status") if isinstance(entry, dict) else None
-                has_quote = any(str(q.get("rfq_id")) == r_id for q in prior_quotes)
-                if status == "sent" and not has_quote:
-                    unanswered_rfqs.append(entry)
-                else:
-                    responded_rfqs.append(entry)
+                r_prod = (r_obj.get("product_name") or "").strip().lower() if isinstance(r_obj, dict) else ""
+                r_specs = (r_obj.get("specs") or "").strip().lower() if isinstance(r_obj, dict) else ""
 
-            msg_lower = (message_text or "").lower()
+                if r_id and (r_id.lower() in msg_lower or f"rfq {r_id.lower()}" in msg_lower):
+                    explicit_candidates.append(entry)
+                    continue
 
-            # Check if supplier explicitly quoted a specific product name differing from session
-            explicit_diff_match = None
-            if session_entry:
-                session_prod = (session_entry.get("rfqs", {}).get("product_name") or "").strip().lower()
-                for entry in all_open_rfqs:
-                    prod = (entry.get("rfqs", {}).get("product_name") or "").strip().lower()
-                    if prod and prod in msg_lower and prod != session_prod:
-                        explicit_diff_match = entry
-                        break
+                if r_prod and (r_prod in msg_lower or (explicit_prod and explicit_prod.lower() in r_prod)):
+                    explicit_candidates.append(entry)
+                    continue
 
-            if explicit_diff_match:
-                # Explicit product reference overrides ongoing session for a different product
-                open_rfqs = [explicit_diff_match]
-                matched_rfq_id = str(explicit_diff_match.get("rfqs", explicit_diff_match).get("id"))
+                if r_specs and len(r_specs) > 3 and r_specs in msg_lower:
+                    explicit_candidates.append(entry)
+
+            # Deduplicate explicit candidates by RFQ ID
+            unique_explicit = []
+            seen_explicit_ids = set()
+            for cand in explicit_candidates:
+                cand_rfq_id = str(cand.get("rfqs", cand).get("id"))
+                if cand_rfq_id not in seen_explicit_ids:
+                    seen_explicit_ids.add(cand_rfq_id)
+                    unique_explicit.append(cand)
+
+            if len(unique_explicit) == 1:
+                # Priority 2: Explicit RFQ ID / product reference identified
+                open_rfqs = [unique_explicit[0]]
+                matched_rfq_id = str(unique_explicit[0].get("rfqs", unique_explicit[0]).get("id"))
                 match_source = "explicit_product"
                 db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
-            elif session_entry:
+            elif pending:
+                # Priority 3: Active Pending Clarification strictly limits candidates to pending_rfq_ids
+                candidate_ids = pending.get("pending_rfq_ids", [])
+                pending_entries = db.get_rfqs_by_ids(candidate_ids) if candidate_ids else []
+
+                matching_pending = []
+                for entry in pending_entries:
+                    r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+                    r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
+                    r_prod = (r_obj.get("product_name") or "").strip().lower() if isinstance(r_obj, dict) else ""
+                    if (r_id and r_id.lower() in msg_lower) or (r_prod and (r_prod in msg_lower or (explicit_prod and explicit_prod.lower() in r_prod))):
+                        matching_pending.append(entry)
+
+                if len(matching_pending) == 1:
+                    open_rfqs = [matching_pending[0]]
+                    matched_rfq_id = str(matching_pending[0].get("rfqs", matching_pending[0]).get("id"))
+                    match_source = "clarification_resolution"
+                    db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
+                else:
+                    open_rfqs = pending_entries
+            elif session_entry and len(unanswered_rfqs) >= 1:
+                # Priority 4 (Problem 1 Fix): Active session on one RFQ AND another unanswered/new RFQ,
+                # with standalone message and no stanza/explicit product -> DO NOT lock to session! Treat as ambiguous!
+                prod_names = []
+                cand_ids = []
+                candidate_list = [session_entry] + [u for u in unanswered_rfqs if str(u.get("rfqs", u).get("id")) != str(session_entry.get("rfqs", session_entry).get("id"))]
+                for entry in candidate_list:
+                    r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+                    p_name = r_obj.get("product_name") or "RFQ"
+                    prod_names.append(p_name)
+                    r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
+                    if r_id:
+                        cand_ids.append(r_id)
+
+                if len(prod_names) == 2:
+                    question_text = f"Just to confirm, is this quote for {prod_names[0]} or {prod_names[1]}?"
+                else:
+                    question_text = f"Just to confirm, which product is this quote for: {', '.join(prod_names[:-1])} or {prod_names[-1]}?"
+
+                parsed_price = commercial_parse.get("price", {}).get("amount") if commercial_parse else None
+                parsed_deliv = None
+                if commercial_parse and commercial_parse.get("delivery", {}).get("days"):
+                    parsed_deliv = f"{commercial_parse['delivery']['days']} days"
+                parsed_notes = commercial_parse.get("specification", {}).get("alternative") if commercial_parse else None
+
+                created_id = db.create_pending_clarification(
+                    client_id=client_id,
+                    supplier_id=supplier["id"],
+                    candidate_rfq_ids=cand_ids,
+                    raw_message=message_text,
+                    extracted_price=parsed_price,
+                    extracted_delivery=parsed_deliv,
+                    extracted_notes=parsed_notes,
+                    last_question=question_text,
+                )
+
+                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", question_text)
+                if sender_phone and msg_log_id:
+                    await enqueue_message(sender_phone, question_text, supplier_id=supplier["id"], message_log_id=msg_log_id)
+
+                if msg_key_id:
+                    db.complete_webhook_message(client_id, msg_key_id)
+
+                return {
+                    "status": "clarification_requested",
+                    "question": question_text,
+                    "pending_id": created_id,
+                    "candidate_rfq_ids": cand_ids,
+                }
+            elif session_entry and not unanswered_rfqs:
                 # Active negotiation session continuity locks RFQ context
                 open_rfqs = [session_entry]
                 matched_rfq_id = str(active_session.get("rfq_id"))
                 match_source = "negotiation_session"
                 db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
             elif len(unanswered_rfqs) == 1:
-                # Tier 4: Exactly one unanswered RFQ exists -> strongly prefer it over historical responded RFQs
-                unanswered_entry = unanswered_rfqs[0]
-                unanswered_prod = (unanswered_entry.get("rfqs", {}).get("product_name") or "").strip().lower()
-
-                # Check if supplier explicitly quoted a specific responded product name differing from unanswered
-                explicit_resp_match = None
-                for resp_entry in responded_rfqs:
-                    resp_prod = (resp_entry.get("rfqs", {}).get("product_name") or "").strip().lower()
-                    if resp_prod and resp_prod in msg_lower and resp_prod != unanswered_prod:
-                        explicit_resp_match = resp_entry
-                        break
-
-                if explicit_resp_match:
-                    open_rfqs = [explicit_resp_match]
-                else:
-                    open_rfqs = [unanswered_entry]
-
+                # Priority 5: Exactly one unanswered RFQ exists -> strongly prefer it over historical responded RFQs
+                open_rfqs = [unanswered_rfqs[0]]
+                matched_rfq_id = str(unanswered_rfqs[0].get("rfqs", unanswered_rfqs[0]).get("id"))
+                match_source = "single_unanswered_rfq"
+                db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
             elif len(unanswered_rfqs) > 1:
                 # Multiple unanswered RFQs: candidate pool is restricted to unanswered RFQs
                 matches = []
@@ -2170,10 +2265,13 @@ async def whatsapp_webhook(request: Request):
                     open_rfqs = [matches[0]]
                 else:
                     open_rfqs = unanswered_rfqs
-
+            elif len(all_open_rfqs) == 1:
+                open_rfqs = all_open_rfqs
+                matched_rfq_id = str(all_open_rfqs[0].get("rfqs", all_open_rfqs[0]).get("id"))
+                match_source = "single_open_rfq"
+                db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
             elif not unanswered_rfqs and responded_rfqs:
                 # All open RFQs already responded (awaiting deadline for quote revisions)
-                # Tier 3 & 5: Check conversation context and product matching
                 context_rfq_id = None
                 if conv_history:
                     recent_linked = [m for m in reversed(conv_history) if m.get("related_rfq_id")]
