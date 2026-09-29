@@ -100,7 +100,14 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
 
   const getCategoryBadge = (cat, meta) => {
     if (cat === 'negotiation_tradeoff_authorization' || meta?.type === 'negotiation_tradeoff_authorization') {
-      return <span className="badge badge-flag business" style={{ background: '#4f46e5', color: '#ffffff' }}>Trade-Off Authorization Required</span>;
+      return (
+        <span 
+          className="badge badge-flag business tradeoff-badge" 
+          style={{ background: '#4338ca', color: '#ffffff', fontWeight: 600, padding: '4px 10px', borderRadius: '6px', fontSize: '0.75rem' }}
+        >
+          Trade-Off Authorization Required
+        </span>
+      );
     }
     switch (cat) {
       case 'requires_business_knowledge':
@@ -161,28 +168,36 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                   const customValues = customFormState[flag.id] || {};
 
                   return (
-                    <div key={flag.id} className="flagged-item-card" style={isTradeoff ? { border: '1px solid #c7d2fe', background: '#fafafa' } : {}}>
+                    <div key={flag.id} className={`flagged-item-card ${isTradeoff ? 'tradeoff-flagged-card' : ''}`}>
                       <div className="flag-item-header">
                         <div>
-                          <strong>{suppName}</strong>
-                          {phone && <span className="phone-sub"><Phone size={12} /> {phone}</span>}
-                          {product && <span className="badge badge-category">{product}</span>}
+                          <strong className={isTradeoff ? 'tradeoff-supplier-name' : ''}>{suppName}</strong>
+                          {phone && (
+                            <span className={isTradeoff ? 'tradeoff-phone' : 'phone-sub'}>
+                              <Phone size={12} style={isTradeoff ? { color: '#64748b' } : {}} /> {phone}
+                            </span>
+                          )}
+                          {product && (
+                            <span className={isTradeoff ? 'badge tradeoff-product-chip' : 'badge badge-category'}>
+                              {product}
+                            </span>
+                          )}
                         </div>
                         {getCategoryBadge(flag.category, meta)}
                       </div>
 
                       {/* Structured Trade-Off Section */}
                       {isTradeoff ? (
-                        <div style={{ margin: '0.85rem 0', padding: '0.85rem', background: '#ffffff', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.6rem', color: '#3730a3', fontWeight: 600, fontSize: '0.95rem' }}>
-                            <Sliders size={18} />
+                        <div className="tradeoff-proposal-box">
+                          <div className="tradeoff-proposal-title">
+                            <Sliders size={18} style={{ color: '#4338ca' }} />
                             <span>Supplier Trade-Off Proposal</span>
                           </div>
 
-                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem', marginBottom: '0.75rem' }}>
-                            <div style={{ background: '#f8fafc', padding: '0.6rem', borderRadius: '6px' }}>
-                              <div style={{ fontSize: '0.75rem', color: '#64748b' }}>Current Requirement:</div>
-                              <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem', marginBottom: '0.85rem' }}>
+                            <div className="tradeoff-metric-req">
+                              <div className="tradeoff-metric-req-label">Current Requirement:</div>
+                              <div className="tradeoff-metric-req-value">
                                 {meta.dimension === 'delivery'
                                   ? `Delivery: ${meta.current_value != null ? `${meta.current_value} days` : 'Not specified'}`
                                   : meta.dimension === 'quantity'
@@ -191,24 +206,24 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               </div>
                             </div>
 
-                            <div style={{ background: '#eef2ff', padding: '0.6rem', borderRadius: '6px' }}>
-                              <div style={{ fontSize: '0.75rem', color: '#4338ca' }}>Supplier Proposes:</div>
-                              <div style={{ fontWeight: 600, fontSize: '0.9rem', color: '#312e81' }}>
+                            <div className="tradeoff-metric-prop">
+                              <div className="tradeoff-metric-prop-label">Supplier Proposes:</div>
+                              <div className="tradeoff-metric-prop-value">
                                 {meta.dimension === 'delivery' ? `Delivery: ${meta.supplier_proposed_value ?? '-'} days` : meta.dimension === 'quantity' ? `Quantity: ${meta.supplier_proposed_value ?? '-'}` : `Specs: ${meta.supplier_proposed_value ?? '-'}`}
                               </div>
                             </div>
 
                             {meta.supplier_latest_price && (
-                              <div style={{ background: '#f0fdf4', padding: '0.6rem', borderRadius: '6px' }}>
-                                <div style={{ fontSize: '0.75rem', color: '#166534' }}>Supplier Quoted Price:</div>
-                                <div style={{ fontWeight: 600, fontSize: '0.9rem', color: '#14532d' }}>
+                              <div className="tradeoff-metric-price">
+                                <div className="tradeoff-metric-price-label">Supplier Quoted Price:</div>
+                                <div className="tradeoff-metric-price-value">
                                   AED {meta.supplier_latest_price}
                                 </div>
                               </div>
                             )}
                           </div>
 
-                          <div style={{ fontSize: '0.875rem', color: '#334155', marginBottom: '0.75rem' }}>
+                          <div className="tradeoff-question">
                             <strong>Question: </strong>
                             Can the AI negotiate using {meta.dimension === 'delivery' ? `delivery up to ${meta.supplier_proposed_value || 5} days` : meta.dimension === 'quantity' ? `quantity up to ${meta.supplier_proposed_value || 30}` : 'this alternative specification'}?
                           </div>
@@ -233,11 +248,11 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
 
                             <button
                               type="button"
-                              className="btn btn-secondary btn-sm"
+                              className="btn btn-sm tradeoff-btn-secondary"
                               onClick={() => handleTradeoffDecision(flag, 'reject')}
                               disabled={resolvingId === flag.id}
                             >
-                              <XCircle size={14} />
+                              <XCircle size={14} style={{ color: '#dc2626' }} />
                               <span>
                                 {meta.dimension === 'delivery'
                                   ? `Keep ${meta.current_value || 2}-day requirement`
@@ -249,24 +264,24 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
 
                             <button
                               type="button"
-                              className="btn btn-ghost btn-sm"
+                              className={`btn btn-sm tradeoff-btn-custom-toggle ${isCustomOpen ? 'active' : ''}`}
                               onClick={() => setShowCustomConfig((prev) => ({ ...prev, [flag.id]: !prev[flag.id] }))}
                               disabled={resolvingId === flag.id}
                             >
-                              <Sliders size={14} />
+                              <Sliders size={14} style={{ color: '#4338ca' }} />
                               <span>{isCustomOpen ? 'Hide Custom Range' : 'Set Custom Range'}</span>
                             </button>
                           </div>
 
                           {/* Custom Range Drawer */}
                           {isCustomOpen && (
-                            <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: '#f8fafc', borderRadius: '6px', border: '1px solid #cbd5e1' }}>
-                              <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.4rem' }}>Specify Custom Authority:</div>
+                            <div className="tradeoff-custom-drawer">
+                              <div className="tradeoff-custom-drawer-title">Specify Custom Authority:</div>
                               {meta.dimension === 'delivery' ? (
                                 <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
                                   <input
                                     type="number"
-                                    className="input-field"
+                                    className="input-field tradeoff-input"
                                     style={{ maxWidth: '160px' }}
                                     placeholder="Max days (e.g. 7)"
                                     value={customValues.max_days || ''}
@@ -288,7 +303,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                                 <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
                                   <input
                                     type="number"
-                                    className="input-field"
+                                    className="input-field tradeoff-input"
                                     style={{ maxWidth: '120px' }}
                                     placeholder="Min qty"
                                     value={customValues.min || ''}
@@ -299,7 +314,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                                   />
                                   <input
                                     type="number"
-                                    className="input-field"
+                                    className="input-field tradeoff-input"
                                     style={{ maxWidth: '120px' }}
                                     placeholder="Max qty"
                                     value={customValues.max || ''}
@@ -321,7 +336,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                                 <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
                                   <input
                                     type="text"
-                                    className="input-field"
+                                    className="input-field tradeoff-input"
                                     placeholder="Allowed substitute description"
                                     value={customValues.allowed_alternatives || ''}
                                     onChange={(e) => setCustomFormState((prev) => ({
@@ -349,25 +364,25 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                         </div>
                       )}
 
-                      <div className="flag-message-box">
-                        <strong>Raw WhatsApp Message Received:</strong>
-                        <p className="raw-text">"{flag.raw_message}"</p>
+                      <div className={isTradeoff ? 'flag-message-box tradeoff-message-box' : 'flag-message-box'}>
+                        <strong className={isTradeoff ? 'tradeoff-message-title' : ''}>Raw WhatsApp Message Received:</strong>
+                        <p className={isTradeoff ? 'raw-text tradeoff-message-text' : 'raw-text'}>"{flag.raw_message}"</p>
                       </div>
 
                       {/* Human Response Input Section */}
-                      <div className="human-response-section" style={{ marginTop: '0.85rem', paddingTop: '0.85rem', borderTop: '1px solid var(--panel-border)' }}>
-                        <label className="form-label flex-items" style={{ marginBottom: '0.4rem' }}>
+                      <div className={isTradeoff ? 'human-response-section tradeoff-response-section' : 'human-response-section'} style={{ marginTop: '0.85rem', paddingTop: '0.85rem' }}>
+                        <label className={isTradeoff ? 'tradeoff-label' : 'form-label flex-items'} style={{ marginBottom: '0.4rem' }}>
                           <FileText size={14} /> <strong>Agent Instruction / Guidance:</strong>
                         </label>
                         <textarea
-                          className="input-field textarea-input"
+                          className={`input-field textarea-input ${isTradeoff ? 'tradeoff-textarea' : ''}`}
                           placeholder="Type instruction for AI agent to execute (e.g., 'We accept 50% advance against PI', 'Offer 48 AED')..."
                           rows={2}
                           value={responseTexts[flag.id] || ''}
                           onChange={(e) => setResponseTexts({ ...responseTexts, [flag.id]: e.target.value })}
                         />
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '0.5rem', flexWrap: 'wrap', gap: '0.5rem' }}>
-                          <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
+                          <label className={isTradeoff ? 'tradeoff-checkbox-label' : ''} style={!isTradeoff ? { fontSize: '0.8rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' } : {}}>
                             <input
                               type="checkbox"
                               checked={sendToSupplierState[flag.id] !== false}
@@ -378,11 +393,11 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
 
                           <div style={{ display: 'flex', gap: '0.5rem' }}>
                             <button
-                              className="btn btn-secondary btn-sm"
+                              className={`btn btn-sm ${isTradeoff ? 'tradeoff-btn-secondary' : 'btn-secondary'}`}
                               onClick={() => handleResolve(flag.id)}
                               disabled={resolvingId === flag.id}
                             >
-                              <Check size={14} />
+                              <Check size={14} style={isTradeoff ? { color: '#059669' } : {}} />
                               <span>{resolvingId === flag.id ? 'Resolving...' : 'Mark Resolved'}</span>
                             </button>
                             <button
@@ -398,7 +413,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                       </div>
 
                       <div className="flag-item-footer" style={{ marginTop: '0.75rem' }}>
-                        <span className="timestamp">
+                        <span className={isTradeoff ? 'tradeoff-timestamp' : 'timestamp'}>
                           <Clock size={12} /> Flagged: {new Date(flag.created_at).toLocaleString()}
                         </span>
                       </div>
