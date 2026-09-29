@@ -297,25 +297,15 @@ def evaluate_supplier_tradeoff(
     constraints_by_dim = {c.get("dimension"): c for c in (rfq_constraints or [])}
 
     # 1. Check Conditional Delivery Trade-off
-    # Examples: "if you can accept 4-day delivery, I can do 55", "if delivery is 4 days", "can reduce price if delivery is 5 days"
-    proposed_days = None
+    # Examples: "if you can accept 5 days, I can do 55", "can reduce price if delivery is 5 days", "if delivery is 4 days"
     deliv_match = re.search(
-        r"\b(?:if\s+(?:you\s+(?:can\s+)?)?(?:accept|allow|take|do)\s+|if\s+delivery\s+is\s+|can\s+reduce\s+(?:price|rate)\s+if\s+(?:delivery\s+is\s+)?|ready\s+in\s+|delivery\s+(?:in|is)\s+)?(\d+)\s*-?\s*(?:days?|working\s*days?|business\s*days?)(?:\s+delivery)?\b",
+        r"\b(?:if\s+(?:you\s+(?:can\s+)?)?(?:accept|allow|take|do)\s+|if\s+delivery\s+is\s+|can\s+reduce\s+(?:price|rate)\s+if\s+(?:delivery\s+is\s+)?|ready\s+in\s+)(\d+)\s*(?:days?|working\s*days?|business\s*days?)\b",
         text,
         re.IGNORECASE,
     )
+
     if deliv_match:
-        try:
-            proposed_days = int(deliv_match.group(1))
-        except (ValueError, TypeError):
-            proposed_days = None
-
-    if proposed_days is None and extracted_delivery:
-        em = re.search(r"(\d+)", str(extracted_delivery))
-        if em:
-            proposed_days = int(em.group(1))
-
-    if proposed_days is not None:
+        proposed_days = int(deliv_match.group(1))
         deliv_constraint = constraints_by_dim.get("delivery")
         current_req = None
         if deliv_constraint and deliv_constraint.get("constraints"):
@@ -356,16 +346,14 @@ def evaluate_supplier_tradeoff(
                         "reason": f"Supplier proposed {proposed_days}-day delivery but delivery is fixed at {current_req} days.",
                     }
             else:
-                is_conditional = bool(re.search(r"\b(?:if\s+(?:you\s+(?:can\s+)?)?(?:accept|allow|take|do)|can\s+reduce\s+(?:price|rate)\s+if)\b", text, re.IGNORECASE))
-                if is_conditional:
-                    return {
-                        "has_tradeoff": True,
-                        "is_authorized": False,
-                        "dimension": "delivery",
-                        "current_value": None,
-                        "supplier_proposed_value": proposed_days,
-                        "reason": f"Supplier proposed conditional {proposed_days}-day delivery; required delivery is not specified in RFQ.",
-                    }
+                return {
+                    "has_tradeoff": True,
+                    "is_authorized": False,
+                    "dimension": "delivery",
+                    "current_value": None,
+                    "supplier_proposed_value": proposed_days,
+                    "reason": f"Supplier proposed {proposed_days}-day delivery; required delivery is not specified in RFQ.",
+                }
 
     # 2. Check Conditional Quantity Trade-off
     # Examples: "if you order 30 pcs", "moq is 30", "if you take 50 units"
@@ -479,18 +467,8 @@ def build_negotiation_preflight(
     attempts_remaining = max(0, MAX_NEGOTIATION_ATTEMPTS - attempts_used)
 
     prev_supplier_offer = None
-    if active_session:
-        sess_latest = active_session.get("latest_supplier_offer")
-        if (
-            sess_latest is not None
-            and abs(float(sess_latest) - supplier_quote) < 0.001
-            and active_session.get("previous_supplier_offer") is not None
-        ):
-            prev_supplier_offer = float(active_session["previous_supplier_offer"])
-        elif sess_latest is not None and abs(float(sess_latest) - supplier_quote) >= 0.001:
-            prev_supplier_offer = float(sess_latest)
-        elif previous_quotes:
-            prev_supplier_offer = float(previous_quotes[-1]["price"])
+    if active_session and active_session.get("latest_supplier_offer") is not None:
+        prev_supplier_offer = float(active_session["latest_supplier_offer"])
     elif previous_quotes:
         prev_supplier_offer = float(previous_quotes[-1]["price"])
 

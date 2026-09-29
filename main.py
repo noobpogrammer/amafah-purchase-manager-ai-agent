@@ -271,33 +271,7 @@ async def enqueue_message(
     supplier_id: str = None,
     message_log_id: str = None,
 ):
-    """Pushes an outbound message onto the asyncio queue for paced sending, or dispatches immediately in test transport mode."""
-    global _current_whatsapp_transport
-    if not isinstance(_current_whatsapp_transport, ProductionWhatsAppTransport):
-        try:
-            if message_log_id:
-                db.mark_message_sending(message_log_id)
-            resp = send_whatsapp_message(phone_number, message)
-            canonical_id, alt_id = extract_evolution_message_ids(resp)
-            if message_log_id:
-                if alt_id:
-                    db.mark_message_sent(
-                        message_log_id,
-                        evolution_message_id=canonical_id,
-                        external_message_id=canonical_id,
-                        external_alt_message_id=alt_id,
-                    )
-                else:
-                    db.mark_message_sent(message_log_id, evolution_message_id=canonical_id)
-            if canonical_id and rfq_id and supplier_id:
-                if alt_id:
-                    db.update_rfq_supplier_sent_message_id(rfq_id, supplier_id, canonical_id, sent_message_alt_id=alt_id)
-                else:
-                    db.update_rfq_supplier_sent_message_id(rfq_id, supplier_id, canonical_id)
-        except Exception as e:
-            print(f"[Test Outbound Dispatch Error]: {e}")
-        return
-
+    """Pushes an outbound message onto the asyncio queue for paced sending."""
     await outbound_queue.put((phone_number, message, rfq_id, supplier_id, message_log_id))
 
 
@@ -541,54 +515,28 @@ async def outbound_worker():
             print(f"[Outbound Worker] Unexpected error in worker loop: {e}")
 
 
-class WhatsAppTransport:
-    """Base interface for WhatsApp outbound message delivery."""
-    def send(self, phone_number: str, message: str) -> dict:
-        raise NotImplementedError
-
-
-class ProductionWhatsAppTransport(WhatsAppTransport):
-    """Production transport sending real HTTP requests to Evolution API."""
-    def send(self, phone_number: str, message: str) -> dict:
-        if not EVOLUTION_API_URL or not EVOLUTION_API_KEY or not EVOLUTION_INSTANCE:
-            raise RuntimeError("Evolution API configuration is missing")
-
-        url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE}"
-        headers = {
-            "Content-Type": "application/json",
-            "apikey": EVOLUTION_API_KEY,
-        }
-        payload = {
-            "number": phone_number,
-            "text": message,
-            "delay": EVOLUTION_TYPING_DELAY_MS,
-        }
-
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        try:
-            return response.json()
-        except Exception:
-            return {"status": "ok", "raw": response.text}
-
-
-_current_whatsapp_transport: WhatsAppTransport = ProductionWhatsAppTransport()
-
-
-def set_whatsapp_transport(transport: WhatsAppTransport) -> None:
-    """Sets the active WhatsApp transport implementation."""
-    global _current_whatsapp_transport
-    _current_whatsapp_transport = transport
-
-
-def get_whatsapp_transport() -> WhatsAppTransport:
-    """Returns the currently configured WhatsApp transport implementation."""
-    return _current_whatsapp_transport
-
-
 def send_whatsapp_message(phone_number: str, message: str) -> dict:
-    """Send a text message through the configured WhatsApp transport."""
-    return _current_whatsapp_transport.send(phone_number, message)
+    """Send a text message through the configured Evolution API instance."""
+    if not EVOLUTION_API_URL or not EVOLUTION_API_KEY or not EVOLUTION_INSTANCE:
+        raise RuntimeError("Evolution API configuration is missing")
+
+    url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE}"
+    headers = {
+        "Content-Type": "application/json",
+        "apikey": EVOLUTION_API_KEY,
+    }
+    payload = {
+        "number": phone_number,
+        "text": message,
+        "delay": EVOLUTION_TYPING_DELAY_MS,
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    try:
+        return response.json()
+    except Exception:
+        return {"status": "ok", "raw": response.text}
 
 
 def normalize_phone(remote_jid: str) -> str:
@@ -1386,18 +1334,15 @@ async def execute_validated_action(
                     target_rfq_id,
                     supplier_id,
                 )
-                try:
-                    supp_name = supplier.get("name") or "Supplier"
-                    db.flag_for_human_review(
-                        client_id=client_id,
-                        supplier_id=supplier_id,
-                        rfq_id=target_rfq_id,
-                        reason=f"Negotiation Session Persistence Error: Unable to save durable negotiation state for {supp_name}. Autonomous counter withheld.",
-                        category="system_error",
-                        raw_message=raw_message,
-                    )
-                except Exception as flag_err:
-                    logger.warning("Could not flag session persistence failure: %s", flag_err)
+                supp_name = supplier.get("name") or "Supplier"
+                db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=target_rfq_id,
+                    reason=f"Negotiation Session Persistence Error: Unable to save durable negotiation state for {supp_name}. Autonomous counter withheld.",
+                    category="system_error",
+                    raw_message=raw_message,
+                )
 
             if can_auto_negotiate and persisted_quote_id:
                 counter_price = float(preflight["recommended_anchor"])

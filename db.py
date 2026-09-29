@@ -1915,11 +1915,7 @@ def flag_for_human_review(
     if rfq_id:
         payload["rfq_id"] = rfq_id
 
-    try:
-        return supabase.table("flagged_for_review").insert(payload).execute().data
-    except Exception as e:
-        logger.warning(f"flag_for_human_review error: {e}")
-        return [{"id": "flag-mock-id", "status": "pending", **payload}]
+    return supabase.table("flagged_for_review").insert(payload).execute().data
 
 
 def get_pending_flags(client_id: str):
