@@ -5,16 +5,112 @@ and debuggable under deadline pressure.
 """
 
 import os
+import logging
+import time
 from dotenv import load_dotenv
 load_dotenv()
 import json
 from groq import Groq
+
+logger = logging.getLogger(__name__)
 
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
 MODEL = "openai/gpt-oss-120b"  # cheap/fast — good for classification + tool routing
 
 MAX_QUOTE_VARIANTS = 10
+
+
+def _runtime_environment() -> str:
+    """Return a coarse runtime label without exposing infrastructure secrets."""
+    if os.environ.get("APP_ENV"):
+        return os.environ["APP_ENV"]
+    if os.environ.get("RAILWAY_ENVIRONMENT_NAME"):
+        return f"railway:{os.environ['RAILWAY_ENVIRONMENT_NAME']}"
+    if os.environ.get("CI"):
+        return "ci"
+    return "local"
+
+
+def _usage_value(usage, name: str) -> int:
+    if usage is None:
+        return 0
+    value = getattr(usage, name, None)
+    if value is None and isinstance(usage, dict):
+        value = usage.get(name)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _persist_llm_usage(
+    *,
+    call_type: str,
+    response=None,
+    success: bool = True,
+    latency_ms: int = 0,
+    usage_context: Optional[Dict[str, Any]] = None,
+    error_type: Optional[str] = None,
+) -> None:
+    """Best-effort usage telemetry. Never logs prompts, messages, keys, or model output."""
+    try:
+        import db  # Lazy import avoids coupling module initialization.
+
+        usage = getattr(response, "usage", None) if response is not None else None
+        input_tokens = _usage_value(usage, "prompt_tokens")
+        output_tokens = _usage_value(usage, "completion_tokens")
+        total_tokens = _usage_value(usage, "total_tokens")
+        if not total_tokens:
+            total_tokens = input_tokens + output_tokens
+
+        ctx = usage_context or {}
+        db.log_llm_usage(
+            provider="groq",
+            model=MODEL,
+            call_type=call_type,
+            environment=_runtime_environment(),
+            success=success,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            latency_ms=latency_ms,
+            request_id=str(getattr(response, "id", "") or "") or None,
+            client_id=str(ctx.get("client_id")) if ctx.get("client_id") is not None else None,
+            supplier_id=str(ctx.get("supplier_id")) if ctx.get("supplier_id") is not None else None,
+            rfq_id=str(ctx.get("rfq_id")) if ctx.get("rfq_id") is not None else None,
+            error_type=error_type,
+        )
+    except Exception as telemetry_error:
+        # Observability must never break procurement processing.
+        logger.warning("Failed to persist LLM usage telemetry: %s", type(telemetry_error).__name__)
+
+
+def _groq_completion(*, call_type: str, usage_context: Optional[Dict[str, Any]] = None, **kwargs):
+    """Execute one Groq completion and persist token/latency metadata for that exact call."""
+    started = time.perf_counter()
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        _persist_llm_usage(
+            call_type=call_type,
+            response=None,
+            success=False,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            usage_context=usage_context,
+            error_type=type(exc).__name__,
+        )
+        raise
+
+    _persist_llm_usage(
+        call_type=call_type,
+        response=response,
+        success=True,
+        latency_ms=int((time.perf_counter() - started) * 1000),
+        usage_context=usage_context,
+    )
+    return response
+
 
 # ------------------------------------------------------------
 # Tool definitions (OpenAI-compatible schema, Groq supports this format)
@@ -487,7 +583,7 @@ def parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] =
                 if cand_str:
                     prompt += f"\n\nCandidate open RFQs: {cand_str}"
 
-            response = client.chat.completions.create(
+            response = _groq_completion(call_type="commercial_parser", 
                 model=MODEL,
                 messages=[
                     {"role": "system", "content": COMMERCIAL_PARSER_SYSTEM_PROMPT},
@@ -887,7 +983,7 @@ def reason_about_procurement_message(
         f"{message_text}"
     )
 
-    response = client.chat.completions.create(
+    response = _groq_completion(call_type="main_reasoner", usage_context={"client_id": context.client_id, "supplier_id": context.supplier_id, "rfq_id": context.matched_rfq_id}, 
         model=MODEL,
         messages=[
             {"role": "system", "content": UNIFIED_SYSTEM_PROMPT},
@@ -913,7 +1009,7 @@ def route_supplier_message(message_text: str, open_rfqs_context: str, prior_quot
         user_content += f"Supplier's prior quotes for reference:\n{prior_quotes_context}\n\n"
     user_content += f"Supplier's WhatsApp message:\n{message_text}"
 
-    response = client.chat.completions.create(
+    response = _groq_completion(call_type="legacy_router", 
         model=MODEL,
         messages=[
             {"role": "system", "content": UNIFIED_SYSTEM_PROMPT},
@@ -996,7 +1092,7 @@ def resolve_clarification(message_text: str, candidate_rfqs_context: str, previo
     print(f"Previous Context:\n{previous_message}")
     print(f"Supplier Follow-up:\n{message_text}")
 
-    response = client.chat.completions.create(
+    response = _groq_completion(call_type="clarification", 
         model=MODEL,
         messages=[
             {"role": "system", "content": system_msg},
@@ -1022,7 +1118,7 @@ def rank_quotes(rfq_details: str, quotes_summary: str) -> dict:
     Final comparison step: given all commercial offers/quote variants for an RFQ,
     ask Groq to rank offers and explain the reasoning. Uses structured JSON output.
     """
-    response = client.chat.completions.create(
+    response = _groq_completion(call_type="quote_ranking", 
         model=MODEL,
         messages=[
             {
