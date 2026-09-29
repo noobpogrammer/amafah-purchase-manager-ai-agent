@@ -33,6 +33,25 @@ def _runtime_environment() -> str:
     return "local"
 
 
+def _execution_context() -> tuple[str, Optional[str]]:
+    """Classify where this LLM call originated without storing prompts or responses."""
+    pytest_name = os.environ.get("PYTEST_CURRENT_TEST")
+    if pytest_name:
+        return "pytest", pytest_name.split(" (", 1)[0]
+
+    explicit = os.environ.get("LLM_EXECUTION_CONTEXT")
+    if explicit:
+        return explicit, None
+
+    if os.environ.get("CI"):
+        return "ci", None
+
+    if os.environ.get("RAILWAY_ENVIRONMENT_NAME"):
+        return "production_whatsapp", None
+
+    return "manual_dev", None
+
+
 def _usage_value(usage, name: str) -> int:
     if usage is None:
         return 0
@@ -66,11 +85,14 @@ def _persist_llm_usage(
             total_tokens = input_tokens + output_tokens
 
         ctx = usage_context or {}
+        execution_context, test_name = _execution_context()
         db.log_llm_usage(
             provider="groq",
             model=MODEL,
             call_type=call_type,
             environment=_runtime_environment(),
+            execution_context=execution_context,
+            test_name=test_name,
             success=success,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
