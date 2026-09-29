@@ -10,7 +10,26 @@ load_dotenv()
 import json
 from groq import Groq
 
-client = Groq(api_key=os.environ["GROQ_API_KEY"])
+_client = None
+
+def _get_groq_client() -> Groq:
+    """
+    Lazily initialize the Groq client only when a real LLM call is made.
+
+    Deterministic/unit/E2E tests can safely import this module without a
+    GROQ_API_KEY. Live LLM execution still fails closed with a clear error.
+    """
+    global _client
+    if _client is None:
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "GROQ_API_KEY is required for live Groq calls. "
+                "Deterministic tests should patch reason_about_procurement_message "
+                "or use RUN_LIVE_LLM_E2E only with a configured key."
+            )
+        _client = Groq(api_key=api_key)
+    return _client
 
 MODEL = "openai/gpt-oss-120b"  # cheap/fast — good for classification + tool routing
 
@@ -577,7 +596,7 @@ def reason_about_procurement_message(
         f"{message_text}"
     )
 
-    response = client.chat.completions.create(
+    response = _get_groq_client().chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": UNIFIED_SYSTEM_PROMPT},
@@ -603,7 +622,7 @@ def route_supplier_message(message_text: str, open_rfqs_context: str, prior_quot
         user_content += f"Supplier's prior quotes for reference:\n{prior_quotes_context}\n\n"
     user_content += f"Supplier's WhatsApp message:\n{message_text}"
 
-    response = client.chat.completions.create(
+    response = _get_groq_client().chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": UNIFIED_SYSTEM_PROMPT},
@@ -686,7 +705,7 @@ def resolve_clarification(message_text: str, candidate_rfqs_context: str, previo
     print(f"Previous Context:\n{previous_message}")
     print(f"Supplier Follow-up:\n{message_text}")
 
-    response = client.chat.completions.create(
+    response = _get_groq_client().chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": system_msg},
@@ -712,7 +731,7 @@ def rank_quotes(rfq_details: str, quotes_summary: str) -> dict:
     Final comparison step: given all commercial offers/quote variants for an RFQ,
     ask Groq to rank offers and explain the reasoning. Uses structured JSON output.
     """
-    response = client.chat.completions.create(
+    response = _get_groq_client().chat.completions.create(
         model=MODEL,
         messages=[
             {
