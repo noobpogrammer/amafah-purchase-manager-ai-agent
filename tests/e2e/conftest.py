@@ -27,6 +27,20 @@ def e2e_harness():
     4. Automatically patches groq reasoner with deterministic reasoner (unless RUN_LIVE_LLM_E2E=1)
     5. Cleans up all test database entities upon completion
     """
+    # 0. Fail closed unless a dedicated E2E Supabase project is configured.
+    e2e_db_url = os.getenv("SUPABASE_URL", "").strip()
+    e2e_service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    production_db_url = os.getenv("PRODUCTION_SUPABASE_URL", "").strip()
+
+    if os.getenv("E2E_DB_CONFIRM") != "1":
+        pytest.fail("E2E_DB_CONFIRM=1 is required to run database-backed E2E tests.")
+    if not e2e_db_url or not e2e_service_key:
+        pytest.fail("Dedicated E2E Supabase URL/service-role key are required.")
+    if "mock.supabase.co" in e2e_db_url.lower() or "placeholder" in e2e_db_url.lower():
+        pytest.fail("E2E tests cannot run against a mock/placeholder Supabase URL.")
+    if production_db_url and e2e_db_url.rstrip("/") == production_db_url.rstrip("/"):
+        pytest.fail("Refusing to run E2E acceptance tests against the production Supabase project.")
+
     # 1. Transport safety injection
     test_transport = TestWhatsAppTransport()
     main.set_whatsapp_transport(test_transport)
@@ -46,7 +60,7 @@ def e2e_harness():
     test_phone = f"+97159{uuid.uuid4().int % 10000000:07d}"
     test_instance = f"test_inst_{test_run_id}"
 
-    # Insert test client
+    # Insert test client. Setup failures must fail the acceptance suite.
     try:
         db.supabase.table("clients").insert({
             "id": test_client_id,
@@ -54,9 +68,9 @@ def e2e_harness():
             "whatsapp_instance": test_instance,
         }).execute()
     except Exception as e:
-        print(f"[E2E Setup] Note: client insert: {e}")
+        pytest.fail(f"E2E setup could not create isolated test client: {e}")
 
-    # Insert test supplier
+    # Insert test supplier. Setup failures must fail the acceptance suite.
     try:
         db.supabase.table("suppliers").insert({
             "id": test_supplier_id,
@@ -67,7 +81,7 @@ def e2e_harness():
             "is_active": True,
         }).execute()
     except Exception as e:
-        print(f"[E2E Setup] Note: supplier insert: {e}")
+        pytest.fail(f"E2E setup could not create isolated test supplier: {e}")
 
     # Test client app with auth override
     app_client = TestClient(main.app)
