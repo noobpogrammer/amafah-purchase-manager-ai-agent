@@ -2836,3 +2836,40 @@ def get_rfq_activity(rfq_id: str, client_id: str) -> list[dict] | None:
     timeline.sort(key=lambda x: str(x.get("timestamp") or ""))
     return timeline
 
+
+
+def log_llm_usage(
+    *,
+    provider: str,
+    model: str,
+    call_type: str,
+    environment: str,
+    success: bool,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    latency_ms: int = 0,
+    request_id: Optional[str] = None,
+    client_id: Optional[str] = None,
+    supplier_id: Optional[str] = None,
+    rfq_id: Optional[str] = None,
+    error_type: Optional[str] = None,
+):
+    """Persist metadata for one LLM API call. No prompts, outputs, or credentials are stored."""
+    payload = {
+        "provider": provider,
+        "model": model,
+        "call_type": call_type,
+        "environment": environment,
+        "success": bool(success),
+        "input_tokens": max(0, int(input_tokens or 0)),
+        "output_tokens": max(0, int(output_tokens or 0)),
+        "total_tokens": max(0, int(total_tokens or 0)),
+        "latency_ms": max(0, int(latency_ms or 0)),
+        "request_id": request_id,
+        "client_id": client_id,
+        "supplier_id": supplier_id,
+        "rfq_id": rfq_id,
+        "error_type": error_type,
+    }
+    return supabase.table("llm_usage_log").insert(payload).execute().data
