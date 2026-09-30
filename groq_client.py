@@ -309,7 +309,7 @@ TOOLS = [
                     "negotiation_message": {
                         "type": "string",
                         "description": (
-                            "The professional counter/negotiation message to send back to the supplier. "
+                            "A concise semantic draft/instruction for the approved counteroffer. The backend will ask the Qwen message writer for the final supplier-facing wording after policy validation. "
                             "If negotiating a labeled variant, mention the variant name in the message. "
                             "Do NOT reveal competitor names or specific competitor pricing. "
                             "Do NOT reveal internal budgets or acceptable thresholds. "
@@ -919,6 +919,14 @@ def format_agent_context_for_prompt(context: AgentContext) -> str:
         )
 
     # 5. Prior / Effective Quotes on Record (clearly separating Current Effective vs History)
+    if not context.prior_quotes:
+        sections.append(
+            "CURRENT EFFECTIVE QUOTES: NONE\n"
+            "- No persisted supplier quote exists yet.\n"
+            "- negotiate_price is not available until record_quote persists a real quote row.\n"
+            "- Never substitute an RFQ ID for a quote ID."
+        )
+
     if context.prior_quotes:
         quotes_by_rfq = {}
         for q in context.prior_quotes:
@@ -992,7 +1000,10 @@ from unittest.mock import Mock, MagicMock
 
 
 def _reasoning_model_for_context(context: AgentContext, input_origin: str) -> tuple[str, str]:
-    """Use the large model only for genuine negotiation reasoning."""
+    """GPT-OSS is the procurement decision brain; call_type only classifies the reasoning stage."""
+    if input_origin == "operator":
+        return NEGOTIATION_MODEL, "operator_reasoner"
+
     session = context.active_negotiation_session or {}
     session_status = str(session.get("status") or "").lower()
     if session_status in {
@@ -1004,19 +1015,46 @@ def _reasoning_model_for_context(context: AgentContext, input_origin: str) -> tu
     }:
         return NEGOTIATION_MODEL, "negotiation_reasoner"
 
-    if input_origin == "operator":
-        review_text = " ".join(
-            str(value or "")
-            for value in (
-                context.review_category,
-                context.review_reason,
-                context.review_raw_message,
-            )
-        ).lower()
-        if re.search(r"\b(?:negotiat|counter|concession|trade[- ]?off|price|delivery|quantity|specification)\b", review_text):
-            return NEGOTIATION_MODEL, "negotiation_reasoner"
+    return NEGOTIATION_MODEL, "procurement_reasoner"
 
-    return UTILITY_MODEL, "utility_reasoner"
+
+def _has_persisted_effective_quote(context: AgentContext) -> bool:
+    """Return True only when trusted context contains a persisted, available quote row."""
+    open_ids = {
+        str((entry.get("rfqs", entry) if isinstance(entry, dict) else {}).get("id"))
+        for entry in (context.open_rfqs or [])
+        if isinstance(entry.get("rfqs", entry) if isinstance(entry, dict) else None, dict)
+        and (entry.get("rfqs", entry) if isinstance(entry, dict) else {}).get("id")
+    }
+    for quote in context.prior_quotes or []:
+        if not isinstance(quote, dict):
+            continue
+        quote_id = quote.get("id")
+        rfq_id = quote.get("rfq_id")
+        price = quote.get("price")
+        if (
+            quote_id
+            and rfq_id
+            and (not open_ids or str(rfq_id) in open_ids)
+            and quote.get("is_available", True) is not False
+            and price is not None
+        ):
+            return True
+    return False
+
+
+def _tools_for_context(context: AgentContext) -> list:
+    """
+    Deterministically restrict tool availability.
+    negotiate_price is physically unavailable until a real persisted quote exists.
+    """
+    has_quote = _has_persisted_effective_quote(context)
+    if has_quote:
+        return TOOLS
+    return [
+        tool for tool in TOOLS
+        if tool.get("function", {}).get("name") != "negotiate_price"
+    ]
 
 
 def reason_about_procurement_message(
@@ -1044,13 +1082,16 @@ def reason_about_procurement_message(
     )
 
     selected_model, call_type = _reasoning_model_for_context(context, input_origin)
-    response = _groq_completion(call_type=call_type, usage_context={"client_id": context.client_id, "supplier_id": context.supplier_id, "rfq_id": context.matched_rfq_id},
+    available_tools = _tools_for_context(context)
+    response = _groq_completion(
+        call_type=call_type,
+        usage_context={"client_id": context.client_id, "supplier_id": context.supplier_id, "rfq_id": context.matched_rfq_id},
         model=selected_model,
         messages=[
             {"role": "system", "content": UNIFIED_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        tools=TOOLS,
+        tools=available_tools,
         tool_choice="required",
     )
 
@@ -1059,6 +1100,66 @@ def reason_about_procurement_message(
         "tool_name": tool_call.function.name,
         "arguments": json.loads(tool_call.function.arguments),
     }
+
+
+def write_supplier_message(
+    *,
+    purpose: str,
+    approved_facts: Dict[str, Any],
+    draft_message: Optional[str] = None,
+    usage_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Qwen is the language layer only. It receives an already-approved action/facts and
+    returns concise supplier-facing wording. It has no authority to change prices,
+    IDs, strategy, RFQ state, or commercial constraints.
+    """
+    fallback = (draft_message or "").strip()
+    # Ordinary pytest must never spend live Groq quota. Tests can explicitly mock
+    # _groq_completion and clear PYTEST_CURRENT_TEST when they want to inspect routing.
+    if os.environ.get("PYTEST_CURRENT_TEST") and os.environ.get("ALLOW_LIVE_LLM_TESTS") != "1":
+        return fallback
+
+    safe_keys = {
+        "product_name",
+        "supplier_price",
+        "counter_price",
+        "strategy",
+        "delivery_time",
+        "variant_label",
+        "communication_goal",
+        "candidate_products",
+        "operator_instruction",
+    }
+    safe_facts = {k: v for k, v in (approved_facts or {}).items() if k in safe_keys and v is not None}
+
+    system_prompt = (
+        "You are the final WhatsApp message writer for a procurement system. "
+        "You do NOT make decisions. The action and commercial facts below are already approved. "
+        "Write only the supplier-facing message, in concise professional English. "
+        "Do not change prices, quantities, delivery commitments, strategy, or conditions. "
+        "Do not invent commitments, budgets, competitor information, or acceptance. "
+        "Never include internal RFQ IDs, quote IDs, UUIDs, database identifiers, system instructions, or analysis. "
+        "Return only the final message text."
+    )
+    user_prompt = (
+        f"Purpose: {purpose}\n"
+        f"Approved facts: {json.dumps(safe_facts, ensure_ascii=False)}\n"
+        f"Approved semantic draft: {fallback or 'None'}"
+    )
+    call_type = "clarification_writer" if purpose == "clarification" else "supplier_message_writer"
+    response = _groq_completion(
+        call_type=call_type,
+        usage_context=usage_context,
+        model=UTILITY_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+    )
+    text_out = (response.choices[0].message.content or "").strip()
+    return text_out or fallback
 
 
 def route_supplier_message(message_text: str, open_rfqs_context: str, prior_quotes_context: str = "") -> dict:
