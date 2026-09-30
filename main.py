@@ -548,6 +548,62 @@ def normalize_phone(remote_jid: str) -> str:
 
 
 
+def _message_has_procurement_signal(message_text: str, open_rfqs: list) -> bool:
+    """Cheap deterministic pre-LLM relevance check for standalone supplier messages."""
+    text = (message_text or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+
+    # Explicit RFQ/product/spec references are strong evidence.
+    for entry in open_rfqs or []:
+        rfq = entry.get("rfqs", entry) if isinstance(entry, dict) else {}
+        if not isinstance(rfq, dict):
+            continue
+        rfq_id = str(rfq.get("id") or "").lower()
+        product = str(rfq.get("product_name") or "").strip().lower()
+        specs = str(rfq.get("specs") or "").strip().lower()
+        if rfq_id and rfq_id in lower:
+            return True
+        if product and product in lower:
+            return True
+        if specs and len(specs) > 3 and specs in lower:
+            return True
+
+    # Commercial language / units / terms.
+    commercial_pattern = re.compile(
+        r"\b(?:aed|dhs?|dirhams?|quote|quotation|price|rate|offer|counter|discount|"
+        r"reduce|lower|best|final|delivery|lead\s*time|ready|stock|available|availability|"
+        r"qty|quantity|moq|pcs?|pieces?|units?|nos?|brand|grade|spec|specification|"
+        r"payment|advance|credit|pi|invoice|warranty)\b",
+        re.IGNORECASE,
+    )
+    if commercial_pattern.search(text):
+        return True
+
+    # Common terse supplier quote forms: "72", "72.50", "72 / pc".
+    if re.fullmatch(r"\s*\d+(?:\.\d+)?\s*(?:/\s*(?:pc|piece|unit))?\s*", text, re.IGNORECASE):
+        return True
+
+    return False
+
+
+def should_invoke_commercial_parser(
+    message_text: str,
+    *,
+    matched_rfq_supplier,
+    pending,
+    active_session,
+    open_rfqs: list,
+) -> bool:
+    """Only spend LLM tokens when there is real procurement context or signal."""
+    if matched_rfq_supplier or pending or active_session:
+        return True
+    if not open_rfqs:
+        return False
+    return _message_has_procurement_signal(message_text, open_rfqs)
+
+
 def format_rfq_context(open_rfqs: list, current_supplier_id: str = None) -> str:
     if not open_rfqs:
         return "No open RFQs for this supplier."
@@ -2123,15 +2179,33 @@ async def whatsapp_webhook(request: Request):
         # 5. Single unanswered RFQ / Single open RFQ -> Route automatically
         # 6. Active session continuity (when no unanswered RFQs exist)
 
-        # Perform structured LLM commercial parsing on inbound supplier message
+        # Deterministic pre-LLM gate: casual WhatsApp chatter must not spend model tokens.
+        msg_lower = (message_text or "").lower()
+        if not should_invoke_commercial_parser(
+            message_text,
+            matched_rfq_supplier=matched_rfq_supplier,
+            pending=pending,
+            active_session=active_session,
+            open_rfqs=all_open_rfqs,
+        ):
+            if msg_key_id:
+                db.complete_webhook_message(client_id, msg_key_id)
+            return {
+                "status": "ignored_non_procurement",
+                "reason": "No active procurement context or deterministic commercial signal",
+            }
+
+        # Structured commercial parsing uses the utility model only after the deterministic gate.
         commercial_parse = None
         try:
-            commercial_parse = groq_client.parse_commercial_message(message_text)
+            commercial_parse = groq_client.parse_commercial_message(
+                message_text,
+                candidate_rfqs=all_open_rfqs,
+            )
         except Exception as parse_err:
             logger.warning(f"Error in parse_commercial_message: {parse_err}")
 
         explicit_prod = commercial_parse.get("explicit_product_reference") if commercial_parse else None
-        msg_lower = (message_text or "").lower()
 
         if matched_rfq_supplier:
             # Priority 1: Exact WhatsApp Stanza Match always wins & locks
@@ -2345,6 +2419,7 @@ async def whatsapp_webhook(request: Request):
             pending_clarification=pending,
             prior_quotes=prior_quotes,
             negotiation_attempts=negotiation_attempts,
+            active_negotiation_session=active_session,
             competitive_context=competitive_context,
             conversation_history=conv_history,
             source_message_id=inbound_log_id,
@@ -2903,6 +2978,15 @@ async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, cu
             logger.warning(f"Error loading conversation history: {e}")
 
         # Build single unified AgentContext with input_origin="operator" and operator flag lock
+        operator_active_session = None
+        if rfq_id:
+            try:
+                candidate_session = db.get_active_negotiation_session_for_supplier(client_id, supplier["id"])
+                if candidate_session and str(candidate_session.get("rfq_id")) == str(rfq_id):
+                    operator_active_session = candidate_session
+            except Exception as session_err:
+                logger.warning("Could not load operator negotiation session: %s", session_err)
+
         context = AgentContext(
             client_id=client_id,
             supplier_id=supplier["id"],
@@ -2915,6 +2999,7 @@ async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, cu
             pending_clarification=pending_clarification,
             prior_quotes=prior_quotes,
             negotiation_attempts=negotiation_attempts,
+            active_negotiation_session=operator_active_session,
             competitive_context=competitive_context,
             conversation_history=conv_history,
             review_flag_id=flag.get("id"),
