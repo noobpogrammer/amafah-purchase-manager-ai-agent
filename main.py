@@ -1400,7 +1400,7 @@ async def execute_validated_action(
                     supplier_id,
                 )
                 supp_name = supplier.get("name") or "Supplier"
-                db.flag_for_human_review(
+                flag_res = db.flag_for_human_review(
                     client_id=client_id,
                     supplier_id=supplier_id,
                     rfq_id=target_rfq_id,
@@ -1408,6 +1408,31 @@ async def execute_validated_action(
                     category="system_error",
                     raw_message=raw_message,
                 )
+                flag_id = flag_res[0]["id"] if flag_res and len(flag_res) > 0 else None
+                msg_log_id = db.log_message(
+                    client_id,
+                    supplier_id,
+                    "outbound",
+                    HUMAN_ACK_MSG,
+                    related_rfq_id=target_rfq_id,
+                )
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log negotiation-session failure holding message.")
+                await enqueue_message(
+                    phone_number,
+                    HUMAN_ACK_MSG,
+                    rfq_id=target_rfq_id,
+                    supplier_id=supplier_id,
+                    message_log_id=msg_log_id,
+                )
+                return {
+                    "status": "escalated_to_human",
+                    "reason": "Negotiation session persistence failed; autonomous negotiation stopped.",
+                    "category": "system_error",
+                    "rfq_id": target_rfq_id,
+                    "quote_id": str(persisted_quote_id) if persisted_quote_id else None,
+                    "flag_id": flag_id,
+                }
 
             if can_auto_negotiate and persisted_quote_id:
                 counter_price = float(preflight["recommended_anchor"])
@@ -1459,6 +1484,7 @@ async def execute_validated_action(
                     matched_rfq_id=context.matched_rfq_id,
                     pending_clarification=context.pending_clarification,
                     input_origin="supplier",
+                    negotiation_preflight=preflight,
                 )
 
                 if followup_validation.is_valid:
@@ -1505,6 +1531,49 @@ async def execute_validated_action(
                     target_rfq_id,
                     followup_validation.reason,
                 )
+                escalation_reason = (
+                    "Negotiation Safety Conflict: the negotiation engine proposed an autonomous "
+                    f"counteroffer, but the Policy Validator could not safely approve it. "
+                    f"Validator reason: {followup_validation.reason}"
+                )
+                if persisted_session and persisted_session.get("id"):
+                    db.complete_negotiation_session(
+                        persisted_session["id"],
+                        status="awaiting_human_review",
+                    )
+                flag_res = db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=target_rfq_id,
+                    reason=escalation_reason,
+                    category="requires_business_knowledge",
+                    raw_message=raw_message,
+                )
+                flag_id = flag_res[0]["id"] if flag_res and len(flag_res) > 0 else None
+                msg_log_id = db.log_message(
+                    client_id,
+                    supplier_id,
+                    "outbound",
+                    HUMAN_ACK_MSG,
+                    related_rfq_id=target_rfq_id,
+                )
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log negotiation safety-conflict holding message.")
+                await enqueue_message(
+                    phone_number,
+                    HUMAN_ACK_MSG,
+                    rfq_id=target_rfq_id,
+                    supplier_id=supplier_id,
+                    message_log_id=msg_log_id,
+                )
+                return {
+                    "status": "escalated_to_human",
+                    "reason": escalation_reason,
+                    "category": "negotiation_safety_conflict",
+                    "rfq_id": target_rfq_id,
+                    "quote_id": str(persisted_quote_id),
+                    "flag_id": flag_id,
+                }
 
             # 4. Handle Stop / Escalation conditions
             if preflight and persisted_session and persisted_session.get("id"):
