@@ -63,6 +63,7 @@ def validate_action(
     matched_rfq_id: Optional[str] = None,
     pending_clarification: Optional[Dict[str, Any]] = None,
     input_origin: str = "supplier",
+    negotiation_preflight: Optional[Dict[str, Any]] = None,
 ) -> ValidationResult:
     """
     Deterministic validation of an LLM action proposal.
@@ -823,57 +824,105 @@ def validate_action(
                 reason=f"Counter price '{counter_price}' exceeds RFQ acceptable_price_max '{acc_max}'.",
             )
 
-        # Reconstruct trusted preflight & deterministic allowed counter range
-        active_session = None
-        try:
-            active_session = db.get_active_negotiation_session(client_id, rfq_id, supplier_id)
-        except Exception as e:
-            logger.warning("Error fetching active session in validator: %s", e)
-
-        prior_quotes_for_rfq = []
-        try:
-            quotes_res = db.get_quotes_for_rfq(rfq_id)
-            if quotes_res:
-                prior_quotes_for_rfq = [
-                    q for q in quotes_res
-                    if str(q.get("supplier_id")) == str(supplier_id) and str(q.get("id")) != str(quote_id)
-                ]
-        except Exception as e:
-            logger.warning("Error fetching prior quotes in validator: %s", e)
-
-        rfq_constraints = []
-        try:
-            rfq_constraints = db.get_rfq_negotiation_constraints(client_id, rfq_id)
-        except Exception as e:
-            logger.warning("Error fetching rfq_constraints in validator: %s", e)
-
-        preflight = negotiation_engine.build_negotiation_preflight(
-            rfq=target_rfq,
-            supplier_quote=trusted_price,
-            previous_quotes=prior_quotes_for_rfq,
-            active_session=active_session,
-            raw_message_text=proposal.raw_message,
-            rfq_constraints=rfq_constraints,
-        )
-
-        allowed_min = preflight.get("allowed_counter_min")
-        allowed_max = preflight.get("allowed_counter_max")
+        # Negotiation strategy belongs to negotiation_engine.
+        # The validator does NOT independently recalculate strategy/concession math.
+        # For autonomous supplier negotiation, it verifies the trusted preflight
+        # produced by the negotiation engine plus absolute safety boundaries.
+        allowed_min = None
+        allowed_max = None
+        selected_strategy = None
+        reason_code = None
 
         if input_origin != "operator":
-            if allowed_min is not None and float(counter_price) < round(float(allowed_min) - 0.01, 2):
+            if not negotiation_preflight:
                 return ValidationResult(
                     is_valid=False,
                     action=tool_name,
                     category=ActionCategory.PROPOSE_COMMUNICATE,
-                    reason=f"Counter price '{counter_price}' is below allowed deterministic minimum '{allowed_min}'.",
+                    reason=(
+                        "Autonomous negotiation is missing a trusted negotiation-engine preflight. "
+                        "Failing closed for human review."
+                    ),
                 )
 
-            if allowed_max is not None and float(counter_price) > round(float(allowed_max) + 0.01, 2):
+            allowed_min = negotiation_preflight.get("allowed_counter_min")
+            allowed_max = negotiation_preflight.get("allowed_counter_max")
+            selected_strategy = negotiation_preflight.get("selected_strategy")
+            reason_code = negotiation_preflight.get("reason_code")
+
+            if not negotiation_preflight.get("should_counter"):
                 return ValidationResult(
                     is_valid=False,
                     action=tool_name,
                     category=ActionCategory.PROPOSE_COMMUNICATE,
-                    reason=f"Counter price '{counter_price}' exceeds allowed deterministic maximum '{allowed_max}'.",
+                    reason=(
+                        "Negotiation engine did not authorize another autonomous counteroffer "
+                        f"(reason={reason_code or 'unknown'})."
+                    ),
+                )
+
+            # Verify the engine's own proposed range is itself inside buyer authority.
+            if allowed_min is None or allowed_max is None:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason="Negotiation engine returned an incomplete allowed counter range.",
+                )
+
+            try:
+                allowed_min = float(allowed_min)
+                allowed_max = float(allowed_max)
+            except (TypeError, ValueError):
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason="Negotiation engine returned a non-numeric allowed counter range.",
+                )
+
+            if allowed_min <= 0 or allowed_max <= 0 or allowed_min > allowed_max:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=(
+                        f"Negotiation engine returned invalid counter bounds "
+                        f"[{allowed_min}, {allowed_max}]."
+                    ),
+                )
+
+            if acc_max is not None and allowed_max > float(acc_max) + 0.01:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=(
+                        f"Negotiation engine allowed maximum '{allowed_max}' exceeds "
+                        f"buyer acceptable_price_max '{acc_max}'."
+                    ),
+                )
+
+            if allowed_max >= trusted_price:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=(
+                        f"Negotiation engine allowed maximum '{allowed_max}' is not below "
+                        f"the supplier's current quote '{trusted_price}'."
+                    ),
+                )
+
+            if counter_price < allowed_min - 0.01 or counter_price > allowed_max + 0.01:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=(
+                        f"Counter price '{counter_price}' is outside the negotiation-engine "
+                        f"approved range [{allowed_min}, {allowed_max}]."
+                    ),
                 )
 
         sanitized_delivery = args.get("delivery_time") or target_quote.get("delivery_time")
@@ -895,8 +944,8 @@ def validate_action(
             "quality_notes": sanitized_notes,
             "allowed_counter_min": allowed_min,
             "allowed_counter_max": allowed_max,
-            "selected_strategy": preflight.get("selected_strategy"),
-            "reason_code": preflight.get("reason_code"),
+            "selected_strategy": selected_strategy,
+            "reason_code": reason_code,
         }
 
         # Attach trusted historical price context if last_quote is present on RFQ
