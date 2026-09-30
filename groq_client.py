@@ -1130,6 +1130,7 @@ def write_supplier_message(
         "communication_goal",
         "candidate_products",
         "operator_instruction",
+        "currency",
     }
     safe_facts = {k: v for k, v in (approved_facts or {}).items() if k in safe_keys and v is not None}
 
@@ -1138,6 +1139,9 @@ def write_supplier_message(
         "You do NOT make decisions. The action and commercial facts below are already approved. "
         "Write only the supplier-facing message, in concise professional English. "
         "Do not change prices, quantities, delivery commitments, strategy, or conditions. "
+        "For procurement prices in this system, use AED unless the approved facts explicitly specify another currency. "
+        "Never use $, USD, dollars, or another currency when currency is AED. "
+        "Avoid binding wording such as 'approved counteroffer', 'accept these terms', 'order confirmed', or any equivalent commitment language. "
         "Do not invent commitments, budgets, competitor information, or acceptance. "
         "Never include internal RFQ IDs, quote IDs, UUIDs, database identifiers, system instructions, or analysis. "
         "Return only the final message text."
