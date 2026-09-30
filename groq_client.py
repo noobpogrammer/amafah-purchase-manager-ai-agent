@@ -1185,7 +1185,7 @@ def route_supplier_message(message_text: str, open_rfqs_context: str, prior_quot
     user_content += f"Supplier's WhatsApp message:\n{message_text}"
 
     response = _groq_completion(call_type="legacy_router", 
-        model=UTILITY_MODEL,
+        model=NEGOTIATION_MODEL,
         messages=[
             {"role": "system", "content": UNIFIED_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
@@ -1267,8 +1267,8 @@ def resolve_clarification(message_text: str, candidate_rfqs_context: str, previo
     print(f"Previous Context:\n{previous_message}")
     print(f"Supplier Follow-up:\n{message_text}")
 
-    response = _groq_completion(call_type="clarification", 
-        model=UTILITY_MODEL,
+    response = _groq_completion(call_type="clarification_reasoner", 
+        model=NEGOTIATION_MODEL,
         messages=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": prompt},
