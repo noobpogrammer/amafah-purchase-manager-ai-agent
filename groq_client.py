@@ -662,6 +662,7 @@ class AgentContext(BaseModel):
 
     prior_quotes: List[Dict[str, Any]] = Field(default_factory=list)
     negotiation_attempts: Dict[str, int] = Field(default_factory=dict)
+    active_negotiation_session: Optional[Dict[str, Any]] = None
     competitive_context: Dict[str, Any] = Field(default_factory=dict)
 
     conversation_history: List[Dict[str, Any]] = Field(default_factory=list)
@@ -990,6 +991,34 @@ def format_agent_context_for_prompt(context: AgentContext) -> str:
 from unittest.mock import Mock, MagicMock
 
 
+def _reasoning_model_for_context(context: AgentContext, input_origin: str) -> tuple[str, str]:
+    """Use the large model only for genuine negotiation reasoning."""
+    session = context.active_negotiation_session or {}
+    session_status = str(session.get("status") or "").lower()
+    if session_status in {
+        "active",
+        "awaiting_authorization",
+        "awaiting_human_review",
+        "supplier_final",
+        "target_reached",
+    }:
+        return NEGOTIATION_MODEL, "negotiation_reasoner"
+
+    if input_origin == "operator":
+        review_text = " ".join(
+            str(value or "")
+            for value in (
+                context.review_category,
+                context.review_reason,
+                context.review_raw_message,
+            )
+        ).lower()
+        if re.search(r"\b(?:negotiat|counter|concession|trade[- ]?off|price|delivery|quantity|specification)\b", review_text):
+            return NEGOTIATION_MODEL, "negotiation_reasoner"
+
+    return UTILITY_MODEL, "utility_reasoner"
+
+
 def reason_about_procurement_message(
     message_text: str,
     context: AgentContext,
@@ -1014,8 +1043,9 @@ def reason_about_procurement_message(
         f"{message_text}"
     )
 
-    response = _groq_completion(call_type="main_reasoner", usage_context={"client_id": context.client_id, "supplier_id": context.supplier_id, "rfq_id": context.matched_rfq_id}, 
-        model=NEGOTIATION_MODEL,
+    selected_model, call_type = _reasoning_model_for_context(context, input_origin)
+    response = _groq_completion(call_type=call_type, usage_context={"client_id": context.client_id, "supplier_id": context.supplier_id, "rfq_id": context.matched_rfq_id},
+        model=selected_model,
         messages=[
             {"role": "system", "content": UNIFIED_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
