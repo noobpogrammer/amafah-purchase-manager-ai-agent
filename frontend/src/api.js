@@ -498,3 +498,17 @@ export async function fetchDeliveryIssues(page = 1, limit = 50) {
 }
 
 
+
+
+export async function resolveFinalQuoteDecision(flagId, decision) {
+  const response = await authorizedFetch(`/flags/${flagId}/final-quote-decision`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ decision }),
+  });
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Failed to resolve final quote decision');
+  }
+  return await response.json();
+}
