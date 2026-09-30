@@ -17,7 +17,11 @@ logger = logging.getLogger(__name__)
 
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-MODEL = "openai/gpt-oss-120b"  # cheap/fast — good for classification + tool routing
+NEGOTIATION_MODEL = "openai/gpt-oss-120b"
+UTILITY_MODEL = "qwen/qwen3.8-27b"
+
+# Backward-compatibility alias. New call sites should use a role-specific model.
+MODEL = NEGOTIATION_MODEL
 
 MAX_QUOTE_VARIANTS = 10
 
@@ -67,6 +71,7 @@ def _usage_value(usage, name: str) -> int:
 def _persist_llm_usage(
     *,
     call_type: str,
+    model: str,
     response=None,
     success: bool = True,
     latency_ms: int = 0,
@@ -88,7 +93,7 @@ def _persist_llm_usage(
         execution_context, test_name = _execution_context()
         db.log_llm_usage(
             provider="groq",
-            model=MODEL,
+            model=model,
             call_type=call_type,
             environment=_runtime_environment(),
             execution_context=execution_context,
@@ -112,11 +117,13 @@ def _persist_llm_usage(
 def _groq_completion(*, call_type: str, usage_context: Optional[Dict[str, Any]] = None, **kwargs):
     """Execute one Groq completion and persist token/latency metadata for that exact call."""
     started = time.perf_counter()
+    model = str(kwargs.get("model") or NEGOTIATION_MODEL)
     try:
         response = client.chat.completions.create(**kwargs)
     except Exception as exc:
         _persist_llm_usage(
             call_type=call_type,
+            model=model,
             response=None,
             success=False,
             latency_ms=int((time.perf_counter() - started) * 1000),
@@ -127,6 +134,7 @@ def _groq_completion(*, call_type: str, usage_context: Optional[Dict[str, Any]] 
 
     _persist_llm_usage(
         call_type=call_type,
+        model=model,
         response=response,
         success=True,
         latency_ms=int((time.perf_counter() - started) * 1000),
@@ -607,7 +615,7 @@ def parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] =
                     prompt += f"\n\nCandidate open RFQs: {cand_str}"
 
             response = _groq_completion(call_type="commercial_parser", 
-                model=MODEL,
+                model=UTILITY_MODEL,
                 messages=[
                     {"role": "system", "content": COMMERCIAL_PARSER_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -1007,7 +1015,7 @@ def reason_about_procurement_message(
     )
 
     response = _groq_completion(call_type="main_reasoner", usage_context={"client_id": context.client_id, "supplier_id": context.supplier_id, "rfq_id": context.matched_rfq_id}, 
-        model=MODEL,
+        model=NEGOTIATION_MODEL,
         messages=[
             {"role": "system", "content": UNIFIED_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
@@ -1033,7 +1041,7 @@ def route_supplier_message(message_text: str, open_rfqs_context: str, prior_quot
     user_content += f"Supplier's WhatsApp message:\n{message_text}"
 
     response = _groq_completion(call_type="legacy_router", 
-        model=MODEL,
+        model=UTILITY_MODEL,
         messages=[
             {"role": "system", "content": UNIFIED_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
@@ -1116,7 +1124,7 @@ def resolve_clarification(message_text: str, candidate_rfqs_context: str, previo
     print(f"Supplier Follow-up:\n{message_text}")
 
     response = _groq_completion(call_type="clarification", 
-        model=MODEL,
+        model=UTILITY_MODEL,
         messages=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": prompt},
@@ -1142,7 +1150,7 @@ def rank_quotes(rfq_details: str, quotes_summary: str) -> dict:
     ask Groq to rank offers and explain the reasoning. Uses structured JSON output.
     """
     response = _groq_completion(call_type="quote_ranking", 
-        model=MODEL,
+        model=UTILITY_MODEL,
         messages=[
             {
                 "role": "system",
