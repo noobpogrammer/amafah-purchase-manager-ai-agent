@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { fetchFlags, resolveFlag, respondToFlag, authorizeNegotiationTradeoff } from '../api';
+import { fetchFlags, resolveFlag, respondToFlag, authorizeNegotiationTradeoff, resolveFinalQuoteDecision } from '../api';
 import { AlertTriangle, CheckCircle2, Phone, Clock, FileText, Check, Send, Sliders, ShieldCheck, XCircle } from 'lucide-react';
 
 export default function AgentAttentionView({ refreshFlagsCount }) {
@@ -61,6 +61,19 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
     }
   };
 
+  const handleFinalQuoteDecision = async (flag, decision) => {
+    setResolvingId(flag.id);
+    try {
+      await resolveFinalQuoteDecision(flag.id, decision);
+      await loadFlags();
+    } catch (err) {
+      console.error(err);
+      alert('Error resolving final quote decision: ' + err.message);
+    } finally {
+      setResolvingId(null);
+    }
+  };
+
   const handleTradeoffDecision = async (flag, decision, customConstraints = null) => {
     setResolvingId(flag.id);
     const meta = flag.metadata || {};
@@ -99,6 +112,16 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
   };
 
   const getCategoryBadge = (cat, meta) => {
+    if (cat === 'supplier_final_quote_decision' || meta?.type === 'supplier_final_quote_decision') {
+      return (
+        <span
+          className="badge badge-flag business"
+          style={{ background: '#0f766e', color: '#ffffff', fontWeight: 600, padding: '4px 10px', borderRadius: '6px', fontSize: '0.75rem' }}
+        >
+          Final Quote Decision
+        </span>
+      );
+    }
     if (cat === 'negotiation_tradeoff_authorization' || meta?.type === 'negotiation_tradeoff_authorization') {
       return (
         <span 
@@ -163,6 +186,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                   const product = flag.rfqs?.product_name || '';
 
                   const isTradeoff = flag.category === 'negotiation_tradeoff_authorization' || flag.metadata?.type === 'negotiation_tradeoff_authorization';
+                  const isFinalQuote = flag.category === 'supplier_final_quote_decision' || flag.metadata?.type === 'supplier_final_quote_decision';
                   const meta = flag.metadata || {};
                   const isCustomOpen = !!showCustomConfig[flag.id];
                   const customValues = customFormState[flag.id] || {};
@@ -185,6 +209,58 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                         </div>
                         {getCategoryBadge(flag.category, meta)}
                       </div>
+
+                      {isFinalQuote && (
+                        <div className="tradeoff-proposal-box" style={{ borderColor: '#0f766e' }}>
+                          <div className="tradeoff-proposal-title">
+                            <ShieldCheck size={18} style={{ color: '#0f766e' }} />
+                            <span>Final Supplier Quote</span>
+                          </div>
+
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem', marginBottom: '0.85rem' }}>
+                            <div className="tradeoff-metric-price">
+                              <div className="tradeoff-metric-price-label">Final Price</div>
+                              <div className="tradeoff-metric-price-value">AED {meta.supplier_final_price ?? '-'}</div>
+                            </div>
+                            <div className="tradeoff-metric-req">
+                              <div className="tradeoff-metric-req-label">Delivery</div>
+                              <div className="tradeoff-metric-req-value">{meta.delivery_time || 'Not specified'}</div>
+                            </div>
+                            <div className="tradeoff-metric-prop">
+                              <div className="tradeoff-metric-prop-label">Buyer Range</div>
+                              <div className="tradeoff-metric-prop-value">
+                                AED {meta.preferred_target ?? '-'} target · AED {meta.acceptable_max ?? '-'} max
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="tradeoff-question">
+                            <strong>Supplier says this is their final price.</strong> Choose what to do with this supplier. This does not close the whole RFQ.
+                          </div>
+
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.75rem' }}>
+                            <button
+                              type="button"
+                              className="btn btn-primary btn-sm"
+                              onClick={() => handleFinalQuoteDecision(flag, 'keep_for_evaluation')}
+                              disabled={resolvingId === flag.id}
+                            >
+                              <Check size={14} />
+                              Keep Quote for Evaluation
+                            </button>
+
+                            <button
+                              type="button"
+                              className="btn btn-sm tradeoff-btn-secondary"
+                              onClick={() => handleFinalQuoteDecision(flag, 'end_supplier')}
+                              disabled={resolvingId === flag.id}
+                            >
+                              <XCircle size={14} style={{ color: '#dc2626' }} />
+                              End Negotiation With Supplier
+                            </button>
+                          </div>
+                        </div>
+                      )}
 
                       {/* Structured Trade-Off Section */}
                       {isTradeoff ? (
