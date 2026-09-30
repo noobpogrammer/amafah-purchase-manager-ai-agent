@@ -1159,7 +1159,20 @@ def write_supplier_message(
         temperature=0.2,
     )
     text_out = (response.choices[0].message.content or "").strip()
-    return text_out or fallback
+    if not text_out:
+        return fallback
+
+    # Qwen is only a writer, never a commercial decision-maker. If it introduces
+    # a numeric value that was not present in the approved facts/draft, fail closed
+    # to the already-approved fallback wording.
+    approved_numeric_source = json.dumps(safe_facts, ensure_ascii=False) + " " + fallback
+    approved_numbers = set(re.findall(r"(?<![A-Za-z])\\d+(?:\\.\\d+)?", approved_numeric_source))
+    output_numbers = set(re.findall(r"(?<![A-Za-z])\\d+(?:\\.\\d+)?", text_out))
+    if not output_numbers.issubset(approved_numbers):
+        logger.warning("Qwen writer introduced unapproved numeric content; using approved fallback.")
+        return fallback
+
+    return text_out
 
 
 def route_supplier_message(message_text: str, open_rfqs_context: str, prior_quotes_context: str = "") -> dict:
