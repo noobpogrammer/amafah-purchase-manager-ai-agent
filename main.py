@@ -1598,10 +1598,20 @@ async def execute_validated_action(
                 diff_from_target = round(price_val - pref_target, 2) if pref_target else "N/A"
                 diff_above_ceiling = round(price_val - tol_ceiling, 2) if tol_ceiling else "N/A"
 
-                if is_final and is_above_ceiling:
+                if is_final:
                     should_escalate_attention = True
+                    if is_above_ceiling:
+                        final_reason = (
+                            f"Supplier stated AED {price_val} is their final price, which is "
+                            f"AED {diff_above_ceiling} above the tolerated final ceiling."
+                        )
+                    else:
+                        final_reason = (
+                            f"Supplier stated AED {price_val} is their final price. "
+                            "Autonomous negotiation has stopped and a human decision is required."
+                        )
                     escalation_reason = (
-                        f"Negotiation Requires Attention\n\n"
+                        f"Final Quote Decision Required\n\n"
                         f"Supplier:\n{supp_name}\n\n"
                         f"Product:\n{prod_name}\n\n"
                         f"{var_line}"
@@ -1610,13 +1620,10 @@ async def execute_validated_action(
                         f"Acceptable Maximum:\nAED {acc_max if acc_max else 'N/A'}\n\n"
                         f"Tolerated Final Ceiling:\nAED {tol_ceiling if tol_ceiling else 'N/A'}\n\n"
                         f"Supplier Final Quote:\nAED {price_val}\n\n"
-                        f"Difference from Last Quote:\nAED +{diff_from_target}\n\n"
+                        f"Delivery:\n{extracted_deliv or 'Not specified'}\n\n"
                         f"Negotiation Attempts:\n{attempts_made}/{MAX_NEGOTIATION_ATTEMPTS}\n\n"
-                        f"Reason:\nSupplier stated AED {price_val} is their final price, which is AED {diff_above_ceiling} above the tolerated final ceiling."
+                        f"Reason:\n{final_reason}"
                     )
-                    if persisted_session and persisted_session.get("id"):
-                        db.complete_negotiation_session(persisted_session["id"], status="awaiting_human_review")
-                elif is_final and not is_above_ceiling:
                     if persisted_session and persisted_session.get("id"):
                         db.complete_negotiation_session(persisted_session["id"], status="supplier_final")
                 elif attempts_made >= MAX_NEGOTIATION_ATTEMPTS and (pref_target is None or price_val > pref_target):
@@ -1639,19 +1646,43 @@ async def execute_validated_action(
                         db.complete_negotiation_session(persisted_session["id"], status="awaiting_human_review")
 
             if should_escalate_attention and escalation_reason:
+                is_final_quote_decision = bool(is_final)
+                flag_metadata = {}
+                flag_category = "requires_business_knowledge"
+                outbound_review_msg = HUMAN_ACK_MSG
+                if is_final_quote_decision:
+                    flag_category = "supplier_final_quote_decision"
+                    flag_metadata = {
+                        "type": "supplier_final_quote_decision",
+                        "quote_id": str(persisted_quote_id) if persisted_quote_id else None,
+                        "supplier_final_price": price_val,
+                        "delivery_time": extracted_deliv,
+                        "preferred_target": pref_target,
+                        "acceptable_max": acc_max,
+                        "tolerated_final_ceiling": tol_ceiling,
+                        "above_tolerated_ceiling": is_above_ceiling,
+                        "negotiation_attempts": attempts_made,
+                    }
+                    delivery_phrase = f" with {extracted_deliv} delivery" if extracted_deliv else ""
+                    outbound_review_msg = (
+                        f"Thanks. We've noted your final quote of AED {price_val:g} per piece"
+                        f"{delivery_phrase}. We'll review it internally and get back to you."
+                    )
+
                 flag_res = db.flag_for_human_review(
                     client_id=client_id,
                     supplier_id=supplier_id,
                     rfq_id=target_rfq_id,
                     reason=escalation_reason,
-                    category="requires_business_knowledge",
+                    category=flag_category,
                     raw_message=raw_message,
+                    metadata=flag_metadata,
                 )
                 flag_id = flag_res[0]["id"] if flag_res and len(flag_res) > 0 else None
-                msg_log_id = db.log_message(client_id, supplier_id, "outbound", HUMAN_ACK_MSG, related_rfq_id=target_rfq_id)
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", outbound_review_msg, related_rfq_id=target_rfq_id)
                 if not msg_log_id:
                     raise RuntimeError("Failed to log outbound message durably.")
-                await enqueue_message(phone_number, HUMAN_ACK_MSG, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+                await enqueue_message(phone_number, outbound_review_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
 
                 if decision_id:
                     updated_args = dict(args)
@@ -1676,7 +1707,7 @@ async def execute_validated_action(
                 return {
                     "status": "escalated_to_human",
                     "reason": escalation_reason,
-                    "category": "requires_business_knowledge",
+                    "category": "supplier_final_quote_decision" if is_final_quote_decision else "requires_business_knowledge",
                     "rfq_id": target_rfq_id,
                     "flag_id": flag_id,
                 }
@@ -2994,6 +3025,10 @@ class FlagRespondRequest(BaseModel):
     send_to_supplier: bool = True
 
 
+class FinalQuoteDecisionRequest(BaseModel):
+    decision: str
+
+
 @app.get("/rfqs/audit")
 async def get_rfq_audit_endpoint(request: Request, current_user=Depends(get_current_user)):
     """Returns RFQs with null category/deadline values or zero matched suppliers; admin-only."""
@@ -3024,6 +3059,74 @@ async def resolve_flag_endpoint(flag_id: str, current_user=Depends(get_current_u
     if not result:
         raise HTTPException(status_code=404, detail="Flagged item not found")
     return {"status": "resolved", "flag": result}
+
+
+@app.post("/flags/{flag_id}/final-quote-decision")
+async def final_quote_decision_endpoint(
+    flag_id: str,
+    payload: FinalQuoteDecisionRequest,
+    current_user=Depends(get_current_user),
+):
+    """Resolve a supplier-declared final quote without closing the whole RFQ."""
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=401, detail="Authentication missing client_id")
+
+    flag = db.get_flag_by_id(flag_id, client_id=client_id)
+    if not flag:
+        raise HTTPException(status_code=404, detail="Flagged item not found")
+    meta = flag.get("metadata") or {}
+    if flag.get("category") != "supplier_final_quote_decision" and meta.get("type") != "supplier_final_quote_decision":
+        raise HTTPException(status_code=400, detail="Flag is not a final-quote decision")
+
+    decision = (payload.decision or "").strip().lower()
+    if decision not in {"keep_for_evaluation", "end_supplier"}:
+        raise HTTPException(status_code=400, detail="decision must be keep_for_evaluation or end_supplier")
+
+    rfq_id = flag.get("rfq_id")
+    supplier_id = flag.get("supplier_id")
+    if not rfq_id or not supplier_id:
+        raise HTTPException(status_code=400, detail="Flag is missing RFQ or supplier context")
+
+    # This action is supplier-scoped. It never closes the whole RFQ.
+    supplier_status = "responded" if decision == "keep_for_evaluation" else "closed"
+    update_res = (
+        db.supabase.table("rfq_suppliers")
+        .update({"status": supplier_status})
+        .eq("rfq_id", rfq_id)
+        .eq("supplier_id", supplier_id)
+        .execute()
+    )
+    if not update_res.data:
+        raise HTTPException(status_code=404, detail="RFQ supplier relationship not found")
+
+    try:
+        active_session = db.get_active_negotiation_session(client_id, rfq_id, supplier_id)
+        if active_session and active_session.get("id"):
+            db.complete_negotiation_session(
+                active_session["id"],
+                status="supplier_final" if decision == "keep_for_evaluation" else "closed",
+            )
+    except Exception as session_err:
+        logger.warning("Could not finalize negotiation session for final quote decision: %s", session_err)
+
+    human_response = (
+        "Final supplier quote kept for RFQ evaluation."
+        if decision == "keep_for_evaluation"
+        else "Supplier negotiation ended for this RFQ; final quote remains in quote history."
+    )
+    resolved = db.resolve_flag(flag_id, client_id=client_id, human_response=human_response)
+    if not resolved:
+        raise HTTPException(status_code=409, detail="Could not resolve final-quote decision flag")
+
+    return {
+        "status": "resolved",
+        "decision": decision,
+        "rfq_id": rfq_id,
+        "supplier_id": supplier_id,
+        "supplier_status": supplier_status,
+        "quote_id": meta.get("quote_id"),
+    }
 
 
 @app.post("/flags/{flag_id}/respond")
