@@ -1411,13 +1411,31 @@ async def execute_validated_action(
 
             if can_auto_negotiate and persisted_quote_id:
                 counter_price = float(preflight["recommended_anchor"])
-                negotiation_message = generate_adaptive_negotiation_message(
+                approved_draft = generate_adaptive_negotiation_message(
                     strategy=preflight["selected_strategy"],
                     counter_price=counter_price,
                     supplier_last_concession=preflight["supplier_last_concession"],
                     product_name=target_rfq.get("product_name") if isinstance(target_rfq, dict) else None,
                     variant_label=variants[0].get("variant_label") if variants else None,
                 )
+                try:
+                    negotiation_message = groq_client.write_supplier_message(
+                        purpose="negotiation",
+                        approved_facts={
+                            "product_name": target_rfq.get("product_name") if isinstance(target_rfq, dict) else None,
+                            "supplier_price": float(price_val),
+                            "counter_price": counter_price,
+                            "strategy": preflight.get("selected_strategy"),
+                            "delivery_time": variants[0].get("delivery_time") if variants else None,
+                            "variant_label": variants[0].get("variant_label") if variants else None,
+                            "communication_goal": "Send the approved counteroffer without changing any commercial terms.",
+                        },
+                        draft_message=approved_draft,
+                        usage_context={"client_id": client_id, "supplier_id": supplier_id, "rfq_id": target_rfq_id},
+                    )
+                except Exception as writer_err:
+                    logger.warning("Qwen negotiation writer failed; using deterministic approved fallback: %s", type(writer_err).__name__)
+                    negotiation_message = approved_draft
 
                 followup_proposal = ActionProposal(
                     tool_name="negotiate_price",
@@ -1637,10 +1655,28 @@ async def execute_validated_action(
             quote_id = args.get("quote_id")
             quoted_price = args.get("quoted_price")
             counter_price = args.get("counter_price")
-            neg_msg = args["negotiation_message"]
+            approved_draft = args["negotiation_message"]
             delivery = args.get("delivery_time")
             notes = args.get("quality_notes")
             variant_label = args.get("variant_label")
+            strategy = args.get("selected_strategy")
+            try:
+                neg_msg = groq_client.write_supplier_message(
+                    purpose="negotiation",
+                    approved_facts={
+                        "supplier_price": quoted_price,
+                        "counter_price": counter_price,
+                        "strategy": strategy,
+                        "delivery_time": delivery,
+                        "variant_label": variant_label,
+                        "communication_goal": "Send the policy-approved counteroffer without changing commercial terms.",
+                    },
+                    draft_message=approved_draft,
+                    usage_context={"client_id": client_id, "supplier_id": supplier_id, "rfq_id": target_rfq_id},
+                )
+            except Exception as writer_err:
+                logger.warning("Qwen negotiation writer failed; using policy-approved fallback: %s", type(writer_err).__name__)
+                neg_msg = approved_draft
 
             attempts = db.increment_negotiation_attempts(target_rfq_id, supplier_id)
             if attempts <= 0:
@@ -1731,7 +1767,32 @@ async def execute_validated_action(
         elif validation.action == "request_clarification":
             args = validation.sanitized_args
             candidate_ids = args.get("candidate_rfq_ids") or []
-            question = args["clarifying_question"]
+            approved_question = args["clarifying_question"]
+            candidate_products = []
+            for cid in candidate_ids:
+                rfq_match = next(
+                    (
+                        item.get("rfqs", item)
+                        for item in (context.open_rfqs or [])
+                        if str(item.get("rfqs", item).get("id")) == str(cid)
+                    ),
+                    None,
+                )
+                if isinstance(rfq_match, dict):
+                    candidate_products.append(rfq_match.get("product_name") or str(cid))
+            try:
+                question = groq_client.write_supplier_message(
+                    purpose="clarification",
+                    approved_facts={
+                        "candidate_products": candidate_products,
+                        "communication_goal": "Ask the approved clarification question only; do not add new commercial terms.",
+                    },
+                    draft_message=approved_question,
+                    usage_context={"client_id": client_id, "supplier_id": supplier_id, "rfq_id": context.matched_rfq_id},
+                )
+            except Exception as writer_err:
+                logger.warning("Qwen clarification writer failed; using policy-approved fallback: %s", type(writer_err).__name__)
+                question = approved_question
             norm_question = " ".join((question or "").lower().split())
 
             if not context.pending_clarification:
@@ -1900,7 +1961,20 @@ async def execute_validated_action(
 
         elif validation.action == "send_procurement_message":
             args = validation.sanitized_args
-            msg = args["message"]
+            approved_message = args["message"]
+            try:
+                msg = groq_client.write_supplier_message(
+                    purpose="procurement_message",
+                    approved_facts={
+                        "operator_instruction": approved_message if context.input_origin == "operator" else None,
+                        "communication_goal": "Write the already-approved procurement message without changing meaning or terms.",
+                    },
+                    draft_message=approved_message,
+                    usage_context={"client_id": client_id, "supplier_id": supplier_id, "rfq_id": args.get("rfq_id") or context.matched_rfq_id},
+                )
+            except Exception as writer_err:
+                logger.warning("Qwen procurement message writer failed; using policy-approved fallback: %s", type(writer_err).__name__)
+                msg = approved_message
             target_rfq_id = args.get("rfq_id") or context.matched_rfq_id
             if target_rfq_id:
                 msg_log_id = db.log_message(client_id, supplier_id, "outbound", msg, related_rfq_id=target_rfq_id)
