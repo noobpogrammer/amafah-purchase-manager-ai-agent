@@ -601,8 +601,8 @@ def _fallback_parse_commercial_message(message_text: str, candidate_rfqs: Option
     )
     negotiation_signal = re.search(
         r"\b(?:i\s+can\s+do|we\s+can\s+do|can\s+do|best\s+(?:i|we)\s+can\s+do|"
-        r"best\s+price|best\s+and\s+final|final\s+(?:price|offer)?|cannot\s+go\s+lower|"
-        r"can't\s+go\s+lower|can(?:not|'t)\s+accept|deal|meet\s+you\s+at)\b",
+        r"best\s+price|best\s+and\s+final|final(?:\s+(?:price|offer))?|\d+(?:\.\d+)?\s+final|"
+        r"cannot\s+go\s+lower|can't\s+go\s+lower|can(?:not|'t)\s+accept|deal|meet\s+you\s+at)\b",
         text,
         re.I,
     )
@@ -671,6 +671,15 @@ def parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] =
             if result.quantity and result.quantity.value is not None:
                 if result.quantity.value <= 0:
                     result.quantity.value = None
+
+            # Deterministic wording evidence outranks the model for routing type.
+            # The model remains useful only when explicit revision/negotiation
+            # language does not resolve the message type.
+            deterministic = _fallback_parse_commercial_message(message_text, candidate_rfqs)
+            if deterministic.routing_intent in {"REVISION", "NEGOTIATION_REPLY"}:
+                result.routing_intent = deterministic.routing_intent
+            elif result.routing_intent not in {"NEW_QUOTE", "REVISION", "NEGOTIATION_REPLY", "UNKNOWN"}:
+                result.routing_intent = "UNKNOWN"
 
             return result.model_dump()
     except Exception as e:
