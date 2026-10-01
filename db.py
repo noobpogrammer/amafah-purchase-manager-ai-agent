@@ -40,6 +40,8 @@ def get_supplier_by_phone(client_id: str, phone_number: str):
         .select("*")
         .eq("client_id", client_id)
         .eq("phone_number", phone_number)
+        .eq("is_active", True)
+        .is_("deleted_at", "null")
         .execute()
     )
     if res.data:
@@ -50,6 +52,8 @@ def get_supplier_by_phone(client_id: str, phone_number: str):
         supabase.table("suppliers")
         .select("*")
         .eq("client_id", client_id)
+        .eq("is_active", True)
+        .is_("deleted_at", "null")
         .execute()
         .data
     )
@@ -999,6 +1003,7 @@ def get_suppliers_by_category(client_id: str, category: str) -> list:
         .select("*")
         .eq("client_id", client_id)
         .eq("is_active", True)
+        .is_("deleted_at", "null")
         .contains("category", [category])
         .execute()
     )
