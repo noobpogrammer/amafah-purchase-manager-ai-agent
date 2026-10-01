@@ -1075,14 +1075,29 @@ async def check_deadlines_and_reminders():
         try:
             rfq = item.get("rfqs") or {}
             supplier = item.get("suppliers") or {}
-            sent_at_str = item.get("sent_at")
-
             # 1. Strictly verify RFQ is active and open (deadline has not elapsed)
             if not db.is_rfq_open(rfq):
                 continue
 
+            # Delivery guardrail: rfq_suppliers.status='sent' only means the supplier
+            # was matched/queued. It does NOT prove Evolution/WhatsApp accepted the
+            # initial RFQ. Reminders are allowed only after the persistent outbound
+            # message lifecycle confirms status='sent'.
+            delivery = db.get_initial_rfq_delivery_status(rfq.get("id"), supplier.get("id"))
+            if not delivery or delivery.get("status") != "sent":
+                delivery_state = delivery.get("status") if delivery else "missing"
+                print(
+                    f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: "
+                    f"initial WhatsApp RFQ delivery is '{delivery_state}', not confirmed sent."
+                )
+                continue
+
+            sent_at_str = delivery.get("sent_at")
             if not sent_at_str:
-                print(f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: missing sent_at timestamp.")
+                print(
+                    f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: "
+                    "confirmed delivery row is missing sent_at timestamp."
+                )
                 continue
 
             try:
