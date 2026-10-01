@@ -894,10 +894,63 @@ def update_message_related_rfq(message_id: str, rfq_id: str):
         return None
 
 
+def _build_effective_quotes_from_history(rows: list[dict], include_unavailable: bool = False) -> list[dict]:
+    """Collapse immutable quote history into current effective supplier offers."""
+    grouped = {}
+    for q in (rows or []):
+        supplier_id = q.get("supplier_id")
+        if not supplier_id:
+            continue
+        variant_key = (q.get("variant_label") or "").strip().casefold()
+        grouped.setdefault((supplier_id, variant_key), []).append(q)
+
+    effective_quotes = []
+    for _key, history in grouped.items():
+        if not history:
+            continue
+
+        # Caller provides newest-first rows.
+        latest = dict(history[0])
+
+        if not latest.get("delivery_time"):
+            prior_delivery = next(
+                (row.get("delivery_time") for row in history[1:] if row.get("delivery_time")),
+                None,
+            )
+            if prior_delivery:
+                latest["delivery_time"] = prior_delivery
+                latest["delivery_inherited"] = True
+
+        if not latest.get("quality_notes"):
+            prior_quality = next(
+                (row.get("quality_notes") for row in history[1:] if row.get("quality_notes")),
+                None,
+            )
+            if prior_quality:
+                latest["quality_notes"] = prior_quality
+                latest["quality_notes_inherited"] = True
+
+        latest["revision_count"] = len(history)
+
+        if include_unavailable:
+            effective_quotes.append(latest)
+        elif latest.get("is_available", True) is True and latest.get("price") is not None:
+            effective_quotes.append(latest)
+
+    effective_quotes.sort(
+        key=lambda q: (q.get("created_at") or "", str(q.get("id") or "")),
+        reverse=True,
+    )
+    return effective_quotes
+
+
 def get_quotes_for_rfq(rfq_id: str, include_unavailable: bool = False) -> list:
     """
-    Returns the latest effective quote per supplier + variant_label for an RFQ, sorted newest first with id tie-breaker.
-    By default, returns only currently available effective variants (is_available=True, price is not None).
+    Returns one current effective commercial offer per supplier + variant_label.
+
+    Quote rows remain immutable history. The newest revision provides the current
+    price/availability, while omitted commercial terms inherit from the most
+    recent older revision for that same supplier + variant.
     """
     res = (
         supabase.table("quotes")
@@ -907,24 +960,10 @@ def get_quotes_for_rfq(rfq_id: str, include_unavailable: bool = False) -> list:
         .order("id", desc=True)
         .execute()
     )
-    latest_quotes = []
-    seen_variant_keys = set()
-    for q in (res.data or []):
-        supplier_id = q.get("supplier_id")
-        if not supplier_id:
-            continue
-        v_label_norm = (q.get("variant_label") or "").strip().casefold()
-        key = (supplier_id, v_label_norm)
-        if key not in seen_variant_keys:
-            seen_variant_keys.add(key)
-            if include_unavailable:
-                latest_quotes.append(q)
-            else:
-                # Include only if active / available and priced
-                if q.get("is_available", True) is True and q.get("price") is not None:
-                    latest_quotes.append(q)
-    return latest_quotes
-
+    return _build_effective_quotes_from_history(
+        res.data or [],
+        include_unavailable=include_unavailable,
+    )
 
 def get_all_quotes_for_rfq(rfq_id: str) -> list:
     """Returns all historical quotes for an RFQ in chronological order (created_at asc)."""

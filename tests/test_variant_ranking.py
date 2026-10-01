@@ -392,3 +392,82 @@ class TestVariantAwareApiAndLegacy:
             ranking = db.get_ranking_for_rfq("rfq-old")
             assert ranking["best_quote_id"] is None
             assert ranking["best_supplier_id"] == "supp-legacy"
+
+
+class TestEffectiveQuoteProjection:
+    def test_revisions_collapse_to_one_effective_offer_and_inherit_delivery(self):
+        rows = [
+            {
+                "id": "q-70-9",
+                "supplier_id": "supp-1",
+                "variant_label": None,
+                "price": 70.9,
+                "delivery_time": None,
+                "quality_notes": None,
+                "is_available": True,
+                "created_at": "2026-10-01T13:47:00+00:00",
+            },
+            {
+                "id": "q-71",
+                "supplier_id": "supp-1",
+                "variant_label": None,
+                "price": 71.0,
+                "delivery_time": "2 days",
+                "quality_notes": "Standard",
+                "is_available": True,
+                "created_at": "2026-10-01T13:43:00+00:00",
+            },
+            {
+                "id": "q-73",
+                "supplier_id": "supp-1",
+                "variant_label": None,
+                "price": 73.0,
+                "delivery_time": "2 days",
+                "quality_notes": None,
+                "is_available": True,
+                "created_at": "2026-10-01T13:35:00+00:00",
+            },
+        ]
+
+        effective = db._build_effective_quotes_from_history(rows)
+
+        assert len(effective) == 1
+        assert effective[0]["id"] == "q-70-9"
+        assert effective[0]["price"] == 70.9
+        assert effective[0]["delivery_time"] == "2 days"
+        assert effective[0]["quality_notes"] == "Standard"
+        assert effective[0]["delivery_inherited"] is True
+        assert effective[0]["revision_count"] == 3
+
+    def test_distinct_variants_remain_separate_effective_offers(self):
+        rows = [
+            {
+                "id": "q-india-new",
+                "supplier_id": "supp-1",
+                "variant_label": "India",
+                "price": 44.0,
+                "is_available": True,
+                "created_at": "2026-10-01T13:50:00+00:00",
+            },
+            {
+                "id": "q-china",
+                "supplier_id": "supp-1",
+                "variant_label": "China",
+                "price": 38.0,
+                "is_available": True,
+                "created_at": "2026-10-01T13:49:00+00:00",
+            },
+            {
+                "id": "q-india-old",
+                "supplier_id": "supp-1",
+                "variant_label": "India",
+                "price": 45.0,
+                "is_available": True,
+                "created_at": "2026-10-01T13:40:00+00:00",
+            },
+        ]
+
+        effective = db._build_effective_quotes_from_history(rows)
+
+        assert {q["id"] for q in effective} == {"q-india-new", "q-china"}
+        assert len(effective) == 2
