@@ -604,6 +604,85 @@ def should_invoke_commercial_parser(
     return _message_has_procurement_signal(message_text, open_rfqs)
 
 
+def select_state_aware_routing_candidates(
+    *,
+    routing_intent: str,
+    all_open_rfqs: list,
+    unanswered_rfqs: list,
+    responded_rfqs: list,
+    session_entry=None,
+    active_session: Optional[dict] = None,
+    conversation_history: Optional[list] = None,
+) -> dict:
+    """
+    Narrow RFQ candidates from trusted database state plus a routing-only message label.
+
+    The routing label never chooses an RFQ ID. Exact stanza/product/pending-clarification
+    routing is handled before this helper. UNKNOWN fails safe by preserving the broader
+    candidate set instead of guessing.
+    """
+    intent = str(routing_intent or "UNKNOWN").upper()
+    if intent not in {"NEW_QUOTE", "REVISION", "NEGOTIATION_REPLY", "UNKNOWN"}:
+        intent = "UNKNOWN"
+
+    def candidate_id(entry):
+        rfq = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+        if isinstance(rfq, dict) and rfq.get("id"):
+            return str(rfq["id"])
+        return None
+
+    if intent == "NEGOTIATION_REPLY" and session_entry:
+        pool = [session_entry]
+        source = "negotiation_session"
+    elif intent == "NEW_QUOTE":
+        pool = list(unanswered_rfqs or [])
+        source = "routing_new_quote"
+    elif intent in {"REVISION", "NEGOTIATION_REPLY"}:
+        pool = list(responded_rfqs or [])
+        source = f"routing_{intent.lower()}"
+    else:
+        pool = list(all_open_rfqs or [])
+        source = "routing_unknown"
+
+    # Classification/state disagreement must broaden safely rather than force a
+    # message onto an incompatible RFQ.
+    if not pool:
+        pool = list(all_open_rfqs or [])
+        intent = "UNKNOWN"
+        source = "routing_unknown"
+
+    # Conversation continuity only breaks ties *inside* an already-compatible
+    # revision/negotiation pool.
+    if len(pool) > 1 and intent in {"REVISION", "NEGOTIATION_REPLY"}:
+        pool_ids = {candidate_id(e) for e in pool}
+        pool_ids.discard(None)
+        for msg in reversed(conversation_history or []):
+            linked_id = msg.get("related_rfq_id") if isinstance(msg, dict) else None
+            if linked_id and str(linked_id) in pool_ids:
+                chosen = next(
+                    (e for e in pool if candidate_id(e) == str(linked_id)),
+                    None,
+                )
+                if chosen is not None:
+                    return {
+                        "candidates": [chosen],
+                        "matched_rfq_id": candidate_id(chosen),
+                        "match_source": "conversation_context",
+                        "routing_intent": intent,
+                    }
+
+    matched_rfq_id = candidate_id(pool[0]) if len(pool) == 1 else None
+    if matched_rfq_id and source == "negotiation_session" and active_session:
+        matched_rfq_id = str(active_session.get("rfq_id") or matched_rfq_id)
+
+    return {
+        "candidates": pool,
+        "matched_rfq_id": matched_rfq_id,
+        "match_source": source if matched_rfq_id else None,
+        "routing_intent": intent,
+    }
+
+
 def format_rfq_context(open_rfqs: list, current_supplier_id: str = None) -> str:
     if not open_rfqs:
         return "No open RFQs for this supplier."
@@ -2443,77 +2522,20 @@ async def whatsapp_webhook(request: Request):
                 # Priority 4+: state-aware routing intent narrows candidates but never
                 # selects an RFQ by itself. Exact stanza/product/pending clarification
                 # above always win.
-                routing_intent = (
-                    str((commercial_parse or {}).get("routing_intent") or "UNKNOWN").upper()
+                routing_result = select_state_aware_routing_candidates(
+                    routing_intent=(commercial_parse or {}).get("routing_intent") or "UNKNOWN",
+                    all_open_rfqs=all_open_rfqs,
+                    unanswered_rfqs=unanswered_rfqs,
+                    responded_rfqs=responded_rfqs,
+                    session_entry=session_entry,
+                    active_session=active_session,
+                    conversation_history=conv_history,
                 )
-                if routing_intent not in {"NEW_QUOTE", "REVISION", "NEGOTIATION_REPLY", "UNKNOWN"}:
-                    routing_intent = "UNKNOWN"
-
-                def _candidate_id(entry):
-                    r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
-                    return str(r_obj.get("id")) if isinstance(r_obj, dict) and r_obj.get("id") else None
-
-                def _recent_context_candidate(candidates):
-                    candidate_ids = {_candidate_id(e) for e in candidates}
-                    candidate_ids.discard(None)
-                    if not candidate_ids:
-                        return None
-                    for msg in reversed(conv_history or []):
-                        linked_id = msg.get("related_rfq_id")
-                        if linked_id and str(linked_id) in candidate_ids:
-                            return next(
-                                (e for e in candidates if _candidate_id(e) == str(linked_id)),
-                                None,
-                            )
-                    return None
-
-                # A genuine negotiation reply belongs to the active negotiation
-                # session when one exists. This captures replies like "50 final".
-                if routing_intent == "NEGOTIATION_REPLY" and session_entry:
-                    candidate_pool = [session_entry]
-                    match_source = "negotiation_session"
-                elif routing_intent == "NEW_QUOTE":
-                    candidate_pool = unanswered_rfqs
-                elif routing_intent == "REVISION":
-                    candidate_pool = responded_rfqs
-                elif routing_intent == "NEGOTIATION_REPLY":
-                    # No active session: restrict to already-quoted RFQs rather
-                    # than attaching negotiation language to a fresh RFQ.
-                    candidate_pool = responded_rfqs
-                else:
-                    # UNKNOWN must fail safe. Do not prefer a single unanswered RFQ
-                    # over an existing quoted RFQ merely because it is unanswered.
-                    candidate_pool = all_open_rfqs
-
-                # If classification produced no compatible candidates, broaden safely
-                # instead of forcing the message onto an incompatible RFQ.
-                if not candidate_pool:
-                    candidate_pool = all_open_rfqs
-                    routing_intent = "UNKNOWN"
-
-                # Conversation continuity is a tie-breaker only inside the already
-                # state-filtered pool. It cannot override stanza/product evidence.
-                context_candidate = None
-                if len(candidate_pool) > 1 and routing_intent in {"REVISION", "NEGOTIATION_REPLY"}:
-                    context_candidate = _recent_context_candidate(candidate_pool)
-
-                if context_candidate is not None:
-                    open_rfqs = [context_candidate]
-                    matched_rfq_id = _candidate_id(context_candidate)
-                    match_source = "conversation_context"
-                    if matched_rfq_id:
-                        db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
-                elif len(candidate_pool) == 1:
-                    open_rfqs = [candidate_pool[0]]
-                    matched_rfq_id = _candidate_id(candidate_pool[0])
-                    if match_source != "negotiation_session":
-                        match_source = f"routing_{routing_intent.lower()}"
-                    if matched_rfq_id:
-                        db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
-                else:
-                    # Multiple plausible candidates remain. The unified reasoner may
-                    # ask clarification, but only from this narrowed candidate pool.
-                    open_rfqs = candidate_pool
+                open_rfqs = routing_result["candidates"]
+                matched_rfq_id = routing_result.get("matched_rfq_id")
+                match_source = routing_result.get("match_source")
+                if matched_rfq_id:
+                    db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
 
         if not open_rfqs and not matched_rfq_supplier and not pending:
             if msg_key_id:
