@@ -1144,6 +1144,65 @@ def reason_about_procurement_message(
     }
 
 
+
+def reason_with_validator_feedback(
+    message_text: str,
+    context: AgentContext,
+    rejected_tool_name: str,
+    rejected_arguments: Dict[str, Any],
+    validator_reason: str,
+    input_origin: str = "supplier",
+) -> dict:
+    """
+    One-shot repair reasoning after a recoverable Policy Validator rejection.
+
+    The validator remains authoritative. This function does not execute anything;
+    it only asks the decision model for the next corrective tool call.
+    """
+    context_str = format_agent_context_for_prompt(context)
+    repair_content = (
+        f"--- TRUSTED CONTEXT ---\n"
+        f"{context_str}\n\n"
+        f"--- CURRENT INCOMING MESSAGE (Origin: {input_origin}) ---\n"
+        f"{message_text}\n\n"
+        f"--- POLICY VALIDATOR FEEDBACK ---\n"
+        f"Your previous proposed action was rejected.\n"
+        f"Rejected tool: {rejected_tool_name}\n"
+        f"Rejected arguments: {json.dumps(rejected_arguments or {}, ensure_ascii=False)}\n"
+        f"Validator reason: {validator_reason}\n\n"
+        "The Policy Validator is authoritative. Do not argue with it and do not "
+        "repeat the rejected action unchanged. Propose exactly ONE corrective next "
+        "tool call that fixes the missing prerequisite or sequencing problem. "
+        "If the current supplier message contains a new or revised quote that is "
+        "not yet the trusted persisted quote, record that quote first with record_quote. "
+        "Do not negotiate against an unpersisted supplier price."
+    )
+
+    selected_model, _ = _reasoning_model_for_context(context, input_origin)
+    available_tools = _tools_for_context(context)
+    response = _groq_completion(
+        call_type="policy_repair_reasoner",
+        usage_context={
+            "client_id": context.client_id,
+            "supplier_id": context.supplier_id,
+            "rfq_id": context.matched_rfq_id,
+        },
+        model=selected_model,
+        messages=[
+            {"role": "system", "content": UNIFIED_SYSTEM_PROMPT},
+            {"role": "user", "content": repair_content},
+        ],
+        tools=available_tools,
+        tool_choice="required",
+    )
+
+    tool_call = response.choices[0].message.tool_calls[0]
+    return {
+        "tool_name": tool_call.function.name,
+        "arguments": json.loads(tool_call.function.arguments),
+    }
+
+
 def write_supplier_message(
     *,
     purpose: str,
