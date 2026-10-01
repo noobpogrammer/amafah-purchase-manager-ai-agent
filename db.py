@@ -40,6 +40,8 @@ def get_supplier_by_phone(client_id: str, phone_number: str):
         .select("*")
         .eq("client_id", client_id)
         .eq("phone_number", phone_number)
+        .eq("is_active", True)
+        .is_("deleted_at", "null")
         .execute()
     )
     if res.data:
@@ -50,6 +52,8 @@ def get_supplier_by_phone(client_id: str, phone_number: str):
         supabase.table("suppliers")
         .select("*")
         .eq("client_id", client_id)
+        .eq("is_active", True)
+        .is_("deleted_at", "null")
         .execute()
         .data
     )
@@ -966,6 +970,32 @@ def get_rfqs_by_date(client_id: str, start_dt: str, end_dt: str) -> list:
     return res.data or []
 
 
+def soft_delete_supplier(supplier_id: str, client_id: str) -> dict | None:
+    """Admin-facing supplier deletion that preserves procurement history.
+
+    Marks the supplier inactive and records deleted_at, scoped to the authenticated
+    tenant. Historical quotes/messages/RFQs remain intact.
+    """
+    if not supplier_id or not client_id:
+        return None
+    try:
+        res = (
+            supabase.table("suppliers")
+            .update({
+                "is_active": False,
+                "deleted_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("id", supplier_id)
+            .eq("client_id", client_id)
+            .is_("deleted_at", "null")
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as ex:
+        logger.warning("soft_delete_supplier error for %s: %s", supplier_id, ex)
+        return None
+
+
 def get_suppliers_by_category(client_id: str, category: str) -> list:
     """Finds active suppliers whose category array contains the specified category for a client."""
     res = (
@@ -973,6 +1003,7 @@ def get_suppliers_by_category(client_id: str, category: str) -> list:
         .select("*")
         .eq("client_id", client_id)
         .eq("is_active", True)
+        .is_("deleted_at", "null")
         .contains("category", [category])
         .execute()
     )

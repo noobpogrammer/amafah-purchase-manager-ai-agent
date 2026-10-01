@@ -238,3 +238,51 @@ def test_get_invite_token_lifecycle(monkeypatch):
 
 
 
+
+
+def test_delete_supplier_requires_admin(monkeypatch):
+    import auth
+    import db
+
+    monkeypatch.setattr(auth, "verify_jwt", lambda token: {"sub": "user-member"})
+    monkeypatch.setattr(db, "get_profile_by_id", lambda uid: {
+        "id": uid,
+        "client_id": "client-abc",
+        "role": "member",
+    })
+
+    r = client.delete(
+        "/admin/suppliers/supplier-1",
+        headers={"Authorization": "Bearer membertoken"},
+    )
+    assert r.status_code == 403
+
+
+def test_admin_can_soft_delete_supplier_in_own_tenant(monkeypatch):
+    import auth
+    import db
+
+    monkeypatch.setattr(auth, "verify_jwt", lambda token: {"sub": "user-admin"})
+    monkeypatch.setattr(db, "get_profile_by_id", lambda uid: {
+        "id": uid,
+        "client_id": "client-abc",
+        "role": "admin",
+    })
+    monkeypatch.setattr(
+        db,
+        "soft_delete_supplier",
+        lambda supplier_id, client_id: {
+            "id": supplier_id,
+            "client_id": client_id,
+            "is_active": False,
+            "deleted_at": "2026-10-02T00:00:00+00:00",
+        },
+    )
+
+    r = client.delete(
+        "/admin/suppliers/supplier-1",
+        headers={"Authorization": "Bearer admintoken"},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "deleted"
+    assert r.json()["supplier_id"] == "supplier-1"

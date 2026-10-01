@@ -43,6 +43,7 @@ export default function App() {
   const [session, setSession] = useState(undefined);
   const [profileLoadError, setProfileLoadError] = useState(null);
   const [profileLoading, setProfileLoading] = useState(false);
+  const [profile, setProfile] = useState(null);
 
   const loadMetrics = async () => {
     setLoadingMetrics(true);
@@ -131,7 +132,8 @@ export default function App() {
       setProfileLoadError(null);
       setProfileLoading(true);
       try {
-        await ensureProfile();
+        const loadedProfile = await ensureProfile();
+        setProfile(loadedProfile || null);
       } catch (err) {
         setProfileLoadError(err.message || String(err));
       } finally {
@@ -151,6 +153,7 @@ export default function App() {
     setActiveTab('dashboard');
     setMetrics(null);
     setSuppliers([]);
+    setProfile(null);
     navigate('/login');
   };
 
@@ -252,6 +255,7 @@ export default function App() {
             suppliers={suppliers}
             loading={loadingSuppliers}
             refreshSuppliers={loadSuppliers}
+            isAdmin={profile?.role === 'admin'}
           />
         )}
 

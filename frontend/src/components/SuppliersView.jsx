@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Users, Plus, Search, Filter, Edit2, Phone, Tag, Check, X } from 'lucide-react';
-import { createSupplier, updateSupplier, fetchCategories, createCustomCategory } from '../api';
+import { Users, Plus, Search, Filter, Edit2, Phone, Tag, Check, X, Trash2, ChevronDown } from 'lucide-react';
+import { createSupplier, updateSupplier, deleteSupplier, fetchCategories, createCustomCategory } from '../api';
 
 const DEFAULT_CATEGORIES = [
   'Electronics',
@@ -12,7 +12,7 @@ const DEFAULT_CATEGORIES = [
   'General',
 ];
 
-export default function SuppliersView({ suppliers, loading, refreshSuppliers }) {
+export default function SuppliersView({ suppliers, loading, refreshSuppliers, isAdmin = false }) {
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const [searchTerm, setSearchTerm] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
@@ -25,6 +25,8 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
   const [showCustomCatInput, setShowCustomCatInput] = useState(false);
   const [customCatName, setCustomCatName] = useState('');
   const [creatingCat, setCreatingCat] = useState(false);
+  const [categoryDropdownOpen, setCategoryDropdownOpen] = useState(false);
+  const [deletingSupplierId, setDeletingSupplierId] = useState(null);
 
   // Form State
   const [name, setName] = useState('');
@@ -59,6 +61,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
     setErrorMsg('');
     setShowCustomCatInput(false);
     setCustomCatName('');
+    setCategoryDropdownOpen(false);
     setShowModal(true);
   };
 
@@ -73,6 +76,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
     setErrorMsg('');
     setShowCustomCatInput(false);
     setCustomCatName('');
+    setCategoryDropdownOpen(false);
     setShowModal(true);
   };
 
@@ -147,6 +151,30 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
       setErrorMsg(err.message || 'Error saving supplier');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleDeleteSupplier = async (supplier) => {
+    if (!isAdmin || !supplier?.id) return;
+    const confirmed = window.confirm(
+      `Delete ${supplier.name}? This removes the supplier from the active directory and future RFQ matching, while preserving historical procurement records.`
+    );
+    if (!confirmed) return;
+
+    setDeletingSupplierId(supplier.id);
+    setErrorMsg('');
+    try {
+      await deleteSupplier(supplier.id);
+      if (editingSupplier?.id === supplier.id) {
+        setShowModal(false);
+        setEditingSupplier(null);
+      }
+      await refreshSuppliers();
+    } catch (err) {
+      console.error(err);
+      setErrorMsg(err.message || 'Failed to delete supplier');
+    } finally {
+      setDeletingSupplierId(null);
     }
   };
 
@@ -267,12 +295,25 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
                     <span className="notes-text">{supplier.notes || '-'}</span>
                   </td>
                   <td className="text-right">
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      onClick={() => openEditModal(supplier)}
-                    >
-                      <Edit2 size={16} /> Edit
-                    </button>
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.35rem' }}>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => openEditModal(supplier)}
+                      >
+                        <Edit2 size={16} /> Edit
+                      </button>
+                      {isAdmin && (
+                        <button
+                          className="btn btn-danger btn-sm"
+                          onClick={() => handleDeleteSupplier(supplier)}
+                          disabled={deletingSupplierId === supplier.id}
+                          title="Delete supplier"
+                        >
+                          <Trash2 size={16} />
+                          {deletingSupplierId === supplier.id ? 'Deleting...' : 'Delete'}
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -326,71 +367,123 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers }) 
                   <label className="form-label">
                     Categories * (Multi-select categories served)
                   </label>
-                  <div className="category-selection-grid">
-                    {categories.map((cat) => {
-                      const isSelected = selectedCategories.includes(cat);
-                      return (
-                        <button
-                          type="button"
-                          key={cat}
-                          onClick={() => toggleCategory(cat)}
-                          className={`category-toggle-chip ${
-                            isSelected ? 'selected' : ''
-                          }`}
-                        >
-                          <Tag size={14} />
-                          <span>{cat}</span>
-                          {isSelected && <Check size={14} />}
-                        </button>
-                      );
-                    })}
 
-                    {showCustomCatInput ? (
-                      <div className="custom-cat-inline-row" style={{ display: 'flex', gap: '0.4rem', marginTop: '0.4rem', width: '100%' }}>
-                        <input
-                          type="text"
-                          className="input-field"
-                          placeholder="Type custom category name..."
-                          value={customCatName}
-                          onChange={(e) => setCustomCatName(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') {
-                              e.preventDefault();
-                              handleCreateCustomCategory(e);
-                            }
-                          }}
-                          autoFocus
-                          style={{ flex: 1 }}
-                        />
-                        <button
-                          type="button"
-                          className="btn btn-primary btn-sm"
-                          onClick={handleCreateCustomCategory}
-                          disabled={creatingCat}
-                        >
-                          {creatingCat ? 'Adding...' : 'Add'}
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-sm"
-                          onClick={() => {
-                            setShowCustomCatInput(false);
-                            setCustomCatName('');
-                          }}
-                        >
-                          Cancel
-                        </button>
+                  <div style={{ position: 'relative' }}>
+                    <button
+                      type="button"
+                      className="input-field"
+                      onClick={() => setCategoryDropdownOpen((open) => !open)}
+                      style={{
+                        width: '100%',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        cursor: 'pointer',
+                        textAlign: 'left'
+                      }}
+                    >
+                      <span>
+                        {selectedCategories.length
+                          ? `${selectedCategories.length} categor${selectedCategories.length === 1 ? 'y' : 'ies'} selected`
+                          : 'Select categories'}
+                      </span>
+                      <ChevronDown size={16} />
+                    </button>
+
+                    {selectedCategories.length > 0 && (
+                      <div className="category-tag-group" style={{ marginTop: '0.5rem' }}>
+                        {selectedCategories.map((cat) => (
+                          <span key={cat} className="badge badge-category">
+                            {cat}
+                          </span>
+                        ))}
                       </div>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => setShowCustomCatInput(true)}
-                        className="category-toggle-chip"
-                        style={{ borderStyle: 'dashed', borderColor: 'var(--primary)', color: 'var(--primary)' }}
+                    )}
+
+                    {categoryDropdownOpen && (
+                      <div
+                        style={{
+                          position: 'absolute',
+                          zIndex: 20,
+                          top: '100%',
+                          left: 0,
+                          right: 0,
+                          marginTop: '0.35rem',
+                          maxHeight: '240px',
+                          overflowY: 'auto',
+                          background: 'var(--card-bg, #fff)',
+                          border: '1px solid var(--border-color, #d1d5db)',
+                          borderRadius: '8px',
+                          boxShadow: '0 10px 30px rgba(0,0,0,0.16)',
+                          padding: '0.4rem'
+                        }}
                       >
-                        <Plus size={14} />
-                        <span>+ Custom Category</span>
-                      </button>
+                        {categories.map((cat) => {
+                          const isSelected = selectedCategories.includes(cat);
+                          return (
+                            <button
+                              type="button"
+                              key={cat}
+                              onClick={() => toggleCategory(cat)}
+                              style={{
+                                width: '100%',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.5rem',
+                                padding: '0.55rem 0.6rem',
+                                border: 0,
+                                borderRadius: '6px',
+                                background: isSelected ? 'rgba(99, 102, 241, 0.12)' : 'transparent',
+                                cursor: 'pointer',
+                                textAlign: 'left'
+                              }}
+                            >
+                              <span style={{ width: 18 }}>{isSelected ? <Check size={15} /> : null}</span>
+                              <Tag size={14} />
+                              <span>{cat}</span>
+                            </button>
+                          );
+                        })}
+
+                        <div style={{ borderTop: '1px solid var(--border-color, #e5e7eb)', marginTop: '0.35rem', paddingTop: '0.4rem' }}>
+                          {showCustomCatInput ? (
+                            <div style={{ display: 'flex', gap: '0.4rem' }}>
+                              <input
+                                type="text"
+                                className="input-field"
+                                placeholder="Custom category..."
+                                value={customCatName}
+                                onChange={(e) => setCustomCatName(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    handleCreateCustomCategory(e);
+                                  }
+                                }}
+                                autoFocus
+                                style={{ flex: 1 }}
+                              />
+                              <button
+                                type="button"
+                                className="btn btn-primary btn-sm"
+                                onClick={handleCreateCustomCategory}
+                                disabled={creatingCat}
+                              >
+                                {creatingCat ? 'Adding...' : 'Add'}
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-sm"
+                              onClick={() => setShowCustomCatInput(true)}
+                              style={{ width: '100%', justifyContent: 'flex-start' }}
+                            >
+                              <Plus size={14} /> Add Custom Category
+                            </button>
+                          )}
+                        </div>
+                      </div>
                     )}
                   </div>
                 </div>
