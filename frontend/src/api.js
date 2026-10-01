@@ -350,7 +350,7 @@ export async function fetchCategories() {
 
   // Also collect any categories dynamically from suppliers table if present
   try {
-    const suppliersRes = await supabase.from('suppliers').select('category').eq('client_id', clientId);
+    const suppliersRes = await supabase.from('suppliers').select('category').eq('client_id', clientId).is('deleted_at', null);
     if (suppliersRes.data) {
       suppliersRes.data.forEach((s) => {
         if (Array.isArray(s.category)) {
