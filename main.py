@@ -1357,6 +1357,7 @@ async def execute_validated_action(
                         delivery_time=variants[0].get("delivery_time"),
                         quality_notes=variants[0].get("quality_notes"),
                         raw_message=quote_raw,
+                        source_message_id=context.source_message_id,
                     )
                     if persisted:
                         persisted_quotes = [persisted]
@@ -2708,6 +2709,81 @@ async def whatsapp_webhook(request: Request):
                     validation_reason=validation.reason,
                     execution_status="not_executed",
                 )
+
+            # Recover only the specific sequencing mistake where the model tried
+            # to negotiate a fresh supplier quote before persisting it. Routing
+            # must already be deterministic and the structured parser must have
+            # extracted a valid price. The corrected record_quote action then
+            # enters the existing quote-first negotiation pipeline.
+            quote_first_recovery = (
+                proposal.tool_name == "send_procurement_message"
+                and isinstance(validation.reason, str)
+                and validation.reason.startswith("Negotiation blocked:")
+                and matched_rfq_id
+                and commercial_parse
+            )
+            if quote_first_recovery:
+                parsed_price = ((commercial_parse.get("price") or {}).get("amount"))
+                parsed_delivery_days = ((commercial_parse.get("delivery") or {}).get("days"))
+                parsed_notes = ((commercial_parse.get("specification") or {}).get("alternative"))
+                if parsed_price is not None:
+                    recovery_args = {
+                        "rfq_id": matched_rfq_id,
+                        "variants": [{
+                            "variant_label": None,
+                            "price": parsed_price,
+                            "delivery_time": (
+                                f"{parsed_delivery_days} days"
+                                if parsed_delivery_days is not None
+                                else None
+                            ),
+                            "quality_notes": parsed_notes,
+                            "is_available": True,
+                        }],
+                    }
+                    recovery_proposal = ActionProposal(
+                        tool_name="record_quote",
+                        arguments=recovery_args,
+                        raw_message=message_text,
+                    )
+                    recovery_validation = validate_action(
+                        recovery_proposal,
+                        client_id=client_id,
+                        supplier_id=supplier["id"],
+                        context_rfqs=open_rfqs,
+                        matched_rfq_id=context.matched_rfq_id,
+                        pending_clarification=context.pending_clarification,
+                        input_origin="supplier",
+                        source_message_id=inbound_log_id,
+                    )
+                    if recovery_validation.is_valid:
+                        recovery_decision = db.record_agent_decision(
+                            client_id=client_id,
+                            origin="supplier",
+                            tool_name="record_quote",
+                            arguments=recovery_validation.sanitized_args,
+                            validation_status="approved",
+                            validation_reason=(
+                                "Policy correction: persisted supplier quote before negotiation."
+                            ),
+                            execution_status="pending",
+                            rfq_id=matched_rfq_id,
+                            supplier_id=supplier["id"],
+                            inbound_message_id=inbound_log_id,
+                        )
+                        recovery_decision_id = recovery_decision.get("id") if recovery_decision else None
+                        exec_res = await execute_validated_action(
+                            recovery_validation,
+                            context,
+                            message_text,
+                            supplier,
+                            client_id,
+                            decision_id=recovery_decision_id,
+                        )
+                        if msg_key_id:
+                            db.complete_webhook_message(client_id, msg_key_id)
+                        return exec_res
+
             db.flag_for_human_review(
                 client_id=client_id,
                 supplier_id=supplier["id"],
