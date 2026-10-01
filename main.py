@@ -613,6 +613,7 @@ def select_state_aware_routing_candidates(
     session_entry=None,
     active_session: Optional[dict] = None,
     conversation_history: Optional[list] = None,
+    incoming_message_text: str = "",
 ) -> dict:
     """
     Narrow RFQ candidates from trusted database state plus a routing-only message label.
@@ -631,7 +632,53 @@ def select_state_aware_routing_candidates(
             return str(rfq["id"])
         return None
 
-    if intent == "NEGOTIATION_REPLY" and session_entry:
+    # A terse numeric reply can be a direct answer to the agent's latest
+    # negotiation question even without words like "final" or "revised".
+    # Only use this continuity signal when the recent outbound message was
+    # negotiation-specific and the incoming reply is short enough that treating
+    # it as a complete first quote would be risky.
+    recent_negotiation_prompt = False
+    if session_entry and active_session:
+        session_rfq_id = str(active_session.get("rfq_id") or "")
+        negotiation_prompt_pattern = re.compile(
+            r"\b(?:could\s+you\s+do|can\s+you\s+do|improve\s+(?:the\s+)?(?:price|rate)|"
+            r"reduce\s+(?:the\s+)?(?:price|rate)|counter(?:offer)?|best\s+price|"
+            r"lower\s+(?:the\s+)?(?:price|rate)|meet\s+(?:us|you)\s+at|still\s+trying\s+to\s+improve)\b",
+            re.IGNORECASE,
+        )
+        for msg in reversed(conversation_history or []):
+            if not isinstance(msg, dict):
+                continue
+            if (
+                msg.get("direction") == "outbound"
+                and str(msg.get("related_rfq_id") or "") == session_rfq_id
+            ):
+                recent_negotiation_prompt = bool(
+                    negotiation_prompt_pattern.search(str(msg.get("body") or ""))
+                )
+                break
+
+    incoming = str(incoming_message_text or "").strip()
+    incoming_words = re.findall(r"[A-Za-z0-9.]+", incoming)
+    has_full_quote_detail = bool(
+        re.search(
+            r"\b(?:delivery|days?|weeks?|brand|spec|specification|qty|quantity|moq|"
+            r"per\s+(?:piece|unit|pc)|each)\b",
+            incoming,
+            re.IGNORECASE,
+        )
+    )
+    terse_continuation = (
+        recent_negotiation_prompt
+        and bool(incoming)
+        and len(incoming_words) <= 5
+        and not has_full_quote_detail
+    )
+
+    if terse_continuation and session_entry:
+        pool = [session_entry]
+        source = "conversation_context"
+    elif intent == "NEGOTIATION_REPLY" and session_entry:
         pool = [session_entry]
         source = "negotiation_session"
     elif intent == "NEW_QUOTE":
@@ -2530,6 +2577,7 @@ async def whatsapp_webhook(request: Request):
                     session_entry=session_entry,
                     active_session=active_session,
                     conversation_history=conv_history,
+                    incoming_message_text=message_text,
                 )
                 open_rfqs = routing_result["candidates"]
                 matched_rfq_id = routing_result.get("matched_rfq_id")
