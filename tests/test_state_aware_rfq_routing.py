@@ -149,3 +149,55 @@ def test_incompatible_classifier_state_falls_back_to_unknown_instead_of_forcing(
     assert result["routing_intent"] == "UNKNOWN"
     assert result["candidates"] == [quoted]
     assert result["matched_rfq_id"] == "PVC PIPE"
+
+
+def test_terse_reply_follows_recent_active_negotiation_context():
+    negotiating = make_entry("PVC PIPE", status="responded")
+    unanswered = make_entry("COPPER PIPE", status="sent")
+
+    result = main.select_state_aware_routing_candidates(
+        routing_intent="NEW_QUOTE",
+        all_open_rfqs=[negotiating, unanswered],
+        unanswered_rfqs=[unanswered],
+        responded_rfqs=[negotiating],
+        session_entry=negotiating,
+        active_session={"rfq_id": "PVC PIPE", "status": "active"},
+        conversation_history=[
+            {
+                "direction": "outbound",
+                "related_rfq_id": "PVC PIPE",
+                "body": "We're still trying to improve the rate. Could you do AED 48 per piece?",
+            }
+        ],
+        incoming_message_text="50",
+    )
+
+    assert result["candidates"] == [negotiating]
+    assert result["matched_rfq_id"] == "PVC PIPE"
+    assert result["match_source"] == "conversation_context"
+
+
+def test_full_new_quote_does_not_get_stolen_by_old_negotiation_context():
+    negotiating = make_entry("PVC PIPE", status="responded")
+    unanswered = make_entry("COPPER PIPE", status="sent")
+
+    result = main.select_state_aware_routing_candidates(
+        routing_intent="NEW_QUOTE",
+        all_open_rfqs=[negotiating, unanswered],
+        unanswered_rfqs=[unanswered],
+        responded_rfqs=[negotiating],
+        session_entry=negotiating,
+        active_session={"rfq_id": "PVC PIPE", "status": "active"},
+        conversation_history=[
+            {
+                "direction": "outbound",
+                "related_rfq_id": "PVC PIPE",
+                "body": "We're still trying to improve the rate. Could you do AED 48 per piece?",
+            }
+        ],
+        incoming_message_text="72 AED per piece, delivery in 2 days",
+    )
+
+    assert result["candidates"] == [unanswered]
+    assert result["matched_rfq_id"] == "COPPER PIPE"
+    assert result["match_source"] == "routing_new_quote"
