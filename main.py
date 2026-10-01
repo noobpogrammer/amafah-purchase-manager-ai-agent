@@ -2696,6 +2696,7 @@ async def whatsapp_webhook(request: Request):
             matched_rfq_id=context.matched_rfq_id,
             pending_clarification=context.pending_clarification,
             input_origin="supplier",
+            source_message_id=inbound_log_id,
         )
 
         if not validation.is_valid:
