@@ -3760,6 +3760,29 @@ async def get_rfq_activity_endpoint(rfq_id: str, current_user=Depends(get_curren
     }
 
 
+@app.delete("/admin/suppliers/{supplier_id}")
+async def delete_supplier_endpoint(
+    supplier_id: str,
+    current_user=Depends(get_current_user),
+):
+    """Admin-only soft delete of a supplier contact for the current tenant."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=400, detail="User has no associated client_id")
+
+    deleted = db.soft_delete_supplier(supplier_id, client_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Supplier not found or already deleted")
+
+    return {
+        "status": "deleted",
+        "supplier_id": supplier_id,
+    }
+
+
 @app.get("/admin/delivery-issues")
 async def get_delivery_issues_endpoint(
     page: int = 1,
