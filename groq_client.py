@@ -392,6 +392,7 @@ class CommercialTradeoffInfo(BaseModel):
 
 class CommercialParseResult(BaseModel):
     intent: str = "other"  # "quote_update", "conditional_offer", "clarification", "rejection", "final_offer", "availability_update", "other"
+    routing_intent: Literal["NEW_QUOTE", "REVISION", "NEGOTIATION_REPLY", "UNKNOWN"] = "UNKNOWN"
     price: Optional[CommercialPriceInfo] = None
     delivery: Optional[CommercialDeliveryInfo] = None
     quantity: Optional[CommercialQuantityInfo] = None
@@ -414,6 +415,7 @@ Only extract the exact factual meaning from the message.
 Output MUST be a single valid JSON object matching this schema:
 {
   "intent": "quote_update" | "conditional_offer" | "clarification" | "rejection" | "final_offer" | "availability_update" | "other",
+  "routing_intent": "NEW_QUOTE" | "REVISION" | "NEGOTIATION_REPLY" | "UNKNOWN",
   "price": {
     "amount": float or null,
     "currency": "AED" or null,
@@ -453,6 +455,11 @@ RULES:
 7. If the supplier mentions a specific product name (e.g. "TEST COPPER PIPE", "pvc pipe"), extract it into explicit_product_reference.
 8. If currency is not specified, default currency to "AED".
 9. Validate data: negative prices, impossible delivery days (> 365) are invalid.
+10. routing_intent is ONLY a routing signal. It must never select an RFQ ID.
+11. Use routing_intent="NEW_QUOTE" for a standalone first-quote style message that gives commercial terms without revision/counter language (e.g. "72 AED, delivery 2 days").
+12. Use routing_intent="REVISION" when the supplier explicitly signals an update to an earlier quote (e.g. "revised price", "updated quote", "new rate", "new price", "lower it to").
+13. Use routing_intent="NEGOTIATION_REPLY" for a clear response to bargaining/counteroffer language (e.g. "I can do 50", "50 final", "best I can do is 50", "cannot go lower than 50", "deal", "can't accept that").
+14. Use routing_intent="UNKNOWN" when the message type is genuinely ambiguous. Prefer UNKNOWN over guessing.
 """
 
 
@@ -583,7 +590,33 @@ def _fallback_parse_commercial_message(message_text: str, candidate_rfqs: Option
         if res.intent == "quote_update":
             res.intent = "final_offer"
 
-    # 8. Explicit product reference check
+    # 8. Routing-only intent classification.
+    # This never chooses an RFQ. It only helps deterministic routing narrow the
+    # database-backed candidate set in main.py.
+    revision_signal = re.search(
+        r"\b(?:revised|revision|updated\s+(?:quote|price|rate)|new\s+(?:quote|price|rate)|"
+        r"our\s+new\s+rate|changed\s+(?:price|rate)|lower(?:ed)?\s+(?:it\s+)?to)\b",
+        text,
+        re.I,
+    )
+    negotiation_signal = re.search(
+        r"\b(?:i\s+can\s+do|we\s+can\s+do|can\s+do|best\s+(?:i|we)\s+can\s+do|"
+        r"best\s+price|best\s+and\s+final|final(?:\s+(?:price|offer))?|\d+(?:\.\d+)?\s+final|"
+        r"cannot\s+go\s+lower|can't\s+go\s+lower|can(?:not|'t)\s+accept|deal|meet\s+you\s+at)\b",
+        text,
+        re.I,
+    )
+
+    if revision_signal:
+        res.routing_intent = "REVISION"
+    elif negotiation_signal:
+        res.routing_intent = "NEGOTIATION_REPLY"
+    elif price_val is not None or deliv_days is not None or res.intent in {"quote_update", "conditional_offer"}:
+        res.routing_intent = "NEW_QUOTE"
+    else:
+        res.routing_intent = "UNKNOWN"
+
+    # 9. Explicit product reference check
     if candidate_rfqs:
         for entry in candidate_rfqs:
             r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
@@ -638,6 +671,15 @@ def parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] =
             if result.quantity and result.quantity.value is not None:
                 if result.quantity.value <= 0:
                     result.quantity.value = None
+
+            # Deterministic wording evidence outranks the model for routing type.
+            # The model remains useful only when explicit revision/negotiation
+            # language does not resolve the message type.
+            deterministic = _fallback_parse_commercial_message(message_text, candidate_rfqs)
+            if deterministic.routing_intent in {"REVISION", "NEGOTIATION_REPLY"}:
+                result.routing_intent = deterministic.routing_intent
+            elif result.routing_intent not in {"NEW_QUOTE", "REVISION", "NEGOTIATION_REPLY", "UNKNOWN"}:
+                result.routing_intent = "UNKNOWN"
 
             return result.model_dump()
     except Exception as e:
