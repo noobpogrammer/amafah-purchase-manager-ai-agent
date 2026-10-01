@@ -2365,6 +2365,36 @@ def mark_message_unknown(message_log_id: str, error_message: str) -> bool:
         return False
 
 
+def get_initial_rfq_delivery_status(rfq_id: str, supplier_id: str) -> Optional[dict]:
+    """Return the earliest outbound message_log row for this supplier/RFQ.
+
+    The initial RFQ invitation's delivery lifecycle is authoritative for whether
+    reminders may be sent. Returns None if no outbound row exists.
+    """
+    if not rfq_id or not supplier_id:
+        return None
+    try:
+        res = (
+            supabase.table("message_log")
+            .select("id, status, sent_at, error_message, created_at")
+            .eq("related_rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .eq("direction", "outbound")
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as ex:
+        logger.warning(
+            "get_initial_rfq_delivery_status error for rfq %s supplier %s: %s",
+            rfq_id,
+            supplier_id,
+            ex,
+        )
+        return None
+
+
 def get_queued_outbound_messages() -> list[dict]:
     """
     Fetches all outbound messages currently in 'queued' status on startup.

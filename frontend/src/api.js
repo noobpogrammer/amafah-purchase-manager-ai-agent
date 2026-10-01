@@ -169,19 +169,48 @@ export async function fetchRFQs() {
 }
 
 export async function fetchRFQDetail(rfqId) {
-  const [rfqRes, suppliersRes, quotesRes, rankingRes, constraintsRes] = await Promise.all([
+  const [rfqRes, suppliersRes, quotesRes, rankingRes, constraintsRes, deliveryRes] = await Promise.all([
     supabase.from('rfqs').select('*').eq('id', rfqId).single(),
     supabase.from('rfq_suppliers').select('*, suppliers(*)').eq('rfq_id', rfqId),
     supabase.from('quotes').select('*, suppliers(name)').eq('rfq_id', rfqId),
     supabase.from('rfq_rankings').select('*').eq('rfq_id', rfqId).order('created_at', { ascending: false }).limit(1),
     supabase.from('rfq_negotiation_constraints').select('*').eq('rfq_id', rfqId),
+    supabase
+      .from('message_log')
+      .select('id, supplier_id, status, sent_at, error_message, created_at')
+      .eq('related_rfq_id', rfqId)
+      .eq('direction', 'outbound')
+      .order('created_at', { ascending: true }),
   ]);
 
   if (rfqRes.error) throw rfqRes.error;
+  if (suppliersRes.error) throw suppliersRes.error;
+  if (deliveryRes.error) throw deliveryRes.error;
+
+  // The first outbound message for a supplier/RFQ is the initial RFQ invitation.
+  // Its persistent delivery lifecycle is authoritative for whether WhatsApp
+  // actually accepted the RFQ message.
+  const initialDeliveryBySupplier = {};
+  (deliveryRes.data || []).forEach((msg) => {
+    if (msg.supplier_id && !initialDeliveryBySupplier[msg.supplier_id]) {
+      initialDeliveryBySupplier[msg.supplier_id] = msg;
+    }
+  });
+
+  const suppliers = (suppliersRes.data || []).map((item) => {
+    const delivery = initialDeliveryBySupplier[item.supplier_id] || null;
+    return {
+      ...item,
+      delivery_status: delivery?.status || null,
+      delivery_sent_at: delivery?.sent_at || null,
+      delivery_error: delivery?.error_message || null,
+      delivery_message_log_id: delivery?.id || null,
+    };
+  });
 
   return {
     rfq: rfqRes.data,
-    suppliers: suppliersRes.data || [],
+    suppliers,
     quotes: quotesRes.data || [],
     ranking: rankingRes.data?.[0] || null,
     constraints: constraintsRes.data || [],
