@@ -894,27 +894,10 @@ def update_message_related_rfq(message_id: str, rfq_id: str):
         return None
 
 
-def get_quotes_for_rfq(rfq_id: str, include_unavailable: bool = False) -> list:
-    """
-    Returns one current effective commercial offer per supplier + variant_label.
-
-    Quote rows remain immutable history. The newest revision provides the current
-    price/availability, while omitted commercial terms (delivery_time and
-    quality_notes) inherit from the most recent older revision for the same
-    supplier + variant. This lets terse revisions such as "70.9" update price
-    without erasing previously agreed delivery/quality terms.
-    """
-    res = (
-        supabase.table("quotes")
-        .select("*, suppliers(name)")
-        .eq("rfq_id", rfq_id)
-        .order("created_at", desc=True)
-        .order("id", desc=True)
-        .execute()
-    )
-
+def _build_effective_quotes_from_history(rows: list[dict], include_unavailable: bool = False) -> list[dict]:
+    """Collapse immutable quote history into current effective supplier offers."""
     grouped = {}
-    for q in (res.data or []):
+    for q in (rows or []):
         supplier_id = q.get("supplier_id")
         if not supplier_id:
             continue
@@ -926,10 +909,9 @@ def get_quotes_for_rfq(rfq_id: str, include_unavailable: bool = False) -> list:
         if not history:
             continue
 
+        # Caller provides newest-first rows.
         latest = dict(history[0])
 
-        # Carry forward unchanged terms from prior revisions. Do not invent terms:
-        # only use values that were actually persisted earlier for this supplier/RFQ.
         if not latest.get("delivery_time"):
             prior_delivery = next(
                 (row.get("delivery_time") for row in history[1:] if row.get("delivery_time")),
@@ -961,6 +943,27 @@ def get_quotes_for_rfq(rfq_id: str, include_unavailable: bool = False) -> list:
     )
     return effective_quotes
 
+
+def get_quotes_for_rfq(rfq_id: str, include_unavailable: bool = False) -> list:
+    """
+    Returns one current effective commercial offer per supplier + variant_label.
+
+    Quote rows remain immutable history. The newest revision provides the current
+    price/availability, while omitted commercial terms inherit from the most
+    recent older revision for that same supplier + variant.
+    """
+    res = (
+        supabase.table("quotes")
+        .select("*, suppliers(name)")
+        .eq("rfq_id", rfq_id)
+        .order("created_at", desc=True)
+        .order("id", desc=True)
+        .execute()
+    )
+    return _build_effective_quotes_from_history(
+        res.data or [],
+        include_unavailable=include_unavailable,
+    )
 
 def get_all_quotes_for_rfq(rfq_id: str) -> list:
     """Returns all historical quotes for an RFQ in chronological order (created_at asc)."""
