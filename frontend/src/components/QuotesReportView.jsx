@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { fetchRFQs, fetchRFQDetail, triggerAIRanking, formatRfqDropdownLabel } from '../api';
-import { Sparkles, Trophy, CheckCircle, BarChart3, AlertCircle, Clock } from 'lucide-react';
+import { Sparkles, Trophy, CheckCircle, BarChart3, AlertCircle, Clock, ChevronDown, ChevronUp } from 'lucide-react';
 
 const formatCurrencyInText = (text) => {
   if (!text || typeof text !== 'string') return text;
@@ -12,6 +12,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
   const [reportData, setReportData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [rankingLoading, setRankingLoading] = useState(false);
+  const [showQuoteHistory, setShowQuoteHistory] = useState(false);
 
   useEffect(() => {
     async function loadRFQsList() {
@@ -66,6 +67,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
 
   const currentRfq = reportData?.rfq;
   const quotes = reportData?.quotes || [];
+  const quoteHistory = reportData?.quoteHistory || [];
   const ranking = reportData?.ranking;
 
   const getSupplierName = (supplierId) => {
@@ -181,7 +183,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
             <div className="card-header flex-between">
               <h4 className="card-title flex-items">
                 <BarChart3 size={18} />
-                <span>Received Quotes & Variants ({quotes.length})</span>
+                <span>Current Supplier Offers ({quotes.length})</span>
               </h4>
             </div>
 
@@ -229,7 +231,14 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                         <td>
                           <span className="price-tag-large">AED {q.price}</span>
                         </td>
-                        <td>{q.delivery_time || 'Not specified'}</td>
+                        <td>
+                          {q.delivery_time || 'Not specified'}
+                          {q.delivery_inherited && (
+                            <span style={{ marginLeft: '0.35rem', color: 'var(--text-muted)', fontSize: '0.78rem' }}>
+                              (carried forward)
+                            </span>
+                          )}
+                        </td>
                         <td>{q.quality_notes || 'Standard'}</td>
                         <td>
                           <span className="badge badge-history">Insufficient history</span>
@@ -244,6 +253,52 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
               </table>
             )}
           </div>
+
+          {quoteHistory.length > quotes.length && (
+            <div className="card">
+              <div className="card-header flex-between">
+                <div>
+                  <h4 className="card-title">Quote Revision History</h4>
+                  <p className="report-sub" style={{ marginTop: '0.25rem' }}>
+                    Historical supplier revisions are kept for audit, but only the current effective offer is used for comparison.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => setShowQuoteHistory((open) => !open)}
+                >
+                  {showQuoteHistory ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                  {showQuoteHistory ? 'Hide History' : `View History (${quoteHistory.length})`}
+                </button>
+              </div>
+
+              {showQuoteHistory && (
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Supplier</th>
+                      <th>Quoted Price</th>
+                      <th>Delivery Time</th>
+                      <th>Raw WhatsApp Reply</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {quoteHistory.map((q) => (
+                      <tr key={q.id}>
+                        <td>{q.suppliers?.name || 'Supplier'}</td>
+                        <td>AED {q.price}</td>
+                        <td>{q.delivery_time || 'Not specified'}</td>
+                        <td className="raw-msg-cell">
+                          <span className="raw-msg-text">"{q.raw_message}"</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
 
           {/* AI Ranking Breakdown */}
           {ranking?.ranking_json?.ranking && (
