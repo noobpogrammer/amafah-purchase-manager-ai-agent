@@ -165,17 +165,43 @@ export default function RFQDetailView({
     setExpandedEvents((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
-  const getSupplierStatusBadge = (status) => {
-    switch (status) {
-      case 'responded':
-        return <span className="badge badge-status responded"><CheckCircle size={12} /> Responded</span>;
-      case 'clarifying':
-        return <span className="badge badge-status clarifying"><HelpCircle size={12} /> Clarifying</span>;
-      case 'no_response':
-        return <span className="badge badge-status no-response"><AlertCircle size={12} /> No Response</span>;
+  const getSupplierStatusBadge = (item) => {
+    const businessStatus = item?.status;
+    const deliveryStatus = item?.delivery_status;
+
+    // Once a supplier has replied, that response state is more meaningful than
+    // the initial outbound delivery lifecycle.
+    if (businessStatus === 'responded') {
+      return <span className="badge badge-status responded"><CheckCircle size={12} /> Responded</span>;
+    }
+    if (businessStatus === 'clarifying') {
+      return <span className="badge badge-status clarifying"><HelpCircle size={12} /> Clarifying</span>;
+    }
+    if (businessStatus === 'no_response') {
+      return <span className="badge badge-status no-response"><AlertCircle size={12} /> No Response</span>;
+    }
+
+    switch (deliveryStatus) {
+      case 'failed':
+        return (
+          <span className="badge badge-status no-response" title={item?.delivery_error || 'WhatsApp send failed'}>
+            <XCircle size={12} /> Failed
+          </span>
+        );
+      case 'unknown':
+        return (
+          <span className="badge badge-status clarifying" title={item?.delivery_error || 'WhatsApp delivery could not be confirmed'}>
+            <AlertCircle size={12} /> Delivery Unconfirmed
+          </span>
+        );
+      case 'sending':
+        return <span className="badge badge-status sent"><Send size={12} /> Sending</span>;
+      case 'queued':
+        return <span className="badge badge-status sent"><Clock size={12} /> Queued</span>;
       case 'sent':
+        return <span className="badge badge-status responded"><CheckCircle size={12} /> Sent</span>;
       default:
-        return <span className="badge badge-status sent"><Clock size={12} /> Sent / Pending</span>;
+        return <span className="badge badge-status sent"><Clock size={12} /> Awaiting Send</span>;
     }
   };
 
@@ -513,8 +539,12 @@ export default function RFQDetailView({
                               <tr key={item.id}>
                                 <td><strong>{supp?.name || 'Supplier'}</strong></td>
                                 <td>{supp?.phone_number}</td>
-                                <td>{getSupplierStatusBadge(item.status)}</td>
-                                <td>{new Date(item.sent_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td>
+                                <td>{getSupplierStatusBadge(item)}</td>
+                                <td>
+                                  {item.delivery_sent_at
+                                    ? new Date(item.delivery_sent_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                                    : '-'}
+                                </td>
                                 <td>{item.reminder_count} reminders</td>
                               </tr>
                             );
