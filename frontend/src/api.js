@@ -77,6 +77,7 @@ export async function fetchSuppliers() {
     .from('suppliers')
     .select('*')
     .eq('client_id', clientId)
+    .is('deleted_at', null)
     .order('created_at', { ascending: false });
   if (error) throw error;
   return data;
@@ -99,6 +100,17 @@ export async function createSupplier(payload) {
     .select();
   if (error) throw error;
   return data[0];
+}
+
+export async function deleteSupplier(id) {
+  const response = await authorizedFetch(`/admin/suppliers/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Failed to delete supplier');
+  }
+  return await response.json();
 }
 
 export async function updateSupplier(id, payload) {
