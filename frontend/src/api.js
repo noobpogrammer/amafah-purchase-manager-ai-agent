@@ -184,7 +184,7 @@ export async function fetchRFQDetail(rfqId) {
   const [rfqRes, suppliersRes, quotesRes, rankingRes, constraintsRes, deliveryRes] = await Promise.all([
     supabase.from('rfqs').select('*').eq('id', rfqId).single(),
     supabase.from('rfq_suppliers').select('*, suppliers(*)').eq('rfq_id', rfqId),
-    supabase.from('quotes').select('*, suppliers(name)').eq('rfq_id', rfqId),
+    supabase.from('quotes').select('*, suppliers(name)').eq('rfq_id', rfqId).order('created_at', { ascending: false }).order('id', { ascending: false }),
     supabase.from('rfq_rankings').select('*').eq('rfq_id', rfqId).order('created_at', { ascending: false }).limit(1),
     supabase.from('rfq_negotiation_constraints').select('*').eq('rfq_id', rfqId),
     supabase
@@ -220,10 +220,53 @@ export async function fetchRFQDetail(rfqId) {
     };
   });
 
+  // Keep immutable quote history, but expose only one current effective offer
+  // per supplier + variant to comparison/ranking UI. A terse revision that only
+  // changes price inherits previously persisted delivery/quality terms.
+  const quoteHistory = quotesRes.data || [];
+  const groupedQuotes = new Map();
+
+  quoteHistory.forEach((quote) => {
+    if (!quote?.supplier_id) return;
+    const variantKey = (quote.variant_label || '').trim().toLowerCase();
+    const key = `${quote.supplier_id}::${variantKey}`;
+    if (!groupedQuotes.has(key)) groupedQuotes.set(key, []);
+    groupedQuotes.get(key).push(quote);
+  });
+
+  const effectiveQuotes = [];
+  groupedQuotes.forEach((history) => {
+    if (!history.length) return;
+    const latest = { ...history[0] };
+
+    if (!latest.delivery_time) {
+      const prior = history.slice(1).find((q) => q.delivery_time);
+      if (prior) {
+        latest.delivery_time = prior.delivery_time;
+        latest.delivery_inherited = true;
+      }
+    }
+
+    if (!latest.quality_notes) {
+      const prior = history.slice(1).find((q) => q.quality_notes);
+      if (prior) {
+        latest.quality_notes = prior.quality_notes;
+        latest.quality_notes_inherited = true;
+      }
+    }
+
+    latest.revision_count = history.length;
+
+    if (latest.is_available !== false && latest.price !== null && latest.price !== undefined) {
+      effectiveQuotes.push(latest);
+    }
+  });
+
   return {
     rfq: rfqRes.data,
     suppliers,
-    quotes: quotesRes.data || [],
+    quotes: effectiveQuotes,
+    quoteHistory,
     ranking: rankingRes.data?.[0] || null,
     constraints: constraintsRes.data || [],
   };
