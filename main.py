@@ -2710,44 +2710,43 @@ async def whatsapp_webhook(request: Request):
                     execution_status="not_executed",
                 )
 
-            # Recover only the specific sequencing mistake where the model tried
-            # to negotiate a fresh supplier quote before persisting it. Routing
-            # must already be deterministic and the structured parser must have
-            # extracted a valid price. The corrected record_quote action then
-            # enters the existing quote-first negotiation pipeline.
-            quote_first_recovery = (
-                proposal.tool_name == "send_procurement_message"
-                and isinstance(validation.reason, str)
-                and validation.reason.startswith("Negotiation blocked:")
+            # One controlled validator-guided repair attempt for recoverable
+            # sequencing/prerequisite failures. The Policy Validator remains
+            # authoritative: the model only proposes a corrected next tool call.
+            recoverable_policy_rejection = (
+                isinstance(validation.reason, str)
+                and (
+                    validation.reason.startswith("Negotiation blocked:")
+                    or (
+                        proposal.tool_name == "negotiate_price"
+                        and "does not match trusted effective quote price" in validation.reason
+                    )
+                )
                 and matched_rfq_id
-                and commercial_parse
             )
-            if quote_first_recovery:
-                parsed_price = ((commercial_parse.get("price") or {}).get("amount"))
-                parsed_delivery_days = ((commercial_parse.get("delivery") or {}).get("days"))
-                parsed_notes = ((commercial_parse.get("specification") or {}).get("alternative"))
-                if parsed_price is not None:
-                    recovery_args = {
-                        "rfq_id": matched_rfq_id,
-                        "variants": [{
-                            "variant_label": None,
-                            "price": parsed_price,
-                            "delivery_time": (
-                                f"{parsed_delivery_days} days"
-                                if parsed_delivery_days is not None
-                                else None
-                            ),
-                            "quality_notes": parsed_notes,
-                            "is_available": True,
-                        }],
-                    }
-                    recovery_proposal = ActionProposal(
-                        tool_name="record_quote",
-                        arguments=recovery_args,
+
+            if recoverable_policy_rejection:
+                try:
+                    repaired = groq_client.reason_with_validator_feedback(
+                        message_text=message_text,
+                        context=context,
+                        rejected_tool_name=proposal.tool_name,
+                        rejected_arguments=proposal.arguments,
+                        validator_reason=validation.reason,
+                        input_origin="supplier",
+                    )
+                    repaired_tool = repaired.get("tool_name", "")
+                    repaired_args = dict(repaired.get("arguments", {}))
+                    if repaired_tool in ("record_quote", "negotiate_price") and not repaired_args.get("rfq_id"):
+                        repaired_args["rfq_id"] = matched_rfq_id
+
+                    repaired_proposal = ActionProposal(
+                        tool_name=repaired_tool,
+                        arguments=repaired_args,
                         raw_message=message_text,
                     )
-                    recovery_validation = validate_action(
-                        recovery_proposal,
+                    repaired_validation = validate_action(
+                        repaired_proposal,
                         client_id=client_id,
                         supplier_id=supplier["id"],
                         context_rfqs=open_rfqs,
@@ -2756,33 +2755,49 @@ async def whatsapp_webhook(request: Request):
                         input_origin="supplier",
                         source_message_id=inbound_log_id,
                     )
-                    if recovery_validation.is_valid:
-                        recovery_decision = db.record_agent_decision(
-                            client_id=client_id,
-                            origin="supplier",
-                            tool_name="record_quote",
-                            arguments=recovery_validation.sanitized_args,
-                            validation_status="approved",
-                            validation_reason=(
-                                "Policy correction: persisted supplier quote before negotiation."
-                            ),
-                            execution_status="pending",
-                            rfq_id=matched_rfq_id,
-                            supplier_id=supplier["id"],
-                            inbound_message_id=inbound_log_id,
-                        )
-                        recovery_decision_id = recovery_decision.get("id") if recovery_decision else None
+
+                    repaired_decision = db.record_agent_decision(
+                        client_id=client_id,
+                        origin="supplier",
+                        tool_name=repaired_proposal.tool_name,
+                        arguments=repaired_proposal.arguments,
+                        validation_status="approved" if repaired_validation.is_valid else "rejected",
+                        validation_reason=(
+                            "Validator-guided one-shot repair."
+                            if repaired_validation.is_valid
+                            else repaired_validation.reason
+                        ),
+                        execution_status="pending" if repaired_validation.is_valid else "not_executed",
+                        rfq_id=repaired_proposal.arguments.get("rfq_id") or matched_rfq_id,
+                        supplier_id=supplier["id"],
+                        inbound_message_id=inbound_log_id,
+                    )
+                    repaired_decision_id = repaired_decision.get("id") if repaired_decision else None
+
+                    if repaired_validation.is_valid:
                         exec_res = await execute_validated_action(
-                            recovery_validation,
+                            repaired_validation,
                             context,
                             message_text,
                             supplier,
                             client_id,
-                            decision_id=recovery_decision_id,
+                            decision_id=repaired_decision_id,
                         )
                         if msg_key_id:
                             db.complete_webhook_message(client_id, msg_key_id)
                         return exec_res
+
+                    logger.warning(
+                        "Validator-guided repair rejected for RFQ %s: %s",
+                        matched_rfq_id,
+                        repaired_validation.reason,
+                    )
+                except Exception as repair_err:
+                    logger.warning(
+                        "Validator-guided repair failed for RFQ %s: %s",
+                        matched_rfq_id,
+                        repair_err,
+                    )
 
             db.flag_for_human_review(
                 client_id=client_id,
