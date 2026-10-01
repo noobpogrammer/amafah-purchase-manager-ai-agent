@@ -342,3 +342,101 @@ class TestPhase5PolicyValidator:
             flag_args = mock_flag.call_args.kwargs
             assert "Policy Validator rejection" in flag_args["reason"]
             mock_enqueue.assert_called_once_with("923362853198", main.HUMAN_ACK_MSG, message_log_id=mock_log.return_value)
+
+
+class TestPersistedQuoteBeforeNegotiation:
+    @staticmethod
+    def _context():
+        rfq = {
+            "id": "rfq-quote-gate",
+            "client_id": "client-1",
+            "status": "active",
+            "due_by": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+        }
+        return [{
+            "id": "rs-quote-gate",
+            "rfq_id": "rfq-quote-gate",
+            "supplier_id": "supp-1",
+            "status": "sent",
+            "rfqs": rfq,
+        }]
+
+    def test_negotiation_message_is_blocked_until_current_inbound_quote_is_persisted(self, mock_supabase):
+        quotes_query = MagicMock()
+        mock_supabase.table.return_value = quotes_query
+        quotes_query.select.return_value.eq.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value = MagicMock(data=[])
+
+        proposal = ActionProposal(
+            tool_name="send_procurement_message",
+            arguments={
+                "rfq_id": "rfq-quote-gate",
+                "message": "Thank you for the quote. Could you please consider AED 70 per piece?",
+            },
+            raw_message="72 AED per piece, delivery in 2 days",
+        )
+
+        result = validate_action(
+            proposal=proposal,
+            client_id="client-1",
+            supplier_id="supp-1",
+            context_rfqs=self._context(),
+            matched_rfq_id="rfq-quote-gate",
+            input_origin="supplier",
+            source_message_id="inbound-msg-1",
+        )
+
+        assert result.is_valid is False
+        assert "record_quote first" in result.reason
+        assert "negotiate_price" in result.reason
+
+    def test_generic_negotiation_message_cannot_bypass_negotiate_price_after_quote_exists(self, mock_supabase):
+        quotes_query = MagicMock()
+        mock_supabase.table.return_value = quotes_query
+        quotes_query.select.return_value.eq.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value = MagicMock(
+            data=[{"id": "quote-1"}]
+        )
+
+        proposal = ActionProposal(
+            tool_name="send_procurement_message",
+            arguments={
+                "rfq_id": "rfq-quote-gate",
+                "message": "Could you please reduce the price to AED 70 per piece?",
+            },
+            raw_message="72 AED per piece, delivery in 2 days",
+        )
+
+        result = validate_action(
+            proposal=proposal,
+            client_id="client-1",
+            supplier_id="supp-1",
+            context_rfqs=self._context(),
+            matched_rfq_id="rfq-quote-gate",
+            input_origin="supplier",
+            source_message_id="inbound-msg-1",
+        )
+
+        assert result.is_valid is False
+        assert "must use the validated negotiate_price action" in result.reason
+
+    def test_non_negotiation_procurement_message_still_allowed(self, mock_supabase):
+        proposal = ActionProposal(
+            tool_name="send_procurement_message",
+            arguments={
+                "rfq_id": "rfq-quote-gate",
+                "message": "Thank you. We have received your message and will review it.",
+            },
+            raw_message="Checking availability now",
+        )
+
+        result = validate_action(
+            proposal=proposal,
+            client_id="client-1",
+            supplier_id="supp-1",
+            context_rfqs=self._context(),
+            matched_rfq_id="rfq-quote-gate",
+            input_origin="supplier",
+            source_message_id="inbound-msg-1",
+        )
+
+        assert result.is_valid is True
+        assert result.action == "send_procurement_message"
