@@ -499,3 +499,64 @@ class TestStartupRecovery:
                     supplier_id="sup-1",
                     message_log_id="rec-1",
                 )
+
+
+class TestInitialRfqDeliveryGuardrail:
+    def test_initial_delivery_lookup_returns_earliest_outbound_row(self):
+        with patch.object(db.supabase, "table") as mock_table:
+            query = MagicMock()
+            mock_table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = MagicMock(
+                data=[{
+                    "id": "initial-msg",
+                    "status": "sent",
+                    "sent_at": "2026-10-01T12:00:00+00:00",
+                    "error_message": None,
+                    "created_at": "2026-10-01T11:59:59+00:00",
+                }]
+            )
+
+            result = db.get_initial_rfq_delivery_status("rfq-1", "sup-1")
+
+        assert result["id"] == "initial-msg"
+        assert result["status"] == "sent"
+
+    @pytest.mark.asyncio
+    async def test_scheduler_does_not_send_reminder_when_initial_delivery_failed(self):
+        item = {
+            "id": "rfq-supplier-1",
+            "status": "sent",
+            "sent_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+            "reminder_count": 0,
+            "rfqs": {
+                "id": "rfq-1",
+                "client_id": "client-1",
+                "product_name": "PVC PIPE",
+                "status": "active",
+                "deadline_hours": 3,
+                "due_by": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            },
+            "suppliers": {
+                "id": "sup-1",
+                "client_id": "client-1",
+                "name": "Supplier",
+                "phone_number": "971500000001",
+            },
+        }
+
+        with patch("db.get_active_rfqs_past_deadline", return_value=[]), \
+             patch("db.get_rfqs_pending_finalization_recovery", return_value=[]), \
+             patch("db.get_active_rfq_suppliers_with_deadlines", return_value=[item]), \
+             patch("db.get_initial_rfq_delivery_status", return_value={
+                 "id": "msg-initial",
+                 "status": "failed",
+                 "sent_at": None,
+                 "error_message": "HTTP 400",
+             }), \
+             patch("db.log_message") as mock_log, \
+             patch("db.update_rfq_supplier_reminder") as mock_reminder, \
+             patch("main.enqueue_message", new_callable=AsyncMock) as mock_enqueue:
+            await main.check_deadlines_and_reminders()
+
+        mock_log.assert_not_called()
+        mock_reminder.assert_not_called()
+        mock_enqueue.assert_not_awaited()
