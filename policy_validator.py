@@ -55,6 +55,53 @@ HIGH_RISK_ACTIONS = {
 }
 
 
+_NEGOTIATION_MESSAGE_PATTERN = re.compile(
+    r"\b(?:counter\s*offer|counteroffer|could\s+you\s+(?:please\s+)?(?:do|consider|reduce)|"
+    r"can\s+you\s+(?:please\s+)?(?:do|consider|reduce)|please\s+(?:consider|reduce)|"
+    r"reduce\s+(?:the\s+)?price|lower\s+(?:the\s+)?price|improve\s+(?:the\s+)?(?:price|rate)|"
+    r"best\s+price|target\s+price|meet\s+(?:us|you)\s+at)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_negotiation_message(message: str) -> bool:
+    return bool(message and _NEGOTIATION_MESSAGE_PATTERN.search(str(message)))
+
+
+def _has_persisted_quote_for_inbound(
+    rfq_id: str,
+    supplier_id: str,
+    source_message_id: Optional[str] = None,
+    raw_message: Optional[str] = None,
+) -> bool:
+    """Return True only when the supplier quote for the current inbound turn is persisted."""
+    if not rfq_id or not supplier_id:
+        return False
+    try:
+        query = (
+            db.supabase.table("quotes")
+            .select("id")
+            .eq("rfq_id", str(rfq_id))
+            .eq("supplier_id", str(supplier_id))
+        )
+        if source_message_id:
+            query = query.eq("source_message_id", str(source_message_id))
+        elif raw_message:
+            query = query.eq("raw_message", str(raw_message))
+        else:
+            return False
+        res = query.limit(1).execute()
+        return bool(res.data)
+    except Exception as exc:
+        logger.warning(
+            "Could not verify persisted quote before negotiation for rfq %s: %s",
+            rfq_id,
+            exc,
+        )
+        # Fail closed: inability to prove persistence means negotiation cannot proceed.
+        return False
+
+
 def validate_action(
     proposal: ActionProposal,
     client_id: str,
@@ -64,6 +111,7 @@ def validate_action(
     pending_clarification: Optional[Dict[str, Any]] = None,
     input_origin: str = "supplier",
     negotiation_preflight: Optional[Dict[str, Any]] = None,
+    source_message_id: Optional[str] = None,
 ) -> ValidationResult:
     """
     Deterministic validation of an LLM action proposal.
@@ -993,6 +1041,38 @@ def validate_action(
                     reason=f"Procurement message RFQ '{rfq_id}' does not match deterministically locked RFQ '{matched_rfq_id}'.",
                 )
             rfq_id = matched_rfq_id
+
+        # Negotiation messages may never bypass the dedicated negotiate_price path.
+        # For supplier-origin turns, first prove that the quote from THIS inbound
+        # message was persisted. If it was not, record_quote must execute first.
+        if input_origin == "supplier" and rfq_id and _looks_like_negotiation_message(msg):
+            quote_persisted = _has_persisted_quote_for_inbound(
+                rfq_id=rfq_id,
+                supplier_id=supplier_id,
+                source_message_id=source_message_id,
+                raw_message=proposal.raw_message,
+            )
+            if not quote_persisted:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=(
+                        "Negotiation blocked: the supplier quote from the current inbound message "
+                        "has not been persisted. Execute record_quote first, then negotiate using "
+                        "the validated negotiate_price action."
+                    ),
+                )
+
+            return ValidationResult(
+                is_valid=False,
+                action=tool_name,
+                category=ActionCategory.PROPOSE_COMMUNICATE,
+                reason=(
+                    "Negotiation messages must use the validated negotiate_price action; "
+                    "send_procurement_message cannot bypass negotiation policy."
+                ),
+            )
 
         # Safety guardrails check
         if not guardrails.is_safe_to_send(msg):
