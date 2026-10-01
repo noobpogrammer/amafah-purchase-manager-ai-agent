@@ -9,7 +9,7 @@ import asyncio
 import pytest
 import requests
 from unittest.mock import MagicMock, patch, AsyncMock
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import main
 import db
