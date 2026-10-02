@@ -699,6 +699,7 @@ class MultiRFQQuoteItem(BaseModel):
     variant_label: Optional[str] = None
     delivery_time: Optional[str] = None
     quality_notes: Optional[str] = None
+    supplier_final: bool = False
     confidence: float = 0.0
 
 
@@ -720,6 +721,7 @@ Return JSON only:
       "variant_label": "brand/model/variant or null",
       "delivery_time": "verbatim delivery wording or null",
       "quality_notes": "other factual notes or null",
+      "supplier_final": true or false,
       "confidence": 0.0 to 1.0
     }
   ]
@@ -735,6 +737,7 @@ Rules:
 7. Do not force a match. Use candidate_rfq_id=null and lower confidence when genuinely uncertain.
 8. Do not make procurement decisions, negotiate, accept, reject, or escalate. Extract and map facts only.
 9. Do not merge different RFQ lines into one item.
+10. supplier_final=true only when that specific quoted line is explicitly described as final/fixed/best-and-final. A global brand heading does not make prices final.
 """
 
 
