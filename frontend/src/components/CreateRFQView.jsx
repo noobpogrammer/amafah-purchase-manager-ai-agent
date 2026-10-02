@@ -553,24 +553,26 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                           left: 0,
                           right: 0,
                           marginTop: '0.35rem',
-                          background: 'var(--card-bg, #fff)',
-                          border: '1px solid var(--border-color, #d1d5db)',
+                          background: '#1e293b',
+                          color: 'var(--text-main)',
+                          border: '1px solid var(--panel-border)',
                           borderRadius: '8px',
                           boxShadow: '0 12px 32px rgba(0,0,0,0.2)',
                           overflow: 'hidden'
                         }}
                       >
-                        <div style={{ padding: '0.5rem', borderBottom: '1px solid var(--border-color, #e5e7eb)' }}>
+                        <div style={{ padding: '0.5rem', background: '#0f172a', borderBottom: '1px solid var(--panel-border)' }}>
                           <input
                             type="search"
                             className="input-field"
                             placeholder="Search categories..."
+                            style={{ background: '#1e293b', color: 'var(--text-main)', paddingLeft: '1rem' }}
                             value={categorySearch}
                             onChange={(e) => setCategorySearch(e.target.value)}
                           />
                         </div>
 
-                        <div style={{ maxHeight: '230px', overflowY: 'auto', padding: '0.35rem' }}>
+                        <div style={{ maxHeight: '230px', overflowY: 'auto', padding: '0.35rem', background: '#1e293b', color: 'var(--text-main)' }}>
                           {categories
                             .filter((cat) => cat.toLowerCase().includes(categorySearch.trim().toLowerCase()))
                             .map((cat) => {
@@ -584,7 +586,8 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                                     gap: '0.5rem',
                                     padding: '0.45rem 0.5rem',
                                     cursor: 'pointer',
-                                    borderRadius: '6px'
+                                    borderRadius: '6px',
+                                    color: 'var(--text-main)'
                                   }}
                                 >
                                   <input
@@ -598,7 +601,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                             })}
                         </div>
 
-                        <div style={{ padding: '0.5rem', borderTop: '1px solid var(--border-color, #e5e7eb)' }}>
+                        <div style={{ padding: '0.5rem', background: '#0f172a', borderTop: '1px solid var(--panel-border)' }}>
                           {showCustomCatInput ? (
                             <div className="custom-cat-inline-row" style={{ display: 'flex', gap: '0.4rem' }}>
                               <input
