@@ -46,6 +46,8 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
   const [showCustomCatInput, setShowCustomCatInput] = useState(false);
   const [customCatName, setCustomCatName] = useState('');
   const [creatingCat, setCreatingCat] = useState(false);
+  const [categoryPickerOpen, setCategoryPickerOpen] = useState(false);
+  const [categorySearch, setCategorySearch] = useState('');
 
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
@@ -512,75 +514,131 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                   <label className="form-label flex-items">
                     <Tag size={16} /> Supplier Categories *
                   </label>
-                  <div
-                    style={{
-                      display: 'flex',
-                      flexWrap: 'wrap',
-                      gap: '0.45rem',
-                      padding: '0.55rem',
-                      border: '1px solid var(--border-color, #d1d5db)',
-                      borderRadius: '8px',
-                      maxHeight: '150px',
-                      overflowY: 'auto'
-                    }}
-                  >
-                    {categories.map((cat) => {
-                      const checked = selectedCategories.includes(cat);
-                      return (
-                        <label
-                          key={cat}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '0.35rem',
-                            padding: '0.35rem 0.55rem',
-                            border: '1px solid var(--border-color, #d1d5db)',
-                            borderRadius: '999px',
-                            cursor: 'pointer'
-                          }}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={() => toggleRfqCategory(cat)}
-                          />
-                          <span>{cat}</span>
-                        </label>
-                      );
-                    })}
-                  </div>
-
-                  {showCustomCatInput ? (
-                    <div className="custom-cat-inline-row" style={{ display: 'flex', gap: '0.4rem', marginTop: '0.5rem' }}>
-                      <input
-                        type="text"
-                        className="input-field"
-                        placeholder="Type custom category name..."
-                        value={customCatName}
-                        onChange={(e) => setCustomCatName(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault();
-                            handleCreateCustomCategory(e);
-                          }
-                        }}
-                        autoFocus
-                        style={{ flex: 1 }}
-                      />
-                      <button type="button" className="btn btn-primary btn-sm" onClick={handleCreateCustomCategory} disabled={creatingCat}>
-                        {creatingCat ? 'Adding...' : 'Add'}
-                      </button>
-                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => { setShowCustomCatInput(false); setCustomCatName(''); }}>
-                        Cancel
-                      </button>
-                    </div>
-                  ) : (
-                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowCustomCatInput(true)} style={{ marginTop: '0.4rem' }}>
-                      + Create Custom Category
+                  <div style={{ position: 'relative' }}>
+                    <button
+                      type="button"
+                      className="input-field"
+                      onClick={() => setCategoryPickerOpen((open) => !open)}
+                      style={{
+                        width: '100%',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        cursor: 'pointer',
+                        textAlign: 'left'
+                      }}
+                    >
+                      <span>
+                        {selectedCategories.length
+                          ? `${selectedCategories.length} categor${selectedCategories.length === 1 ? 'y' : 'ies'} selected`
+                          : 'Select categories'}
+                      </span>
+                      <ChevronDown size={16} />
                     </button>
-                  )}
+
+                    {selectedCategories.length > 0 && (
+                      <div className="category-tag-group" style={{ marginTop: '0.45rem' }}>
+                        {selectedCategories.map((cat) => (
+                          <span key={cat} className="badge badge-category">{cat}</span>
+                        ))}
+                      </div>
+                    )}
+
+                    {categoryPickerOpen && (
+                      <div
+                        style={{
+                          position: 'absolute',
+                          zIndex: 30,
+                          top: '100%',
+                          left: 0,
+                          right: 0,
+                          marginTop: '0.35rem',
+                          background: 'var(--card-bg, #fff)',
+                          border: '1px solid var(--border-color, #d1d5db)',
+                          borderRadius: '8px',
+                          boxShadow: '0 12px 32px rgba(0,0,0,0.2)',
+                          overflow: 'hidden'
+                        }}
+                      >
+                        <div style={{ padding: '0.5rem', borderBottom: '1px solid var(--border-color, #e5e7eb)' }}>
+                          <input
+                            type="search"
+                            className="input-field"
+                            placeholder="Search categories..."
+                            value={categorySearch}
+                            onChange={(e) => setCategorySearch(e.target.value)}
+                          />
+                        </div>
+
+                        <div style={{ maxHeight: '230px', overflowY: 'auto', padding: '0.35rem' }}>
+                          {categories
+                            .filter((cat) => cat.toLowerCase().includes(categorySearch.trim().toLowerCase()))
+                            .map((cat) => {
+                              const checked = selectedCategories.includes(cat);
+                              return (
+                                <label
+                                  key={cat}
+                                  style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.5rem',
+                                    padding: '0.45rem 0.5rem',
+                                    cursor: 'pointer',
+                                    borderRadius: '6px'
+                                  }}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={() => toggleRfqCategory(cat)}
+                                  />
+                                  <span>{cat}</span>
+                                </label>
+                              );
+                            })}
+                        </div>
+
+                        <div style={{ padding: '0.5rem', borderTop: '1px solid var(--border-color, #e5e7eb)' }}>
+                          {showCustomCatInput ? (
+                            <div className="custom-cat-inline-row" style={{ display: 'flex', gap: '0.4rem' }}>
+                              <input
+                                type="text"
+                                className="input-field"
+                                placeholder="Type custom category name..."
+                                value={customCatName}
+                                onChange={(e) => setCustomCatName(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    handleCreateCustomCategory(e);
+                                  }
+                                }}
+                                autoFocus
+                                style={{ flex: 1, minWidth: 0 }}
+                              />
+                              <button type="button" className="btn btn-primary btn-sm" onClick={handleCreateCustomCategory} disabled={creatingCat}>
+                                {creatingCat ? 'Adding...' : 'Add'}
+                              </button>
+                              <button type="button" className="btn btn-ghost btn-sm" onClick={() => { setShowCustomCatInput(false); setCustomCatName(''); }}>
+                                Cancel
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-sm"
+                              onClick={() => setShowCustomCatInput(true)}
+                              style={{ width: '100%', justifyContent: 'flex-start' }}
+                            >
+                              + Create Custom Category
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                   <span className="field-hint">
-                    Category matching uses ANY selected category. Suppliers are deduplicated automatically.
+                    Select one or more categories. Matching uses ANY selected category.
                   </span>
                 </div>
 
