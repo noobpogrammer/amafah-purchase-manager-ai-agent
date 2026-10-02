@@ -328,11 +328,22 @@ def validate_action(
             if notes and len(notes) > 500:
                 notes = notes[:500]
 
+            raw_qty = item.get("quantity")
+            qty_val = None
+            if raw_qty is not None:
+                try:
+                    qty_val = int(raw_qty)
+                    if qty_val <= 0:
+                        qty_val = None
+                except (TypeError, ValueError):
+                    qty_val = None
+
             sanitized_variants.append({
                 "variant_label": label,
                 "price": price_val,
                 "delivery_time": deliv,
                 "quality_notes": notes,
+                "quantity": qty_val,
                 "is_available": is_avail,
             })
 

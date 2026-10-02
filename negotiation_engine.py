@@ -15,9 +15,8 @@ import re
 from typing import Dict, Any, Optional, Tuple
 
 MAX_NEGOTIATION_ATTEMPTS = int(os.environ.get("MAX_NEGOTIATION_ATTEMPTS", 10))
-PRICE_TOLERANCE_AED = 3.0
 MIN_MEANINGFUL_SUPPLIER_CONCESSION_AED = 1.0
-FAVORABLE_STRETCH_DISCOUNT = float(os.environ.get("FAVORABLE_STRETCH_DISCOUNT", "0.25"))
+FAVORABLE_STRETCH_DISCOUNT = float(os.environ.get("FAVORABLE_STRETCH_DISCOUNT", "0.07"))
 
 
 FINAL_PRICE_PATTERNS = [
@@ -54,12 +53,15 @@ def compute_target_hierarchy(
     last_quote: Optional[float] = None,
 ) -> Dict[str, Optional[float]]:
     """
-    Establishes the deterministic price target hierarchy:
-    1. acceptable_price_min = optimum / preferred target
-    2. last_quote = fallback target if acceptable_price_min is missing
-    3. acceptable_price_max = final fallback target if neither exists
-    
-    Ceiling: acceptable_price_max + 3.0 (or preferred_target + 3.0)
+    Establishes the deterministic buyer-authorized price hierarchy:
+    1. acceptable_price_min = explicit preferred target
+    2. last_quote = fallback preferred target when no explicit target exists
+    3. acceptable_price_max = fallback target only when neither of the above exists
+
+    IMPORTANT:
+    - acceptable_price_max is the ONLY hard buyer-authorized ceiling.
+    - last_quote is historical guidance, not permission to pay above it.
+    - no synthetic "last_quote + tolerance" hard ceiling is created.
     """
     preferred_target = None
     if acceptable_price_min is not None and acceptable_price_min > 0:
@@ -71,13 +73,9 @@ def compute_target_hierarchy(
 
     acc_max = float(acceptable_price_max) if acceptable_price_max is not None and acceptable_price_max > 0 else None
 
-    # Tolerated final ceiling
-    if acc_max is not None:
-        tolerated_ceiling = acc_max + PRICE_TOLERANCE_AED
-    elif preferred_target is not None:
-        tolerated_ceiling = preferred_target + PRICE_TOLERANCE_AED
-    else:
-        tolerated_ceiling = None
+    # Keep the legacy field name for persisted-session compatibility, but its
+    # value is now exactly the explicit buyer-authorized maximum (or null).
+    tolerated_ceiling = acc_max
 
     return {
         "preferred_target": preferred_target,
@@ -141,18 +139,34 @@ def build_allowed_counter_range(
     Calculates deterministic bounds for the next autonomous agent counteroffer.
     Enforces all concession principles and guarantees the LLM cannot invent illegal prices.
     """
-    # If preferred target is missing, fallback safely
-    if preferred_target is None:
-        preferred_target = acceptable_max or latest_supplier_offer
+    # No buyer target means there is no authorized basis for autonomous price
+    # negotiation. Do not invent a target from the supplier's own offer.
+    if preferred_target is None and acceptable_max is None:
+        return {
+            "allowed_counter_min": None,
+            "allowed_counter_max": None,
+            "recommended_anchor": None,
+            "can_concede": False,
+            "selected_strategy": "ACKNOWLEDGE_AND_STOP",
+            "reason_code": "NO_BUYER_PRICE_TARGET",
+            "should_counter": False,
+        }
 
+    if preferred_target is None:
+        preferred_target = acceptable_max
+
+    # Without an explicit maximum, the agent may negotiate at/below the target,
+    # but may not autonomously concede above that target.
     effective_cap = acceptable_max if acceptable_max is not None else preferred_target
 
     # 1. Supplier explicitly declared a final/non-negotiable price.
     # Stop immediately even when the price is already favorable. Final commercial
     # acceptance remains a human decision elsewhere in the orchestration layer.
     if supplier_final_detected:
+        # "Final" is a supplier stop signal, never a buyer authorization limit.
+        # Compare against the explicit maximum only when one actually exists.
         is_above_ceiling = (
-            tolerated_final_ceiling is not None and latest_supplier_offer > tolerated_final_ceiling
+            acceptable_max is not None and latest_supplier_offer > acceptable_max
         )
         return {
             "allowed_counter_min": None,
@@ -160,7 +174,7 @@ def build_allowed_counter_range(
             "recommended_anchor": None,
             "can_concede": False,
             "selected_strategy": "ESCALATE" if is_above_ceiling else "ACKNOWLEDGE_AND_STOP",
-            "reason_code": "SUPPLIER_FINAL_ABOVE_CEILING" if is_above_ceiling else "SUPPLIER_FINAL_WITHIN_BOUNDS",
+            "reason_code": "SUPPLIER_FINAL_ABOVE_EXPLICIT_MAX" if is_above_ceiling else "SUPPLIER_FINAL_REQUIRES_HUMAN_DECISION",
             "should_counter": False,
         }
 
@@ -215,7 +229,7 @@ def build_allowed_counter_range(
     # 4. Attempt limit reached (e.g. 10 attempts already used)
     if attempt_count >= max_attempts:
         is_above_ceiling = (
-            tolerated_final_ceiling is not None and latest_supplier_offer > tolerated_final_ceiling
+            acceptable_max is not None and latest_supplier_offer > acceptable_max
         )
         return {
             "allowed_counter_min": None,

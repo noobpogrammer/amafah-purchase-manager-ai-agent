@@ -982,7 +982,7 @@ class TestFavorableQuoteBuyerSemantics:
         assert result["should_counter"] is True
         assert result["selected_strategy"] == "STRETCH_SAVINGS"
         assert result["reason_code"] == "BELOW_TARGET_FAVORABLE"
-        assert result["recommended_anchor"] == 1.5
+        assert result["recommended_anchor"] == 1.86
         assert result["recommended_anchor"] < 2.0
 
     def test_favorable_quote_holds_existing_stretch_counter_on_next_turn(self):
@@ -992,14 +992,14 @@ class TestFavorableQuoteBuyerSemantics:
             tolerated_final_ceiling=7.0,
             latest_supplier_offer=2.0,
             previous_supplier_offer=2.0,
-            latest_agent_counter=1.5,
+            latest_agent_counter=1.86,
             attempt_count=1,
             supplier_final_detected=False,
         )
 
         assert result["should_counter"] is True
         assert result["selected_strategy"] == "STRETCH_SAVINGS"
-        assert result["recommended_anchor"] == 1.5
+        assert result["recommended_anchor"] == 1.86
 
     def test_favorable_supplier_final_stops_negotiation(self):
         result = negotiation_engine.build_allowed_counter_range(
@@ -1104,3 +1104,68 @@ class TestDreamNestFalsePositiveTradeoffs:
         assert result["has_tradeoff"] is True
         assert result["is_authorized"] is False
         assert result["dimension"] == "specification"
+
+
+class TestTargetHierarchyWithoutSyntheticCeiling:
+    def test_last_quote_is_target_but_not_hard_maximum(self):
+        hierarchy = negotiation_engine.compute_target_hierarchy(
+            acceptable_price_min=None,
+            acceptable_price_max=None,
+            last_quote=1073.0,
+        )
+
+        assert hierarchy["preferred_target"] == 1073.0
+        assert hierarchy["acceptable_max"] is None
+        assert hierarchy["tolerated_final_ceiling"] is None
+
+    def test_explicit_max_is_only_hard_maximum(self):
+        hierarchy = negotiation_engine.compute_target_hierarchy(
+            acceptable_price_min=1000.0,
+            acceptable_price_max=1150.0,
+            last_quote=1073.0,
+        )
+
+        assert hierarchy["preferred_target"] == 1000.0
+        assert hierarchy["acceptable_max"] == 1150.0
+        assert hierarchy["tolerated_final_ceiling"] == 1150.0
+
+    def test_supplier_final_without_explicit_max_stops_for_human_not_new_ceiling(self):
+        result = negotiation_engine.build_allowed_counter_range(
+            preferred_target=1073.0,
+            acceptable_max=None,
+            tolerated_final_ceiling=None,
+            latest_supplier_offer=1180.0,
+            supplier_final_detected=True,
+        )
+
+        assert result["should_counter"] is False
+        assert result["selected_strategy"] == "ACKNOWLEDGE_AND_STOP"
+        assert result["reason_code"] == "SUPPLIER_FINAL_REQUIRES_HUMAN_DECISION"
+
+    def test_supplier_final_above_explicit_max_escalates(self):
+        result = negotiation_engine.build_allowed_counter_range(
+            preferred_target=1073.0,
+            acceptable_max=1150.0,
+            tolerated_final_ceiling=1150.0,
+            latest_supplier_offer=1180.0,
+            supplier_final_detected=True,
+        )
+
+        assert result["should_counter"] is False
+        assert result["selected_strategy"] == "ESCALATE"
+        assert result["reason_code"] == "SUPPLIER_FINAL_ABOVE_EXPLICIT_MAX"
+
+    def test_favorable_offer_below_last_quote_stretches_further_down(self):
+        result = negotiation_engine.build_allowed_counter_range(
+            preferred_target=1073.0,
+            acceptable_max=None,
+            tolerated_final_ceiling=None,
+            latest_supplier_offer=1000.0,
+            attempt_count=0,
+            supplier_final_detected=False,
+        )
+
+        assert result["should_counter"] is True
+        assert result["selected_strategy"] == "STRETCH_SAVINGS"
+        assert result["recommended_anchor"] == 930.0
+        assert result["recommended_anchor"] < 1000.0
