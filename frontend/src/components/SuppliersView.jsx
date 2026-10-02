@@ -409,49 +409,61 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
                           left: 0,
                           right: 0,
                           marginTop: '0.35rem',
-                          maxHeight: '240px',
-                          overflowY: 'auto',
                           background: 'var(--card-bg, #fff)',
                           border: '1px solid var(--border-color, #d1d5db)',
                           borderRadius: '8px',
                           boxShadow: '0 10px 30px rgba(0,0,0,0.16)',
-                          padding: '0.4rem'
+                          overflow: 'hidden'
                         }}
                       >
-                        {categories.map((cat) => {
-                          const isSelected = selectedCategories.includes(cat);
-                          return (
-                            <button
-                              type="button"
-                              key={cat}
-                              onClick={() => toggleCategory(cat)}
-                              style={{
-                                width: '100%',
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '0.5rem',
-                                padding: '0.55rem 0.6rem',
-                                border: 0,
-                                borderRadius: '6px',
-                                background: isSelected ? 'rgba(99, 102, 241, 0.12)' : 'transparent',
-                                cursor: 'pointer',
-                                textAlign: 'left'
-                              }}
-                            >
-                              <span style={{ width: 18 }}>{isSelected ? <Check size={15} /> : null}</span>
-                              <Tag size={14} />
-                              <span>{cat}</span>
-                            </button>
-                          );
-                        })}
+                        <div
+                          style={{
+                            maxHeight: '220px',
+                            overflowY: 'auto',
+                            padding: '0.4rem'
+                          }}
+                        >
+                          {categories.map((cat) => {
+                            const isSelected = selectedCategories.includes(cat);
+                            return (
+                              <button
+                                type="button"
+                                key={cat}
+                                onClick={() => toggleCategory(cat)}
+                                style={{
+                                  width: '100%',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '0.5rem',
+                                  padding: '0.55rem 0.6rem',
+                                  border: 0,
+                                  borderRadius: '6px',
+                                  background: isSelected ? 'rgba(99, 102, 241, 0.12)' : 'transparent',
+                                  cursor: 'pointer',
+                                  textAlign: 'left'
+                                }}
+                              >
+                                <span style={{ width: 18 }}>{isSelected ? <Check size={15} /> : null}</span>
+                                <Tag size={14} />
+                                <span>{cat}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
 
-                        <div style={{ borderTop: '1px solid var(--border-color, #e5e7eb)', marginTop: '0.35rem', paddingTop: '0.4rem' }}>
+                        <div
+                          style={{
+                            borderTop: '1px solid var(--border-color, #e5e7eb)',
+                            padding: '0.5rem',
+                            background: 'var(--card-bg, #fff)'
+                          }}
+                        >
                           {showCustomCatInput ? (
-                            <div style={{ display: 'flex', gap: '0.4rem' }}>
+                            <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
                               <input
                                 type="text"
                                 className="input-field"
-                                placeholder="Custom category..."
+                                placeholder="Type a new category..."
                                 value={customCatName}
                                 onChange={(e) => setCustomCatName(e.target.value)}
                                 onKeyDown={(e) => {
@@ -461,7 +473,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
                                   }
                                 }}
                                 autoFocus
-                                style={{ flex: 1 }}
+                                style={{ flex: 1, minWidth: 0 }}
                               />
                               <button
                                 type="button"
@@ -471,13 +483,27 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
                               >
                                 {creatingCat ? 'Adding...' : 'Add'}
                               </button>
+                              <button
+                                type="button"
+                                className="btn btn-ghost btn-sm"
+                                onClick={() => {
+                                  setShowCustomCatInput(false);
+                                  setCustomCatName('');
+                                }}
+                              >
+                                Cancel
+                              </button>
                             </div>
                           ) : (
                             <button
                               type="button"
                               className="btn btn-ghost btn-sm"
                               onClick={() => setShowCustomCatInput(true)}
-                              style={{ width: '100%', justifyContent: 'flex-start' }}
+                              style={{
+                                width: '100%',
+                                justifyContent: 'flex-start',
+                                fontWeight: 600
+                              }}
                             >
                               <Plus size={14} /> Add Custom Category
                             </button>
