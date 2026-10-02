@@ -964,3 +964,84 @@ class TestPhase2AdaptiveNegotiation:
         mock_supabase.table().insert().execute.side_effect = Exception("DB connection timeout")
         res = db.create_or_update_negotiation_session(CLIENT_ID, str(uuid.uuid4()), SUPPLIER_ID, preferred_target=45.0)
         assert res is None
+
+
+class TestFavorableQuoteBuyerSemantics:
+    def test_below_target_quote_stretches_downward_never_upward(self):
+        result = negotiation_engine.build_allowed_counter_range(
+            preferred_target=2.5,
+            acceptable_max=4.0,
+            tolerated_final_ceiling=7.0,
+            latest_supplier_offer=2.0,
+            previous_supplier_offer=None,
+            latest_agent_counter=None,
+            attempt_count=0,
+            supplier_final_detected=False,
+        )
+
+        assert result["should_counter"] is True
+        assert result["selected_strategy"] == "STRETCH_SAVINGS"
+        assert result["reason_code"] == "BELOW_TARGET_FAVORABLE"
+        assert result["recommended_anchor"] == 1.5
+        assert result["recommended_anchor"] < 2.0
+
+    def test_favorable_quote_holds_existing_stretch_counter_on_next_turn(self):
+        result = negotiation_engine.build_allowed_counter_range(
+            preferred_target=2.5,
+            acceptable_max=4.0,
+            tolerated_final_ceiling=7.0,
+            latest_supplier_offer=2.0,
+            previous_supplier_offer=2.0,
+            latest_agent_counter=1.5,
+            attempt_count=1,
+            supplier_final_detected=False,
+        )
+
+        assert result["should_counter"] is True
+        assert result["selected_strategy"] == "STRETCH_SAVINGS"
+        assert result["recommended_anchor"] == 1.5
+
+    def test_favorable_supplier_final_stops_negotiation(self):
+        result = negotiation_engine.build_allowed_counter_range(
+            preferred_target=2.5,
+            acceptable_max=4.0,
+            tolerated_final_ceiling=7.0,
+            latest_supplier_offer=2.0,
+            latest_agent_counter=1.5,
+            attempt_count=1,
+            supplier_final_detected=True,
+        )
+
+        assert result["should_counter"] is False
+        assert result["selected_strategy"] == "ACKNOWLEDGE_AND_STOP"
+        assert result["reason_code"] == "SUPPLIER_FINAL_WITHIN_BOUNDS"
+
+    def test_rfq_invitation_uses_everyware_branding_and_omits_blank_specs(self):
+        msg = main.build_rfq_invitation_message(
+            product_name="Noora Brush",
+            specs=".",
+            quantity=24,
+            deadline_hours=24,
+            required_delivery_days=1,
+        )
+
+        assert msg.startswith("Hi! This is Everyware®️ (Al Noon Int’l Trading LLC).")
+        assert "* Product: Noora Brush" in msg
+        assert "* Quantity: 24" in msg
+        assert "* Quote Required Within: 24 hour(s)" in msg
+        assert "* Required Delivery: Within 1 day" in msg
+        assert "Specs:" not in msg
+        assert "final price per unit (AED)" in msg
+
+    def test_unavailable_product_does_not_get_quote_acknowledgement(self):
+        msg = main.acknowledgement_for_quote_variants([
+            {
+                "variant_label": None,
+                "price": None,
+                "is_available": False,
+                "quality_notes": "No stock",
+            }
+        ])
+
+        assert msg == "Thanks for letting us know."
+        assert "quote" not in msg.lower()
