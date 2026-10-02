@@ -74,7 +74,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
       .join(' ')
       .toLowerCase();
     return (r.product_name || '').toLowerCase().includes(q)
-      || (r.category || '').toLowerCase().includes(q)
+      || ([...(r.categories || []), r.category].filter(Boolean).join(' ')).toLowerCase().includes(q)
       || supplierNames.includes(q);
   });
 
@@ -161,7 +161,11 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
           <div className="card report-header-card">
             <div className="flex-between">
               <div>
-                <span className="badge badge-category">{currentRfq.category}</span>
+                <div className="category-tag-group">
+                  {(currentRfq.categories?.length ? currentRfq.categories : [currentRfq.category]).filter(Boolean).map((cat) => (
+                    <span key={cat} className="badge badge-category">{cat}</span>
+                  ))}
+                </div>
                 <h3 className="report-title">{currentRfq.product_name}</h3>
                 <p className="report-sub">
                   Specs: {currentRfq.specs || 'Standard'} | Quantity: {currentRfq.quantity || 'N/A'} | Deadline: {currentRfq.deadline_hours || 24}h
