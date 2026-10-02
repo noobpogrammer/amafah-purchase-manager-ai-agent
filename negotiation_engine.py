@@ -17,6 +17,7 @@ from typing import Dict, Any, Optional, Tuple
 MAX_NEGOTIATION_ATTEMPTS = int(os.environ.get("MAX_NEGOTIATION_ATTEMPTS", 10))
 PRICE_TOLERANCE_AED = 3.0
 MIN_MEANINGFUL_SUPPLIER_CONCESSION_AED = 1.0
+FAVORABLE_STRETCH_DISCOUNT = float(os.environ.get("FAVORABLE_STRETCH_DISCOUNT", "0.25"))
 
 
 FINAL_PRICE_PATTERNS = [
@@ -146,31 +147,9 @@ def build_allowed_counter_range(
 
     effective_cap = acceptable_max if acceptable_max is not None else preferred_target
 
-    # 1. Target reached: supplier price is already at or below preferred target
-    if latest_supplier_offer <= preferred_target:
-        return {
-            "allowed_counter_min": None,
-            "allowed_counter_max": None,
-            "recommended_anchor": None,
-            "can_concede": False,
-            "selected_strategy": "ACKNOWLEDGE_AND_STOP",
-            "reason_code": "TARGET_REACHED",
-            "should_counter": False,
-        }
-
-    # 2. Supplier accepted our counter
-    if latest_agent_counter is not None and latest_supplier_offer <= latest_agent_counter:
-        return {
-            "allowed_counter_min": None,
-            "allowed_counter_max": None,
-            "recommended_anchor": None,
-            "can_concede": False,
-            "selected_strategy": "ACKNOWLEDGE_AND_STOP",
-            "reason_code": "COUNTER_ACCEPTED",
-            "should_counter": False,
-        }
-
-    # 3. Final price declared by supplier
+    # 1. Supplier explicitly declared a final/non-negotiable price.
+    # Stop immediately even when the price is already favorable. Final commercial
+    # acceptance remains a human decision elsewhere in the orchestration layer.
     if supplier_final_detected:
         is_above_ceiling = (
             tolerated_final_ceiling is not None and latest_supplier_offer > tolerated_final_ceiling
@@ -183,6 +162,54 @@ def build_allowed_counter_range(
             "selected_strategy": "ESCALATE" if is_above_ceiling else "ACKNOWLEDGE_AND_STOP",
             "reason_code": "SUPPLIER_FINAL_ABOVE_CEILING" if is_above_ceiling else "SUPPLIER_FINAL_WITHIN_BOUNDS",
             "should_counter": False,
+        }
+
+    # 2. Supplier accepted/met our previous counter.
+    if latest_agent_counter is not None and latest_supplier_offer <= latest_agent_counter:
+        return {
+            "allowed_counter_min": None,
+            "allowed_counter_max": None,
+            "recommended_anchor": None,
+            "can_concede": False,
+            "selected_strategy": "ACKNOWLEDGE_AND_STOP",
+            "reason_code": "COUNTER_ACCEPTED",
+            "should_counter": False,
+        }
+
+    # 3. Favorable quote: supplier is already at/below the buyer's preferred target.
+    # Never negotiate upward. Instead, make one deterministic "stretch savings"
+    # ask below the supplier's own price. On subsequent turns, hold that stretch
+    # counter unless the supplier accepts it or explicitly declares final.
+    if latest_supplier_offer <= preferred_target:
+        if latest_agent_counter is not None and latest_agent_counter < latest_supplier_offer:
+            stretch = round(float(latest_agent_counter), 2)
+        else:
+            pct = min(max(FAVORABLE_STRETCH_DISCOUNT, 0.01), 0.50)
+            stretch = round(latest_supplier_offer * (1.0 - pct), 2)
+            if stretch <= 0:
+                stretch = round(max(0.01, latest_supplier_offer - 0.01), 2)
+            if stretch >= latest_supplier_offer:
+                stretch = round(max(0.01, latest_supplier_offer - 0.01), 2)
+
+        if stretch <= 0 or stretch >= latest_supplier_offer:
+            return {
+                "allowed_counter_min": None,
+                "allowed_counter_max": None,
+                "recommended_anchor": None,
+                "can_concede": False,
+                "selected_strategy": "ACKNOWLEDGE_AND_STOP",
+                "reason_code": "FAVORABLE_PRICE_NO_SAFE_STRETCH",
+                "should_counter": False,
+            }
+
+        return {
+            "allowed_counter_min": stretch,
+            "allowed_counter_max": stretch,
+            "recommended_anchor": stretch,
+            "can_concede": False,
+            "selected_strategy": "STRETCH_SAVINGS",
+            "reason_code": "BELOW_TARGET_FAVORABLE",
+            "should_counter": True,
         }
 
     # 4. Attempt limit reached (e.g. 10 attempts already used)
