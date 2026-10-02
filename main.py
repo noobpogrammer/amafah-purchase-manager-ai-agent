@@ -1263,6 +1263,13 @@ app.add_middleware(
 )
 
 
+def acknowledgement_for_quote_variants(variants: list[dict]) -> str:
+    """Return a supplier-facing acknowledgement that matches what was actually received."""
+    if variants and all(v.get("is_available", True) is False for v in variants):
+        return UNAVAILABLE_ACK_MSG
+    return THANK_YOU_MSG
+
+
 def build_rfq_invitation_message(
     product_name: str,
     specs: Optional[str],
@@ -1885,8 +1892,7 @@ async def execute_validated_action(
                 }
 
             # Semantic acknowledgement: an unavailable product is not a quote.
-            all_unavailable = bool(variants) and all(v.get("is_available", True) is False for v in variants)
-            acknowledgement_msg = UNAVAILABLE_ACK_MSG if all_unavailable else THANK_YOU_MSG
+            acknowledgement_msg = acknowledgement_for_quote_variants(variants)
             msg_log_id = db.log_message(client_id, supplier_id, "outbound", acknowledgement_msg, related_rfq_id=target_rfq_id)
             if not msg_log_id:
                 raise RuntimeError("Failed to log outbound acknowledgement durably.")
