@@ -575,15 +575,27 @@ def _message_has_procurement_signal(message_text: str, open_rfqs: list) -> bool:
     commercial_pattern = re.compile(
         r"\b(?:aed|dhs?|dirhams?|quote|quotation|price|rate|offer|counter|discount|"
         r"reduce|lower|best|final|delivery|lead\s*time|ready|stock|available|availability|"
-        r"qty|quantity|moq|pcs?|pieces?|units?|nos?|brand|grade|spec|specification|"
-        r"payment|advance|credit|pi|invoice|warranty)\b",
+        r"qty|quantity|moq|pcs?|pieces?|units?|nos?|dozen|dozens|pack|packs|packaging|"
+        r"brand|grade|spec|specification|payment|advance|credit|pi|invoice|warranty)\b",
         re.IGNORECASE,
     )
     if commercial_pattern.search(text):
         return True
 
-    # Common terse supplier quote forms: "72", "72.50", "72 / pc".
-    if re.fullmatch(r"\s*\d+(?:\.\d+)?\s*(?:/\s*(?:pc|piece|unit))?\s*", text, re.IGNORECASE):
+    # Compact currency formats commonly used by suppliers: "48aed", "48dhs", "aed48".
+    if re.search(
+        r"(?:\d+(?:\.\d+)?\s*(?:aed|dhs?|dirhams?)\b|\b(?:aed|dhs?|dirhams?)\s*\d+(?:\.\d+)?)",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+
+    # Common terse supplier quote forms: "72", "72.50", "72 / pc", "48 per dozen".
+    if re.fullmatch(
+        r"\s*\d+(?:\.\d+)?\s*(?:/\s*|per\s+)?(?:pc|pcs|piece|pieces|unit|units|dozen|dozens)?\s*",
+        text,
+        re.IGNORECASE,
+    ):
         return True
 
     return False
