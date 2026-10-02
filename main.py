@@ -1370,6 +1370,145 @@ def generate_adaptive_negotiation_message(
 
 
 
+
+async def process_multi_rfq_quote_batch(
+    *,
+    parsed_items: list,
+    all_open_rfqs: list,
+    supplier: dict,
+    client_id: str,
+    raw_message: str,
+    inbound_log_id: str,
+    pending_clarification: Optional[dict] = None,
+) -> Optional[dict]:
+    """Validate and persist a supplier message that quotes multiple RFQs at once.
+
+    Semantic mapping is produced by the AI fact parser. This function only
+    enforces hard invariants through the existing policy validator, then records
+    each RFQ quote without allowing one active negotiation session to swallow
+    the entire batch.
+    """
+    if not parsed_items or len(parsed_items) < 2:
+        return None
+
+    supplier_id = supplier.get("id")
+    phone_number = supplier.get("phone_number")
+    if not supplier_id:
+        return None
+
+    grouped = {}
+    for item in parsed_items:
+        if not isinstance(item, dict):
+            return None
+        rfq_id = str(item.get("candidate_rfq_id") or "").strip()
+        price = item.get("price")
+        confidence = float(item.get("confidence") or 0.0)
+        if not rfq_id or price is None or confidence < 0.70:
+            return None
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            return None
+        if price <= 0:
+            return None
+
+        grouped.setdefault(rfq_id, []).append({
+            "variant_label": item.get("variant_label"),
+            "price": price,
+            "delivery_time": item.get("delivery_time"),
+            "quality_notes": item.get("quality_notes"),
+            "is_available": True,
+        })
+
+    # Only treat this as a true multi-RFQ batch when at least 2 different RFQs
+    # were confidently identified.
+    if len(grouped) < 2:
+        return None
+
+    validations = []
+    for rfq_id, variants in grouped.items():
+        proposal = ActionProposal(
+            tool_name="record_quote",
+            arguments={"rfq_id": rfq_id, "variants": variants},
+            raw_message=raw_message,
+        )
+        validation = validate_action(
+            proposal,
+            client_id=client_id,
+            supplier_id=supplier_id,
+            context_rfqs=all_open_rfqs,
+            matched_rfq_id=None,
+            pending_clarification=None,
+            input_origin="supplier",
+            source_message_id=inbound_log_id,
+        )
+        if not validation.is_valid:
+            logger.warning(
+                "Multi-RFQ batch validation failed for RFQ %s: %s",
+                rfq_id,
+                validation.reason,
+            )
+            return None
+        validations.append((rfq_id, validation))
+
+    recorded = []
+    for rfq_id, validation in validations:
+        variants = validation.sanitized_args.get("variants") or []
+        persisted = db.record_quotes_batch(
+            rfq_id=rfq_id,
+            supplier_id=supplier_id,
+            variants=variants,
+            raw_message=raw_message,
+            source_message_id=inbound_log_id,
+        ) or []
+
+        decision = db.record_agent_decision(
+            client_id=client_id,
+            origin="supplier",
+            tool_name="record_quote",
+            arguments={"rfq_id": rfq_id, "variants": variants, "multi_rfq_batch": True},
+            validation_status="approved",
+            validation_reason=None,
+            execution_status="completed" if persisted else "failed",
+            execution_error=None if persisted else "Quote persistence returned no rows",
+            rfq_id=rfq_id,
+            supplier_id=supplier_id,
+            inbound_message_id=inbound_log_id,
+        )
+        recorded.append({
+            "rfq_id": rfq_id,
+            "quote_ids": [q.get("id") for q in persisted if isinstance(q, dict) and q.get("id")],
+            "decision_id": decision.get("id") if isinstance(decision, dict) else None,
+        })
+
+    if pending_clarification:
+        try:
+            db.resolve_pending_clarification(pending_clarification["id"])
+        except Exception:
+            pass
+
+    acknowledgement = "Thanks! We've recorded the quoted items and will review them."
+    msg_log_id = db.log_message(
+        client_id,
+        supplier_id,
+        "outbound",
+        acknowledgement,
+    )
+    if phone_number and msg_log_id:
+        await enqueue_message(
+            phone_number,
+            acknowledgement,
+            supplier_id=supplier_id,
+            message_log_id=msg_log_id,
+        )
+
+    return {
+        "status": "multi_rfq_quotes_recorded",
+        "rfq_count": len(recorded),
+        "recorded": recorded,
+    }
+
+
 async def execute_validated_action(
     validation: ValidationResult,
     context: AgentContext,
@@ -2594,6 +2733,33 @@ async def whatsapp_webhook(request: Request):
             logger.warning(f"Error in parse_commercial_message: {parse_err}")
 
         explicit_prod = commercial_parse.get("explicit_product_reference") if commercial_parse else None
+
+        # Multi-RFQ batch ingestion: suppliers often answer several RFQs in one
+        # WhatsApp price list. Let the AI fact parser map each line to an active
+        # candidate RFQ, then validate every mutation against hard DB/policy
+        # invariants before recording. This must run before single-RFQ session
+        # continuity so one active negotiation cannot swallow the whole batch.
+        if len(all_open_rfqs) >= 2 and "\n" in (message_text or ""):
+            try:
+                multi_parse = groq_client.parse_multi_rfq_quotes(
+                    message_text,
+                    candidate_rfqs=all_open_rfqs,
+                )
+                multi_result = await process_multi_rfq_quote_batch(
+                    parsed_items=(multi_parse or {}).get("items") or [],
+                    all_open_rfqs=all_open_rfqs,
+                    supplier=supplier,
+                    client_id=client_id,
+                    raw_message=message_text,
+                    inbound_log_id=inbound_log_id,
+                    pending_clarification=pending,
+                )
+                if multi_result:
+                    if msg_key_id:
+                        db.complete_webhook_message(client_id, msg_key_id)
+                    return multi_result
+            except Exception as multi_err:
+                logger.warning("Multi-RFQ quote ingestion failed; continuing normal flow: %s", multi_err)
 
         if matched_rfq_supplier:
             # Priority 1: Exact WhatsApp Stanza Match always wins & locks

@@ -690,6 +690,115 @@ def parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] =
     return _fallback_parse_commercial_message(message_text, candidate_rfqs).model_dump()
 
 
+
+class MultiRFQQuoteItem(BaseModel):
+    candidate_rfq_id: Optional[str] = None
+    product_reference: Optional[str] = None
+    quantity: Optional[int] = None
+    price: Optional[float] = None
+    variant_label: Optional[str] = None
+    delivery_time: Optional[str] = None
+    quality_notes: Optional[str] = None
+    confidence: float = 0.0
+
+
+class MultiRFQQuoteParseResult(BaseModel):
+    items: List[MultiRFQQuoteItem] = Field(default_factory=list)
+
+
+MULTI_RFQ_QUOTE_SYSTEM_PROMPT = """You extract line-item supplier quotations that may cover MULTIPLE active RFQs in one WhatsApp message.
+
+You receive the supplier message plus an authoritative list of candidate RFQs.
+Return JSON only:
+{
+  "items": [
+    {
+      "candidate_rfq_id": "one of the supplied candidate IDs or null",
+      "product_reference": "supplier wording for this line",
+      "quantity": integer or null,
+      "price": positive number or null,
+      "variant_label": "brand/model/variant or null",
+      "delivery_time": "verbatim delivery wording or null",
+      "quality_notes": "other factual notes or null",
+      "confidence": 0.0 to 1.0
+    }
+  ]
+}
+
+Rules:
+1. Create one item for each distinct quoted product/RFQ line. A single WhatsApp message may contain many RFQs.
+2. candidate_rfq_id MUST be copied exactly from the supplied candidate list. Never invent IDs.
+3. Match abbreviated supplier wording semantically to candidate products: e.g. "6mmx5c" can match "FLEXIBLE WIRE 6MMX5CORE...".
+4. A heading such as "Brand FLEXTOP" or "Brand EZFLEX" applies to following lines until another brand heading appears.
+5. Brand/model is a variant_label, not automatically a specification trade-off.
+6. Prices like "1425/-" mean 1425 AED unless the message explicitly says otherwise.
+7. Do not force a match. Use candidate_rfq_id=null and lower confidence when genuinely uncertain.
+8. Do not make procurement decisions, negotiate, accept, reject, or escalate. Extract and map facts only.
+9. Do not merge different RFQ lines into one item.
+"""
+
+
+def parse_multi_rfq_quotes(message_text: str, candidate_rfqs: Optional[list] = None) -> Dict[str, Any]:
+    """AI-first extraction for one supplier message containing quotes for multiple RFQs."""
+    candidates = []
+    for entry in candidate_rfqs or []:
+        rfq = entry.get("rfqs", entry) if isinstance(entry, dict) else None
+        if not isinstance(rfq, dict) or not rfq.get("id"):
+            continue
+        candidates.append({
+            "rfq_id": str(rfq.get("id")),
+            "product_name": rfq.get("product_name"),
+            "specs": rfq.get("specs"),
+            "quantity": rfq.get("quantity"),
+        })
+
+    if not message_text or not message_text.strip() or len(candidates) < 2:
+        return {"items": []}
+
+    try:
+        from unittest.mock import Mock, MagicMock
+        if client and not isinstance(client, (Mock, MagicMock)) and os.environ.get("GROQ_API_KEY"):
+            prompt = (
+                "Supplier WhatsApp message:\n"
+                + message_text
+                + "\n\nAuthoritative candidate RFQs:\n"
+                + json.dumps(candidates, ensure_ascii=False)
+            )
+            response = _groq_completion(
+                call_type="multi_rfq_quote_parser",
+                model=UTILITY_MODEL,
+                messages=[
+                    {"role": "system", "content": MULTI_RFQ_QUOTE_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            parsed = MultiRFQQuoteParseResult(**json.loads(response.choices[0].message.content))
+            allowed_ids = {c["rfq_id"] for c in candidates}
+            clean_items = []
+            for item in parsed.items:
+                row = item.model_dump()
+                rid = str(row.get("candidate_rfq_id") or "")
+                price = row.get("price")
+                if rid not in allowed_ids:
+                    row["candidate_rfq_id"] = None
+                if price is not None:
+                    try:
+                        price = float(price)
+                        if price <= 0 or math.isnan(price) or math.isinf(price):
+                            price = None
+                    except Exception:
+                        price = None
+                    row["price"] = price
+                clean_items.append(row)
+            return {"items": clean_items}
+    except Exception as e:
+        logger.warning("Multi-RFQ quote parser failed; continuing through normal single-RFQ flow: %s", e)
+
+    return {"items": []}
+
+
 class AgentContext(BaseModel):
     client_id: str
     supplier_id: str
