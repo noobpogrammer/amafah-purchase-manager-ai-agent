@@ -466,23 +466,47 @@ def validate_action(
                     reason="Clarification candidates cannot expand outside active pending candidates.",
                 )
 
-        # Candidate membership check: ensure all candidates belong to active open context_rfqs
-        if context_rfqs:
-            valid_open_ids = {
-                str(r.get("rfqs", r).get("id"))
-                for r in context_rfqs
-                if isinstance(r.get("rfqs", r), dict)
-                and r.get("rfqs", r).get("id")
-                and db.is_rfq_open(r.get("rfqs", r))
-            }
-            for cid in candidate_ids:
-                if str(cid) not in valid_open_ids:
-                    return ValidationResult(
-                        is_valid=False,
-                        action=tool_name,
-                        category=ActionCategory.PROPOSE_COMMUNICATE,
-                        reason=f"Candidate RFQ '{cid}' is not an open RFQ for this supplier/client.",
+        # Candidate membership check: context_rfqs may be a state-aware routing
+        # subset (for example, NEW_QUOTE candidates can omit an already-responded
+        # RFQ). Clarification, however, may legitimately refer to ANY still-open
+        # RFQ that was sent to this supplier. Validate against the durable
+        # supplier/RFQ association instead of rejecting solely because a candidate
+        # is absent from the transient routing subset.
+        for cid in candidate_ids:
+            candidate_ok = False
+
+            for entry in (context_rfqs or []):
+                candidate_rfq = entry.get("rfqs", entry) if isinstance(entry, dict) else None
+                if (
+                    isinstance(candidate_rfq, dict)
+                    and str(candidate_rfq.get("id")) == str(cid)
+                    and db.is_rfq_open(candidate_rfq)
+                ):
+                    candidate_ok = True
+                    break
+
+            if not candidate_ok:
+                try:
+                    rs_res = (
+                        db.supabase.table("rfq_suppliers")
+                        .select("rfq_id, supplier_id, rfqs(*)")
+                        .eq("rfq_id", cid)
+                        .eq("supplier_id", supplier_id)
+                        .execute()
                     )
+                    if rs_res.data:
+                        durable_rfq = rs_res.data[0].get("rfqs") or {}
+                        candidate_ok = db.is_rfq_open(durable_rfq)
+                except Exception as ex:
+                    logger.debug("Clarification durable candidate lookup failed for %s: %s", cid, ex)
+
+            if not candidate_ok:
+                return ValidationResult(
+                    is_valid=False,
+                    action=tool_name,
+                    category=ActionCategory.PROPOSE_COMMUNICATE,
+                    reason=f"Candidate RFQ '{cid}' is not an open RFQ for this supplier/client.",
+                )
 
         if not question or not isinstance(question, str):
             return ValidationResult(
