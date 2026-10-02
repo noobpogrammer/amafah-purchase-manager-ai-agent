@@ -418,42 +418,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
                       >
                         <div
                           style={{
-                            maxHeight: '220px',
-                            overflowY: 'auto',
-                            padding: '0.4rem'
-                          }}
-                        >
-                          {categories.map((cat) => {
-                            const isSelected = selectedCategories.includes(cat);
-                            return (
-                              <button
-                                type="button"
-                                key={cat}
-                                onClick={() => toggleCategory(cat)}
-                                style={{
-                                  width: '100%',
-                                  display: 'flex',
-                                  alignItems: 'center',
-                                  gap: '0.5rem',
-                                  padding: '0.55rem 0.6rem',
-                                  border: 0,
-                                  borderRadius: '6px',
-                                  background: isSelected ? 'rgba(99, 102, 241, 0.12)' : 'transparent',
-                                  cursor: 'pointer',
-                                  textAlign: 'left'
-                                }}
-                              >
-                                <span style={{ width: 18 }}>{isSelected ? <Check size={15} /> : null}</span>
-                                <Tag size={14} />
-                                <span>{cat}</span>
-                              </button>
-                            );
-                          })}
-                        </div>
-
-                        <div
-                          style={{
-                            borderTop: '1px solid var(--border-color, #e5e7eb)',
+                            borderBottom: '1px solid var(--border-color, #e5e7eb)',
                             padding: '0.5rem',
                             background: 'var(--card-bg, #fff)'
                           }}
@@ -508,6 +473,41 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
                               <Plus size={14} /> Add Custom Category
                             </button>
                           )}
+                        </div>
+
+                        <div
+                          style={{
+                            maxHeight: '220px',
+                            overflowY: 'auto',
+                            padding: '0.4rem'
+                          }}
+                        >
+                          {categories.map((cat) => {
+                            const isSelected = selectedCategories.includes(cat);
+                            return (
+                              <button
+                                type="button"
+                                key={cat}
+                                onClick={() => toggleCategory(cat)}
+                                style={{
+                                  width: '100%',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '0.5rem',
+                                  padding: '0.55rem 0.6rem',
+                                  border: 0,
+                                  borderRadius: '6px',
+                                  background: isSelected ? 'rgba(99, 102, 241, 0.12)' : 'transparent',
+                                  cursor: 'pointer',
+                                  textAlign: 'left'
+                                }}
+                              >
+                                <span style={{ width: 18 }}>{isSelected ? <Check size={15} /> : null}</span>
+                                <Tag size={14} />
+                                <span>{cat}</span>
+                              </button>
+                            );
+                          })}
                         </div>
                       </div>
                     )}
