@@ -263,16 +263,23 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
       </div>
 
       {showCategoryManager && (
-        <div className="modal-overlay" onClick={() => setShowCategoryManager(false)}>
+        <div className="modal-backdrop" onClick={() => setShowCategoryManager(false)}>
           <div
             className="modal-card"
             onClick={(e) => e.stopPropagation()}
-            style={{ maxWidth: '520px', width: '92%', maxHeight: '70vh', overflow: 'hidden' }}
+            style={{
+              maxWidth: '1180px',
+              width: 'calc(100vw - 3rem)',
+              maxHeight: '78vh',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden'
+            }}
           >
-            <div className="modal-header">
+            <div className="modal-header" style={{ alignItems: 'flex-start' }}>
               <div>
                 <h3 style={{ margin: 0 }}>Manage Categories</h3>
-                <p className="field-hint" style={{ margin: '0.25rem 0 0' }}>
+                <p className="field-hint" style={{ margin: '0.3rem 0 0', maxWidth: '720px' }}>
                   Delete unused categories or add a new one. Deleting a category also cleans it from supplier and RFQ tags.
                 </p>
               </div>
@@ -281,57 +288,81 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
               </button>
             </div>
 
-            <div style={{ padding: '0.75rem 0', maxHeight: '360px', overflowY: 'auto' }}>
+            <div
+              style={{
+                padding: '1rem 1.25rem',
+                overflowY: 'auto',
+                flex: 1
+              }}
+            >
               {categories.length === 0 ? (
-                <div className="empty-state" style={{ padding: '1rem' }}>No categories yet.</div>
+                <div className="empty-state" style={{ padding: '2rem' }}>No categories yet.</div>
               ) : (
-                categories.map((cat) => (
-                  <div
-                    key={cat}
-                    style={{
-                      display: 'flex',
-                      justifyContent: 'space-between',
-                      alignItems: 'center',
-                      gap: '0.75rem',
-                      padding: '0.55rem 0.25rem',
-                      borderBottom: '1px solid var(--border-color, #e5e7eb)'
-                    }}
-                  >
-                    <span className="badge badge-category">{cat}</span>
-                    <button
-                      type="button"
-                      className="btn btn-ghost btn-sm"
-                      disabled={deletingCategory === cat}
-                      onClick={() => handleDeleteCategory(cat)}
-                      title={`Delete ${cat}`}
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))',
+                    gap: '0.75rem'
+                  }}
+                >
+                  {categories.map((cat) => (
+                    <div
+                      key={cat}
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        gap: '0.75rem',
+                        padding: '0.75rem 0.85rem',
+                        minHeight: '58px',
+                        background: 'rgba(255,255,255,0.035)',
+                        border: '1px solid var(--panel-border)',
+                        borderRadius: '10px'
+                      }}
                     >
-                      <Trash2 size={15} />
-                      {deletingCategory === cat ? 'Deleting...' : 'Delete'}
-                    </button>
-                  </div>
-                ))
+                      <span className="badge badge-category" style={{ maxWidth: '70%', whiteSpace: 'normal' }}>{cat}</span>
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        disabled={deletingCategory === cat}
+                        onClick={() => handleDeleteCategory(cat)}
+                        title={`Delete ${cat}`}
+                      >
+                        <Trash2 size={15} />
+                        {deletingCategory === cat ? 'Deleting...' : 'Delete'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
 
-            <div style={{ display: 'flex', gap: '0.5rem', paddingTop: '0.75rem' }}>
+            <div
+              className="modal-footer"
+              style={{
+                justifyContent: 'stretch',
+                gap: '0.75rem',
+                padding: '1rem 1.25rem'
+              }}
+            >
               <input
                 type="text"
                 className="input-field"
                 placeholder="New category name"
                 value={customCatName}
                 onChange={(e) => setCustomCatName(e.target.value)}
-                style={{ flex: 1 }}
+                style={{ flex: 1, paddingLeft: '1rem' }}
               />
               <button
                 type="button"
-                className="btn btn-primary btn-sm"
+                className="btn btn-primary"
                 disabled={creatingCat || !customCatName.trim()}
                 onClick={async (e) => {
                   await handleCreateCustomCategory(e);
                   await loadCategories();
                 }}
               >
-                {creatingCat ? 'Adding...' : 'Add'}
+                {creatingCat ? 'Adding...' : 'Add Category'}
               </button>
             </div>
           </div>
