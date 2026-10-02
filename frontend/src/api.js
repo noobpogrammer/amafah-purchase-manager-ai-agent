@@ -381,14 +381,56 @@ export async function fetchCategories() {
   const clientId = await getCurrentClientId();
   if (!clientId) throw new Error('Missing client_id (not authenticated)');
 
-  const { data, error } = await supabase
-    .from('categories')
-    .select('name')
-    .eq('client_id', clientId)
-    .order('created_at', { ascending: true });
+  // Categories can enter the system in three ways:
+  // 1) the managed categories table,
+  // 2) supplier imports (supplier.category[]), and
+  // 3) RFQs created/imported directly in the database.
+  // Use the union so Manage Categories and RFQ creation always reflect reality.
+  const [categoryRes, supplierRes, rfqRes] = await Promise.all([
+    supabase
+      .from('categories')
+      .select('name')
+      .eq('client_id', clientId),
+    supabase
+      .from('suppliers')
+      .select('category')
+      .eq('client_id', clientId)
+      .is('deleted_at', null),
+    supabase
+      .from('rfqs')
+      .select('category, categories')
+      .eq('client_id', clientId),
+  ]);
 
-  if (error) throw error;
-  return (data || []).map((c) => c.name).filter(Boolean);
+  if (categoryRes.error) throw categoryRes.error;
+  if (supplierRes.error) throw supplierRes.error;
+  if (rfqRes.error) throw rfqRes.error;
+
+  const all = new Set();
+
+  (categoryRes.data || []).forEach((row) => {
+    const name = (row.name || '').trim();
+    if (name) all.add(name);
+  });
+
+  (supplierRes.data || []).forEach((row) => {
+    (Array.isArray(row.category) ? row.category : []).forEach((raw) => {
+      const name = String(raw || '').trim();
+      if (name) all.add(name);
+    });
+  });
+
+  (rfqRes.data || []).forEach((row) => {
+    const values = Array.isArray(row.categories) && row.categories.length
+      ? row.categories
+      : [row.category];
+    values.forEach((raw) => {
+      const name = String(raw || '').trim();
+      if (name) all.add(name);
+    });
+  });
+
+  return Array.from(all).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 }
 
 export async function createCustomCategory(categoryName) {
