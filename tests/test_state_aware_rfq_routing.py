@@ -201,3 +201,27 @@ def test_full_new_quote_does_not_get_stolen_by_old_negotiation_context():
     assert result["candidates"] == [unanswered]
     assert result["matched_rfq_id"] == "COPPER PIPE"
     assert result["match_source"] == "routing_new_quote"
+
+
+def test_compact_currency_and_dozen_packaging_trigger_commercial_gate():
+    entry = make_entry("NORA BRUSH", status="sent")
+
+    assert main.should_invoke_commercial_parser(
+        "we only provide in dozen packaging - 48aed per dozen",
+        matched_rfq_supplier=None,
+        pending=None,
+        active_session=None,
+        open_rfqs=[entry],
+    ) is True
+
+
+def test_compact_aed_format_is_procurement_signal():
+    entry = make_entry("NORA BRUSH", status="sent")
+
+    assert main.should_invoke_commercial_parser(
+        "48aed",
+        matched_rfq_supplier=None,
+        pending=None,
+        active_session=None,
+        open_rfqs=[entry],
+    ) is True
