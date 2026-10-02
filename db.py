@@ -247,7 +247,13 @@ def is_rfq_open(rfq: dict) -> bool:
 
 
 def get_open_rfqs_for_supplier(supplier_id: str):
-    """All active RFQs sent to this supplier, awaiting an initial reply or revision."""
+    """All active RFQs actually delivered to this supplier and still open.
+
+    A supplier link can exist with status='sent' before/without successful
+    WhatsApp delivery. Exclude links whose initial outbound delivery is known
+    to have failed or is unconfirmed, so an undelivered RFQ cannot create
+    ambiguity for a later supplier reply.
+    """
     res = (
         supabase.table("rfq_suppliers")
         .select("*, rfqs(*)")
@@ -255,8 +261,24 @@ def get_open_rfqs_for_supplier(supplier_id: str):
         .in_("status", ["sent", "clarifying", "responded"])
         .execute()
     )
-    # Strictly filter only entries where the underlying RFQ is active and open
-    return [entry for entry in (res.data or []) if is_rfq_open(entry.get("rfqs"))]
+
+    open_entries = []
+    for entry in (res.data or []):
+        rfq = entry.get("rfqs")
+        if not is_rfq_open(rfq):
+            continue
+
+        # A responded/clarifying link is already proven to have real supplier
+        # interaction. For a merely 'sent' link, require confirmed initial
+        # delivery when a delivery record exists.
+        if entry.get("status") == "sent" and rfq and rfq.get("id"):
+            delivery = get_initial_rfq_delivery_status(rfq.get("id"), supplier_id)
+            if delivery and delivery.get("status") != "sent":
+                continue
+
+        open_entries.append(entry)
+
+    return open_entries
 
 
 def record_quotes_batch(rfq_id: str, supplier_id: str, variants: list[dict],
