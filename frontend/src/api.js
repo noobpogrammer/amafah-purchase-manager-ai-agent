@@ -136,6 +136,9 @@ export async function createRFQ(payload) {
     body: JSON.stringify({
       product_name: payload.product_name,
       category: payload.category,
+      categories: payload.categories || (payload.category ? [payload.category] : []),
+      targeting_mode: payload.targeting_mode || 'category',
+      supplier_ids: payload.supplier_ids || [],
       specs: payload.specs,
       quantity: payload.quantity ? parseInt(payload.quantity) : null,
       last_quote: payload.last_quote !== undefined && payload.last_quote !== null && payload.last_quote !== '' ? Number(payload.last_quote) : null,
@@ -384,36 +387,8 @@ export async function fetchCategories() {
     .eq('client_id', clientId)
     .order('created_at', { ascending: true });
 
-  const defaultList = ['Electronics', 'Hardware', 'Plumbing', 'Electrical', 'Tools', 'Building Materials', 'General'];
-  let categoryNames = (data || []).map((c) => c.name);
-
-  if (error || !categoryNames.length) {
-    categoryNames = [...defaultList];
-  }
-
-  // Also collect any categories dynamically from suppliers table if present
-  try {
-    const suppliersRes = await supabase.from('suppliers').select('category').eq('client_id', clientId).is('deleted_at', null);
-    if (suppliersRes.data) {
-      suppliersRes.data.forEach((s) => {
-        if (Array.isArray(s.category)) {
-          s.category.forEach((cat) => {
-            if (cat && !categoryNames.includes(cat)) {
-              categoryNames.push(cat);
-            }
-          });
-        }
-      });
-    }
-  } catch (e) {
-    // Ignore error
-  }
-
-  defaultList.forEach((d) => {
-    if (!categoryNames.includes(d)) categoryNames.push(d);
-  });
-
-  return categoryNames;
+  if (error) throw error;
+  return (data || []).map((c) => c.name).filter(Boolean);
 }
 
 export async function createCustomCategory(categoryName) {
@@ -437,6 +412,20 @@ export async function createCustomCategory(categoryName) {
   }
 
   return cleanName;
+}
+
+export async function deleteCategory(categoryName) {
+  const clean = (categoryName || '').trim();
+  if (!clean) throw new Error('Category name cannot be empty');
+
+  const response = await authorizedFetch(`/admin/categories/${encodeURIComponent(clean)}`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Failed to delete category');
+  }
+  return await response.json();
 }
 
 export async function createInviteToken({ role = 'member', email = null }) {
