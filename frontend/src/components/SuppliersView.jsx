@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Users, Plus, Search, Filter, Edit2, Phone, Tag, Check, X, Trash2, ChevronDown } from 'lucide-react';
-import { createSupplier, updateSupplier, deleteSupplier, fetchCategories, createCustomCategory } from '../api';
+import { createSupplier, updateSupplier, deleteSupplier, fetchCategories, createCustomCategory, deleteCategory } from '../api';
 
 const DEFAULT_CATEGORIES = [
   'Electronics',
@@ -27,6 +27,8 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
   const [creatingCat, setCreatingCat] = useState(false);
   const [categoryDropdownOpen, setCategoryDropdownOpen] = useState(false);
   const [deletingSupplierId, setDeletingSupplierId] = useState(null);
+  const [showCategoryManager, setShowCategoryManager] = useState(false);
+  const [deletingCategory, setDeletingCategory] = useState('');
 
   // Form State
   const [name, setName] = useState('');
@@ -38,9 +40,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
   const loadCategories = async () => {
     try {
       const list = await fetchCategories();
-      if (list && list.length) {
-        setCategories(list);
-      }
+      setCategories(list || []);
     } catch (e) {
       console.error('Error loading categories:', e);
     }
@@ -55,7 +55,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
     setEditingSupplier(null);
     setName('');
     setPhone('');
-    setSelectedCategories(['Hardware']);
+    setSelectedCategories(categories[0] ? [categories[0]] : []);
     setNotes('');
     setIsActive(true);
     setErrorMsg('');
@@ -109,6 +109,28 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
       setSelectedCategories(selectedCategories.filter((c) => c !== cat));
     } else {
       setSelectedCategories([...selectedCategories, cat]);
+    }
+  };
+
+  const handleDeleteCategory = async (cat) => {
+    if (!isAdmin || !cat) return;
+    const confirmed = window.confirm(
+      `Delete category "${cat}"? It will be removed from the category list, supplier category tags, and RFQ category tags. Historical RFQs and supplier records will not be deleted.`
+    );
+    if (!confirmed) return;
+
+    setDeletingCategory(cat);
+    setErrorMsg('');
+    try {
+      await deleteCategory(cat);
+      setSelectedCategories((current) => current.filter((c) => c !== cat));
+      if (categoryFilter === cat) setCategoryFilter('');
+      await Promise.all([loadCategories(), refreshSuppliers()]);
+    } catch (err) {
+      console.error(err);
+      setErrorMsg(err.message || 'Failed to delete category');
+    } finally {
+      setDeletingCategory('');
     }
   };
 
@@ -232,7 +254,89 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
             ))}
           </select>
         </div>
+
+        {isAdmin && (
+          <button type="button" className="btn btn-secondary btn-sm" onClick={() => setShowCategoryManager(true)}>
+            <Tag size={16} /> Manage Categories
+          </button>
+        )}
       </div>
+
+      {showCategoryManager && (
+        <div className="modal-overlay" onClick={() => setShowCategoryManager(false)}>
+          <div
+            className="modal-card"
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: '520px', width: '92%', maxHeight: '70vh', overflow: 'hidden' }}
+          >
+            <div className="modal-header">
+              <div>
+                <h3 style={{ margin: 0 }}>Manage Categories</h3>
+                <p className="field-hint" style={{ margin: '0.25rem 0 0' }}>
+                  Delete unused categories or add a new one. Deleting a category also cleans it from supplier and RFQ tags.
+                </p>
+              </div>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowCategoryManager(false)}>
+                <X size={18} />
+              </button>
+            </div>
+
+            <div style={{ padding: '0.75rem 0', maxHeight: '360px', overflowY: 'auto' }}>
+              {categories.length === 0 ? (
+                <div className="empty-state" style={{ padding: '1rem' }}>No categories yet.</div>
+              ) : (
+                categories.map((cat) => (
+                  <div
+                    key={cat}
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '0.75rem',
+                      padding: '0.55rem 0.25rem',
+                      borderBottom: '1px solid var(--border-color, #e5e7eb)'
+                    }}
+                  >
+                    <span className="badge badge-category">{cat}</span>
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      disabled={deletingCategory === cat}
+                      onClick={() => handleDeleteCategory(cat)}
+                      title={`Delete ${cat}`}
+                    >
+                      <Trash2 size={15} />
+                      {deletingCategory === cat ? 'Deleting...' : 'Delete'}
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div style={{ display: 'flex', gap: '0.5rem', paddingTop: '0.75rem' }}>
+              <input
+                type="text"
+                className="input-field"
+                placeholder="New category name"
+                value={customCatName}
+                onChange={(e) => setCustomCatName(e.target.value)}
+                style={{ flex: 1 }}
+              />
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                disabled={creatingCat || !customCatName.trim()}
+                onClick={async (e) => {
+                  await handleCreateCustomCategory(e);
+                  await loadCategories();
+                }}
+              >
+                {creatingCat ? 'Adding...' : 'Add'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Suppliers Table */}
       <div className="card table-card">
