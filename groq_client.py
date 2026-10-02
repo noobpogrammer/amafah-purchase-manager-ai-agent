@@ -449,7 +449,7 @@ RULES:
 1. If the supplier offers a price contingent on a delivery schedule (e.g. "50 if you allow 6-day delivery", "if you can accept 6 days, I can do 50 AED", "ready in 4 days"), set tradeoff.present=true, tradeoff.dimension="delivery", price.amount=50, delivery.days=6, intent="conditional_offer".
 2. If the supplier offers a price contingent on volume (e.g. "if you take 100 units I can do 42"), set tradeoff.present=true, tradeoff.dimension="quantity", quantity.value=100, price.amount=42, intent="conditional_offer".
 3. If the message states a minimum order quantity (e.g. "MOQ 50"), set quantity.minimum_order_quantity=50, tradeoff.present=true, tradeoff.dimension="quantity".
-4. If the supplier offers an alternative specification or brand (e.g. "alternative brand ABB at 38 AED", "substitute: Grade 316"), set tradeoff.present=true, tradeoff.dimension="specification", specification.alternative="ABB", price.amount=38, intent="conditional_offer".
+4. A plain brand label is a quote variant, NOT automatically a specification trade-off. Only populate specification.alternative and mark a specification trade-off when the supplier explicitly proposes a substitute/alternative/instead-of specification or brand (e.g. "alternative brand ABB instead", "substitute: Grade 316"). If the supplier simply lists brands with prices (e.g. "FLEXTOP 2415, EZFLEX 2178"), do not call that a specification trade-off.
 5. If the message states payment requirements (e.g. "50% advance against PI"), set payment_terms.text="50% advance against PI", tradeoff.present=true, tradeoff.dimension="payment".
 6. If the supplier states the price is final/last/best (e.g. "final 49", "cannot go lower than 50", "best and final"), set supplier_final=true.
 7. If the supplier mentions a specific product name (e.g. "TEST COPPER PIPE", "pvc pipe"), extract it into explicit_product_reference.
@@ -460,6 +460,8 @@ RULES:
 12. Use routing_intent="REVISION" when the supplier explicitly signals an update to an earlier quote (e.g. "revised price", "updated quote", "new rate", "new price", "lower it to").
 13. Use routing_intent="NEGOTIATION_REPLY" for a clear response to bargaining/counteroffer language (e.g. "I can do 50", "50 final", "best I can do is 50", "cannot go lower than 50", "deal", "can't accept that").
 14. Use routing_intent="UNKNOWN" when the message type is genuinely ambiguous. Prefer UNKNOWN over guessing.
+15. Do not invent facts. If a field cannot be determined confidently from the supplier's wording, leave it null and lower confidence rather than forcing an interpretation.
+16. Restating the RFQ quantity is not a quantity trade-off. A quantity trade-off requires a different quantity, MOQ, or explicit quantity condition.
 """
 
 
