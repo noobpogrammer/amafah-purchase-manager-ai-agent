@@ -60,7 +60,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
   const loadCategories = async () => {
     try {
       const list = await fetchCategories();
-      const usable = list && list.length ? list : DEFAULT_CATEGORIES;
+      const usable = list || [];
       setCategories(usable);
       if (!category || !usable.includes(category)) {
         setCategory(usable[0] || '');
