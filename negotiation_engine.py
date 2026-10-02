@@ -435,7 +435,12 @@ def evaluate_supplier_tradeoff(
     if qty_constraint and qty_constraint.get("constraints"):
         current_qty = qty_constraint["constraints"].get("required") or current_qty
 
-    if proposed_qty is not None and (proposed_qty != current_qty or has_tradeoff_flag or tradeoff_dim == "quantity"):
+    # Quoting the exact requested quantity is not a trade-off, even if the
+    # parser noticed quantity language such as "1 roll".
+    if proposed_qty is not None and current_qty is not None and int(proposed_qty) == int(current_qty):
+        proposed_qty = None
+
+    if proposed_qty is not None and proposed_qty != current_qty:
         if qty_constraint and qty_constraint.get("status") == "authorized":
             q_min = qty_constraint.get("constraints", {}).get("min")
             q_max = qty_constraint.get("constraints", {}).get("max")
@@ -467,9 +472,16 @@ def evaluate_supplier_tradeoff(
             }
 
     # 3. Check Specification Trade-off
-    proposed_spec = spec_info.get("alternative") or extracted_variant
+    # A quote variant/brand label is not automatically a specification change.
+    # Only treat it as a trade-off when the parser/text explicitly presents it
+    # as an alternative/substitute/instead-of specification.
+    proposed_spec = spec_info.get("alternative")
     if not proposed_spec and text:
-        spec_match = re.search(r"\b(?:alternative|substitute|option|instead\s+of|brand)\s*:\s*([A-Za-z0-9\s]+)", text, re.IGNORECASE)
+        spec_match = re.search(
+            r"\b(?:alternative|substitute|instead\s+of)\s*:?[\s-]*([A-Za-z0-9][A-Za-z0-9 ._/-]*)",
+            text,
+            re.IGNORECASE,
+        )
         if spec_match:
             proposed_spec = spec_match.group(1).strip()
 

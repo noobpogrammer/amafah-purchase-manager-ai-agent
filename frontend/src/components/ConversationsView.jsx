@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { fetchMessages, fetchSuppliers, fetchRFQs, formatRfqDropdownLabel } from '../api';
-import { MessageSquare, Phone, Filter, Clock, Bot, User } from 'lucide-react';
+import { MessageSquare, Phone, Filter, Clock, Bot, User, Search } from 'lucide-react';
 
 export default function ConversationsView() {
   const [messages, setMessages] = useState([]);
@@ -10,6 +10,7 @@ export default function ConversationsView() {
 
   const [selectedSupplierId, setSelectedSupplierId] = useState('');
   const [selectedRfqId, setSelectedRfqId] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
     async function loadFilterOptions() {
@@ -43,6 +44,18 @@ export default function ConversationsView() {
     loadTranscript();
   }, [selectedSupplierId, selectedRfqId]);
 
+  const filteredMessages = messages.filter((msg) => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return true;
+    const supplierName = msg.suppliers?.name || '';
+    const phone = msg.suppliers?.phone_number || '';
+    const product = msg.rfqs?.product_name || '';
+    const body = msg.body || '';
+    return [supplierName, phone, product, body].some((value) =>
+      String(value).toLowerCase().includes(q)
+    );
+  });
+
   return (
     <div className="view-container">
       <div className="view-header">
@@ -56,6 +69,17 @@ export default function ConversationsView() {
 
       {/* Filter Bar */}
       <div className="filter-bar">
+        <div className="filter-select-wrap" style={{ minWidth: '260px', position: 'relative' }}>
+          <Search size={18} className="filter-icon" />
+          <input
+            type="search"
+            className="input-field"
+            placeholder="Search supplier, product, phone or message..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            style={{ paddingLeft: '2.2rem' }}
+          />
+        </div>
         <div className="filter-select-wrap">
           <Filter size={18} className="filter-icon" />
           <select
@@ -97,7 +121,7 @@ export default function ConversationsView() {
       <div className="card chat-transcript-card">
         {loading ? (
           <div className="loading-state">Loading WhatsApp transcript history...</div>
-        ) : messages.length === 0 ? (
+        ) : filteredMessages.length === 0 ? (
           <div className="empty-state">
             <MessageSquare size={40} className="empty-icon" />
             <h3>No WhatsApp Messages Logged</h3>
@@ -105,7 +129,7 @@ export default function ConversationsView() {
           </div>
         ) : (
           <div className="chat-messages-container">
-            {messages.map((msg) => {
+            {filteredMessages.map((msg) => {
               const isInbound = msg.direction === 'inbound';
               const supplierName = msg.suppliers?.name || 'Supplier';
               const phone = msg.suppliers?.phone_number || '';

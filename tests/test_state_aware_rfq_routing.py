@@ -225,3 +225,27 @@ def test_compact_aed_format_is_procurement_signal():
         active_session=None,
         open_rfqs=[entry],
     ) is True
+
+
+def test_ai_parser_runs_for_unusual_supplier_wording_with_open_rfq():
+    entry = make_entry("WIRE RFQ", status="sent")
+
+    assert main.should_invoke_commercial_parser(
+        "our rate for this one works out at forty eight for the carton",
+        matched_rfq_supplier=None,
+        pending=None,
+        active_session=None,
+        open_rfqs=[entry],
+    ) is True
+
+
+def test_obvious_social_ack_can_skip_parser_without_locked_context():
+    entry = make_entry("WIRE RFQ", status="sent")
+
+    assert main.should_invoke_commercial_parser(
+        "Ok",
+        matched_rfq_supplier=None,
+        pending=None,
+        active_session=None,
+        open_rfqs=[entry],
+    ) is False
