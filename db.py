@@ -1031,6 +1031,24 @@ def get_rfqs_by_date(client_id: str, start_dt: str, end_dt: str) -> list:
     return res.data or []
 
 
+def delete_category_clean(client_id: str, category: str) -> dict | None:
+    """Delete a tenant category and remove it from active supplier/RFQ category arrays."""
+    if not client_id or not category or not str(category).strip():
+        return None
+    try:
+        res = supabase.rpc("delete_category_clean", {
+            "p_client_id": client_id,
+            "p_category": str(category).strip(),
+        }).execute()
+        data = res.data
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data if isinstance(data, dict) else None
+    except Exception as ex:
+        logger.warning("delete_category_clean error for %s: %s", category, ex)
+        return None
+
+
 def soft_delete_supplier(supplier_id: str, client_id: str) -> dict | None:
     """Admin-facing supplier deletion that preserves procurement history.
 
