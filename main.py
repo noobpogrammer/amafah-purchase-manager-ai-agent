@@ -43,6 +43,7 @@ scheduler = AsyncIOScheduler()
 
 DEMO_CLIENT_ID = "d88c52ad-3d0b-42e9-86f1-b9f70018856b"
 THANK_YOU_MSG = "Thanks for the quote! We'll be in touch if we move forward."
+UNAVAILABLE_ACK_MSG = "Thanks for letting us know."
 HUMAN_ACK_MSG = "Thanks! We'll review your response and get back to you shortly."
 
 MAX_NO_PROGRESS_ATTEMPTS = 2
@@ -1262,6 +1263,33 @@ app.add_middleware(
 )
 
 
+def build_rfq_invitation_message(
+    product_name: str,
+    specs: Optional[str],
+    quantity: Optional[int],
+    deadline_hours: int,
+    required_delivery_days: Optional[int] = None,
+) -> str:
+    """Build the canonical Everyware supplier-facing RFQ invitation."""
+    lines = [f"* Product: {product_name}"]
+    clean_specs = (specs or "").strip()
+    if clean_specs and clean_specs not in {".", "-", "N/A", "n/a"}:
+        lines.append(f"* Specs: {clean_specs}")
+    lines.append(f"* Quantity: {quantity if quantity is not None else 'N/A'}")
+    lines.append(f"* Quote Required Within: {deadline_hours} hour(s)")
+    if required_delivery_days is not None and required_delivery_days > 0:
+        day_str = "day" if required_delivery_days == 1 else "days"
+        lines.append(f"* Required Delivery: Within {required_delivery_days} {day_str}")
+
+    return (
+        "Hi! This is Everyware®️ (Al Noon Int’l Trading LLC).\n\n"
+        "We're requesting a quote for the following item:\n"
+        + "\n".join(lines)
+        + "\n\nPlease respond to this message with your final price per unit (AED) "
+          "and estimated delivery time.\n\nThanks."
+    )
+
+
 def is_supplier_final_price_statement(message: str) -> bool:
     """Detects whether supplier explicitly stated their price is final, lowest, or non-negotiable."""
     if not message:
@@ -1283,6 +1311,8 @@ def generate_adaptive_negotiation_message(
     var_prefix = f"For the {variant_label} option, " if variant_label else ""
     if strategy == "ANCHOR":
         return f"{var_prefix}Thanks for the quote. We're looking for a more competitive rate on this order. Could you do AED {counter_price:g} per piece?"
+    elif strategy == "STRETCH_SAVINGS":
+        return f"{var_prefix}Thanks for the competitive price. Could you make it AED {counter_price:g} per piece for this order?"
     elif strategy == "RECIPROCAL_CONCESSION":
         if supplier_last_concession >= 5.0:
             return f"{var_prefix}Thanks for moving significantly on the price. We're getting closer. Could you meet us at AED {counter_price:g} per piece?"
@@ -1854,11 +1884,13 @@ async def execute_validated_action(
                     "flag_id": flag_id,
                 }
 
-            # Normal quote acknowledgement (no escalation)
-            msg_log_id = db.log_message(client_id, supplier_id, "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
+            # Semantic acknowledgement: an unavailable product is not a quote.
+            all_unavailable = bool(variants) and all(v.get("is_available", True) is False for v in variants)
+            acknowledgement_msg = UNAVAILABLE_ACK_MSG if all_unavailable else THANK_YOU_MSG
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", acknowledgement_msg, related_rfq_id=target_rfq_id)
             if not msg_log_id:
-                raise RuntimeError("Failed to log outbound thank-you message durably.")
-            await enqueue_message(phone_number, THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+                raise RuntimeError("Failed to log outbound acknowledgement durably.")
+            await enqueue_message(phone_number, acknowledgement_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
 
             if decision_id:
                 updated_args = dict(args)
@@ -2942,22 +2974,12 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
             "message": f"RFQ created (ID: {rfq['id']}), but no active suppliers matched category '{req.category}'.",
         }
 
-    rfq_lines = [
-        f"• Product: {req.product_name}",
-        f"• Specs: {req.specs or 'Standard'}",
-        f"• Quantity: {req.quantity or 'N/A'}",
-        f"• Quote Required Within: {req.deadline_hours} hour(s)",
-    ]
-    if req.required_delivery_days is not None and req.required_delivery_days > 0:
-        day_str = "day" if req.required_delivery_days == 1 else "days"
-        rfq_lines.append(f"• Required Delivery: Within {req.required_delivery_days} {day_str}")
-
-    items_text = "\n".join(rfq_lines)
-    rfq_msg = (
-        f"Hi! This is Amafha Hardware Store.\n"
-        f"We're requesting a quote for the following item:\n\n"
-        f"{items_text}\n\n"
-        f"Please reply directly to this message with your price per unit (AED) and estimated delivery time. Thanks!"
+    rfq_msg = build_rfq_invitation_message(
+        product_name=req.product_name,
+        specs=req.specs,
+        quantity=req.quantity,
+        deadline_hours=req.deadline_hours,
+        required_delivery_days=req.required_delivery_days,
     )
 
     for supplier in matched_suppliers:
@@ -3130,14 +3152,12 @@ async def bulk_create_rfq_endpoint(
         rfq, matched_suppliers = db.create_rfq_and_match_suppliers(**create_kwargs)
 
         if matched_suppliers:
-            rfq_msg = (
-                f"Hi! This is Amafha Hardware Store.\n"
-                f"We're requesting a quote for the following item:\n\n"
-                f"• Product: {final_product_name}\n"
-                f"• Specs: {final_specs or 'Standard'}\n"
-                f"• Quantity: {final_quantity or 'N/A'}\n"
-                f"• Quote Required Within: {final_deadline} hour(s)\n\n"
-                f"Please reply directly to this message with your price per unit (AED) and estimated delivery time. Thanks!"
+            rfq_msg = build_rfq_invitation_message(
+                product_name=final_product_name,
+                specs=final_specs,
+                quantity=final_quantity,
+                deadline_hours=final_deadline,
+                required_delivery_days=None,
             )
             for supplier in matched_suppliers:
                 phone = supplier.get("phone_number")
