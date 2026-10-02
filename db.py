@@ -1031,6 +1031,24 @@ def get_rfqs_by_date(client_id: str, start_dt: str, end_dt: str) -> list:
     return res.data or []
 
 
+def delete_category_clean(client_id: str, category: str) -> dict | None:
+    """Delete a tenant category and remove it from active supplier/RFQ category arrays."""
+    if not client_id or not category or not str(category).strip():
+        return None
+    try:
+        res = supabase.rpc("delete_category_clean", {
+            "p_client_id": client_id,
+            "p_category": str(category).strip(),
+        }).execute()
+        data = res.data
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data if isinstance(data, dict) else None
+    except Exception as ex:
+        logger.warning("delete_category_clean error for %s: %s", category, ex)
+        return None
+
+
 def soft_delete_supplier(supplier_id: str, client_id: str) -> dict | None:
     """Admin-facing supplier deletion that preserves procurement history.
 
@@ -1834,7 +1852,10 @@ def build_historical_price_context(last_quote: float = None, current_quote: floa
 def create_rfq_and_match_suppliers(
     client_id: str,
     product_name: str,
-    category: str,
+    category: str = None,
+    categories: Optional[list] = None,
+    supplier_ids: Optional[list] = None,
+    targeting_mode: str = "category",
     deadline_hours: int = 24,
     specs: str = None,
     quantity: int = None,
@@ -1846,13 +1867,35 @@ def create_rfq_and_match_suppliers(
     authorized_by: Optional[str] = None,
 ):
     """
-    Atomically creates a new RFQ row and initial rfq_negotiation_constraints in a single PostgreSQL transaction
-    using create_rfq_with_constraints_rpc. Then matches active suppliers by category and creates rfq_suppliers join records.
+    Creates an RFQ and its initial negotiation constraints, then targets suppliers
+    either by selected supplier IDs or by ANY of the RFQ's selected categories.
+    The legacy scalar category is preserved as the first selected category for
+    backward compatibility; rfqs.categories is authoritative for multi-category UI/matching.
     """
+    clean_categories = []
+    for raw in (categories or ([category] if category else [])):
+        clean = str(raw or "").strip()
+        if clean and clean not in clean_categories:
+            clean_categories.append(clean)
+    if not clean_categories:
+        raise ValueError("At least one RFQ category is required")
+    primary_category = clean_categories[0]
+
+    clean_supplier_ids = []
+    for raw in (supplier_ids or []):
+        sid = str(raw or "").strip()
+        if sid and sid not in clean_supplier_ids:
+            clean_supplier_ids.append(sid)
+
+    if targeting_mode not in {"category", "selected"}:
+        targeting_mode = "category"
+    if targeting_mode == "selected" and not clean_supplier_ids:
+        raise ValueError("Selected supplier targeting requires at least one supplier")
+
     rfq_data = {
         "client_id": client_id,
         "product_name": product_name,
-        "category": category,
+        "category": primary_category,
         "specs": specs,
         "quantity": quantity,
         "deadline_hours": deadline_hours,
@@ -1872,7 +1915,7 @@ def create_rfq_and_match_suppliers(
     rpc_params = {
         "p_client_id": client_id,
         "p_product_name": product_name,
-        "p_category": category,
+        "p_category": primary_category,
         "p_specs": specs,
         "p_quantity": quantity,
         "p_last_quote": last_quote,
@@ -1889,9 +1932,41 @@ def create_rfq_and_match_suppliers(
     res_data = rpc_res.data
     rfq = res_data[0] if isinstance(res_data, list) and len(res_data) > 0 else res_data
 
-    matching_suppliers = get_suppliers_by_category(client_id, category)
+    # Persist the full RFQ category set after the backward-compatible RPC insert.
+    supabase.table("rfqs").update({
+        "categories": clean_categories,
+        "category": primary_category,
+    }).eq("id", rfq["id"]).eq("client_id", client_id).execute()
+    rfq["categories"] = clean_categories
+    rfq["category"] = primary_category
 
-    # Deduplicate matched suppliers by id
+    if targeting_mode == "selected":
+        supplier_res = (
+            supabase.table("suppliers")
+            .select("*")
+            .eq("client_id", client_id)
+            .eq("is_active", True)
+            .is_("deleted_at", "null")
+            .in_("id", clean_supplier_ids)
+            .execute()
+        )
+        matching_suppliers = supplier_res.data or []
+    else:
+        supplier_res = (
+            supabase.table("suppliers")
+            .select("*")
+            .eq("client_id", client_id)
+            .eq("is_active", True)
+            .is_("deleted_at", "null")
+            .execute()
+        )
+        wanted = set(clean_categories)
+        matching_suppliers = [
+            s for s in (supplier_res.data or [])
+            if wanted.intersection(set(s.get("category") or []))
+        ]
+
+    # Deduplicate matched suppliers by id.
     unique_suppliers = []
     seen_ids = set()
     for s in matching_suppliers:

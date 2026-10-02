@@ -66,7 +66,10 @@ class PasswordResetRequest(BaseModel):
 
 class RFQCreateRequest(BaseModel):
     product_name: str
-    category: str = Field(..., min_length=1)
+    category: Optional[str] = None
+    categories: Optional[List[str]] = None
+    supplier_ids: Optional[List[str]] = None
+    targeting_mode: str = "category"
     specs: str
     quantity: Optional[int] = None
     last_quote: Optional[float] = None
@@ -76,7 +79,7 @@ class RFQCreateRequest(BaseModel):
     required_delivery_days: Optional[int] = None
     flexibility: Optional[dict] = None
 
-    @field_validator("product_name", "category", "specs")
+    @field_validator("product_name", "specs")
     @classmethod
     def validate_non_empty(cls, v: str, info: ValidationInfo) -> str:
         if v is None or not str(v).strip():
@@ -106,10 +109,35 @@ class RFQCreateRequest(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def validate_price_range(self) -> "RFQCreateRequest":
+    def validate_rfq(self) -> "RFQCreateRequest":
+        clean_categories = []
+        for raw in (self.categories or ([self.category] if self.category else [])):
+            clean = str(raw or "").strip()
+            if clean and clean not in clean_categories:
+                clean_categories.append(clean)
+        if not clean_categories:
+            raise ValueError("At least one supplier category is required")
+        self.categories = clean_categories
+        self.category = clean_categories[0]
+
+        mode = (self.targeting_mode or "category").strip().lower()
+        if mode not in {"category", "selected"}:
+            raise ValueError("targeting_mode must be 'category' or 'selected'")
+        self.targeting_mode = mode
+
+        clean_supplier_ids = []
+        for raw in (self.supplier_ids or []):
+            sid = str(raw or "").strip()
+            if sid and sid not in clean_supplier_ids:
+                clean_supplier_ids.append(sid)
+        self.supplier_ids = clean_supplier_ids
+        if mode == "selected" and not clean_supplier_ids:
+            raise ValueError("Select at least one supplier when targeting_mode is 'selected'")
+
         if self.acceptable_price_min is not None and self.acceptable_price_max is not None:
             if self.acceptable_price_min > self.acceptable_price_max:
                 raise ValueError("acceptable_price_min cannot be greater than acceptable_price_max")
+
         if self.flexibility and isinstance(self.flexibility, dict):
             qty_dict = self.flexibility.get("quantity")
             if isinstance(qty_dict, dict) and qty_dict.get("authorized"):
@@ -151,7 +179,6 @@ class RFQCreateRequest(BaseModel):
                 if alt is not None and not str(alt).strip():
                     raise ValueError("allowed_alternatives cannot be empty when authorized")
         return self
-
 
 def normalize_bulk_description(value: str) -> str:
     text = (value or "").strip()
@@ -3280,14 +3307,16 @@ async def reset_password(payload: PasswordResetRequest, request: Request):
 
 @app.post("/rfq/create")
 async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_current_user)):
-    """Creates a new RFQ, matches active suppliers by category, and enqueues initial WhatsApp RFQs."""
-    # Derive client_id from authenticated profile (do not trust client-supplied client_id)
+    """Create an RFQ and send it to category matches or explicitly selected suppliers."""
     client_id = current_user.get("client_id")
 
     create_kwargs = {
         "client_id": client_id,
         "product_name": req.product_name,
         "category": req.category,
+        "categories": req.categories,
+        "supplier_ids": req.supplier_ids,
+        "targeting_mode": req.targeting_mode,
         "deadline_hours": req.deadline_hours,
         "specs": req.specs,
         "quantity": req.quantity,
@@ -3308,8 +3337,13 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
         return {
             "status": "no_matching_suppliers",
             "rfq_id": rfq["id"],
-            "category": req.category,
-            "message": f"RFQ created (ID: {rfq['id']}), but no active suppliers matched category '{req.category}'.",
+            "categories": req.categories,
+            "targeting_mode": req.targeting_mode,
+            "message": (
+                "RFQ created, but none of the selected suppliers are active."
+                if req.targeting_mode == "selected"
+                else f"RFQ created, but no active suppliers matched any selected category: {', '.join(req.categories or [])}."
+            ),
         }
 
     rfq_msg = build_rfq_invitation_message(
@@ -3322,15 +3356,22 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
 
     for supplier in matched_suppliers:
         msg_log_id = db.log_message(client_id, supplier["id"], "outbound", rfq_msg, related_rfq_id=rfq["id"])
-        await enqueue_message(supplier["phone_number"], rfq_msg, rfq_id=rfq["id"], supplier_id=supplier["id"], message_log_id=msg_log_id)
+        await enqueue_message(
+            supplier["phone_number"],
+            rfq_msg,
+            rfq_id=rfq["id"],
+            supplier_id=supplier["id"],
+            message_log_id=msg_log_id,
+        )
 
     return {
         "status": "success",
         "rfq_id": rfq["id"],
+        "categories": req.categories,
+        "targeting_mode": req.targeting_mode,
         "matched_suppliers_count": len(matched_suppliers),
         "suppliers": [{"id": s["id"], "name": s["name"], "phone": s["phone_number"]} for s in matched_suppliers],
     }
-
 
 @app.post("/rfq/bulk-create")
 async def bulk_create_rfq_endpoint(
@@ -4116,6 +4157,26 @@ async def get_rfq_activity_endpoint(rfq_id: str, current_user=Depends(get_curren
         "count": len(activity),
         "activity": activity,
     }
+
+
+@app.delete("/admin/categories/{category_name}")
+async def delete_category_endpoint(
+    category_name: str,
+    current_user=Depends(get_current_user),
+):
+    """Admin-only clean category deletion for the current tenant."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=400, detail="User has no associated client_id")
+
+    result = db.delete_category_clean(client_id, category_name)
+    if not result:
+        raise HTTPException(status_code=404, detail="Category not found or could not be deleted")
+
+    return {"status": "deleted", **result}
 
 
 @app.delete("/admin/suppliers/{supplier_id}")
