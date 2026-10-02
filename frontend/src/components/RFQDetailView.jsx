@@ -21,7 +21,8 @@ import {
   ChevronUp,
   Send,
   Sliders,
-  UserCheck
+  UserCheck,
+  Search
 } from 'lucide-react';
 
 export default function RFQDetailView({
@@ -39,6 +40,7 @@ export default function RFQDetailView({
   const [confirmClose, setConfirmClose] = useState(false);
   const [closing, setClosing] = useState(false);
   const [filterTab, setFilterTab] = useState('all'); // 'all', 'active', 'closed'
+  const [searchQuery, setSearchQuery] = useState('');
 
   // Admin Activity / Audit state
   const [isAdmin, setIsAdmin] = useState(false);
@@ -219,9 +221,23 @@ export default function RFQDetailView({
   };
 
   const filteredRFQs = rfqs.filter((r) => {
-    if (filterTab === 'active') return r.status === 'active';
-    if (filterTab === 'closed') return r.status === 'closed' || r.status === 'cancelled';
-    return true;
+    const statusMatches =
+      filterTab === 'active'
+        ? r.status === 'active'
+        : filterTab === 'closed'
+          ? r.status === 'closed' || r.status === 'cancelled'
+          : true;
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return statusMatches;
+    const supplierNames = (r.rfq_suppliers || [])
+      .map((entry) => entry.suppliers?.name || '')
+      .join(' ')
+      .toLowerCase();
+    return statusMatches && (
+      (r.product_name || '').toLowerCase().includes(q)
+      || (r.category || '').toLowerCase().includes(q)
+      || supplierNames.includes(q)
+    );
   });
 
   return (
@@ -269,6 +285,18 @@ export default function RFQDetailView({
                 Closed
               </button>
             </div>
+          </div>
+
+          <div style={{ position: 'relative', padding: '0 1rem 0.75rem' }}>
+            <Search size={16} style={{ position: 'absolute', left: '1.75rem', top: '50%', transform: 'translateY(-50%)', opacity: 0.65 }} />
+            <input
+              type="search"
+              className="input-field"
+              placeholder="Search product or supplier..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              style={{ paddingLeft: '2.2rem', width: '100%' }}
+            />
           </div>
 
           {loading ? (
