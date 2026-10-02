@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import { Send, CheckCircle, AlertTriangle, ArrowRight, Tag, Clock, Package, FileText, Upload, ChevronDown, ChevronRight, Sliders } from 'lucide-react';
-import { createRFQ, fetchCategories, createCustomCategory, bulkCreateRFQs } from '../api';
+import { createRFQ, fetchCategories, createCustomCategory, bulkCreateRFQs, fetchSuppliers } from '../api';
 // client_id is derived server-side from authenticated user; do not import DEMO_CLIENT_ID
 
 const DEFAULT_CATEGORIES = [
@@ -19,7 +19,12 @@ const normalizeBulkString = (v) => (typeof v === 'string' ? v.trim() : '');
 export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedRfqId }) {
   const [productName, setProductName] = useState('');
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
-  const [category, setCategory] = useState('Hardware');
+  const [category, setCategory] = useState('Hardware'); // bulk-mode default
+  const [selectedCategories, setSelectedCategories] = useState(['Hardware']);
+  const [targetingMode, setTargetingMode] = useState('category');
+  const [availableSuppliers, setAvailableSuppliers] = useState([]);
+  const [selectedSupplierIds, setSelectedSupplierIds] = useState([]);
+  const [supplierSearch, setSupplierSearch] = useState('');
   const [specs, setSpecs] = useState('');
   const [quantity, setQuantity] = useState('');
   const [lastQuote, setLastQuote] = useState('');
@@ -55,36 +60,55 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
   const loadCategories = async () => {
     try {
       const list = await fetchCategories();
-      if (list && list.length) {
-        setCategories(list);
-        if (!category || !list.includes(category)) {
-          setCategory(list[0]);
-        }
+      const usable = list && list.length ? list : DEFAULT_CATEGORIES;
+      setCategories(usable);
+      if (!category || !usable.includes(category)) {
+        setCategory(usable[0] || '');
       }
+      setSelectedCategories((current) => {
+        const kept = (current || []).filter((cat) => usable.includes(cat));
+        return kept.length ? kept : (usable[0] ? [usable[0]] : []);
+      });
     } catch (e) {
       console.error('Error loading categories:', e);
     }
   };
 
+  const loadSuppliers = async () => {
+    try {
+      const list = await fetchSuppliers();
+      setAvailableSuppliers((list || []).filter((s) => s.is_active !== false));
+    } catch (e) {
+      console.error('Error loading suppliers:', e);
+    }
+  };
+
   useEffect(() => {
     loadCategories();
+    loadSuppliers();
   }, []);
 
   const formHasRequiredFields =
     productName.trim() &&
-    category && category.trim() &&
+    selectedCategories.length > 0 &&
     specs.trim() &&
     String(deadlineHours).trim() !== '' &&
     Number(deadlineHours) > 0;
 
-  const handleCategorySelectChange = (e) => {
-    const val = e.target.value;
-    if (val === '__CREATE_CUSTOM__') {
-      setShowCustomCatInput(true);
-      setCustomCatName('');
-    } else {
-      setCategory(val);
-    }
+  const toggleRfqCategory = (cat) => {
+    setSelectedCategories((current) =>
+      current.includes(cat)
+        ? current.filter((c) => c !== cat)
+        : [...current, cat]
+    );
+  };
+
+  const toggleTargetSupplier = (supplierId) => {
+    setSelectedSupplierIds((current) =>
+      current.includes(supplierId)
+        ? current.filter((id) => id !== supplierId)
+        : [...current, supplierId]
+    );
   };
 
   const handleCreateCustomCategory = async (e) => {
@@ -99,6 +123,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
         setCategories([...categories, created]);
       }
       setCategory(created);
+      setSelectedCategories((current) => current.includes(created) ? current : [...current, created]);
       setCustomCatName('');
       setShowCustomCatInput(false);
     } catch (err) {
@@ -116,8 +141,12 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
       setErrorMsg('Product Name is required.');
       return;
     }
-    if (!category || !category.trim()) {
-      setErrorMsg('Supplier Category is required.');
+    if (selectedCategories.length === 0) {
+      setErrorMsg('Select at least one supplier category.');
+      return;
+    }
+    if (targetingMode === 'selected' && selectedSupplierIds.length === 0) {
+      setErrorMsg('Select at least one supplier, or switch targeting to all category matches.');
       return;
     }
     if (!specs.trim()) {
@@ -208,7 +237,10 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
     try {
       const res = await createRFQ({
         product_name: productName.trim(),
-        category: category.trim(),
+        category: selectedCategories[0],
+        categories: selectedCategories,
+        targeting_mode: targetingMode,
+        supplier_ids: targetingMode === 'selected' ? selectedSupplierIds : [],
         specs: specs.trim(),
         quantity,
         last_quote: lastQuote ? Number(lastQuote) : null,
@@ -478,10 +510,48 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
               <div className="form-row">
                 <div className="form-group">
                   <label className="form-label flex-items">
-                    <Tag size={16} /> Supplier Category *
+                    <Tag size={16} /> Supplier Categories *
                   </label>
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      gap: '0.45rem',
+                      padding: '0.55rem',
+                      border: '1px solid var(--border-color, #d1d5db)',
+                      borderRadius: '8px',
+                      maxHeight: '150px',
+                      overflowY: 'auto'
+                    }}
+                  >
+                    {categories.map((cat) => {
+                      const checked = selectedCategories.includes(cat);
+                      return (
+                        <label
+                          key={cat}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '0.35rem',
+                            padding: '0.35rem 0.55rem',
+                            border: '1px solid var(--border-color, #d1d5db)',
+                            borderRadius: '999px',
+                            cursor: 'pointer'
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => toggleRfqCategory(cat)}
+                          />
+                          <span>{cat}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+
                   {showCustomCatInput ? (
-                    <div className="custom-cat-inline-row" style={{ display: 'flex', gap: '0.4rem' }}>
+                    <div className="custom-cat-inline-row" style={{ display: 'flex', gap: '0.4rem', marginTop: '0.5rem' }}>
                       <input
                         type="text"
                         className="input-field"
@@ -500,27 +570,75 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                       <button type="button" className="btn btn-primary btn-sm" onClick={handleCreateCustomCategory} disabled={creatingCat}>
                         {creatingCat ? 'Adding...' : 'Add'}
                       </button>
-                      <button
-                        type="button"
-                        className="btn btn-secondary btn-sm"
-                        onClick={() => {
-                          setShowCustomCatInput(false);
-                          setCustomCatName('');
-                          if (categories.length > 0) setCategory(categories[0]);
-                        }}
-                      >
+                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => { setShowCustomCatInput(false); setCustomCatName(''); }}>
                         Cancel
                       </button>
                     </div>
                   ) : (
-                    <select className="input-field" value={category} onChange={handleCategorySelectChange} required>
-                      {categories.map((cat) => (
-                        <option key={cat} value={cat}>{cat}</option>
-                      ))}
-                      <option value="__CREATE_CUSTOM__">+ Create Custom Category...</option>
-                    </select>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowCustomCatInput(true)} style={{ marginTop: '0.4rem' }}>
+                      + Create Custom Category
+                    </button>
                   )}
-                  <span className="field-hint">Matching suppliers with '{category}' tag will receive this RFQ.</span>
+                  <span className="field-hint">
+                    Category matching uses ANY selected category. Suppliers are deduplicated automatically.
+                  </span>
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Send RFQ To</label>
+                  <select
+                    className="input-field"
+                    value={targetingMode}
+                    onChange={(e) => setTargetingMode(e.target.value)}
+                  >
+                    <option value="category">All suppliers matching selected categories</option>
+                    <option value="selected">Specific supplier(s)</option>
+                  </select>
+
+                  {targetingMode === 'selected' && (
+                    <div style={{ marginTop: '0.55rem' }}>
+                      <input
+                        type="search"
+                        className="input-field"
+                        placeholder="Search suppliers..."
+                        value={supplierSearch}
+                        onChange={(e) => setSupplierSearch(e.target.value)}
+                      />
+                      <div
+                        style={{
+                          marginTop: '0.4rem',
+                          maxHeight: '170px',
+                          overflowY: 'auto',
+                          border: '1px solid var(--border-color, #d1d5db)',
+                          borderRadius: '8px',
+                          padding: '0.35rem'
+                        }}
+                      >
+                        {availableSuppliers
+                          .filter((s) => {
+                            const q = supplierSearch.trim().toLowerCase();
+                            return !q || (s.name || '').toLowerCase().includes(q) || (s.phone_number || '').includes(q);
+                          })
+                          .map((supplier) => (
+                            <label
+                              key={supplier.id}
+                              style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', padding: '0.4rem', cursor: 'pointer' }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={selectedSupplierIds.includes(supplier.id)}
+                                onChange={() => toggleTargetSupplier(supplier.id)}
+                              />
+                              <span>
+                                <strong>{supplier.name}</strong>
+                                <span className="phone-sub" style={{ marginLeft: '0.4rem' }}>{supplier.phone_number}</span>
+                              </span>
+                            </label>
+                          ))}
+                      </div>
+                      <span className="field-hint">{selectedSupplierIds.length} supplier(s) selected.</span>
+                    </div>
+                  )}
                 </div>
 
                 <div className="form-group">
@@ -902,7 +1020,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                   <div>
                     <h3 className="banner-title">RFQ Created & Suppliers Matched</h3>
                     <p className="banner-subtitle">
-                      Matched <strong>{matchedResult.matched_suppliers_count} supplier(s)</strong> in category '{category}'. Outbound WhatsApp messages have been pushed to the pacing queue.
+                      Contacted <strong>{matchedResult.matched_suppliers_count} supplier(s)</strong> via {matchedResult.targeting_mode === 'selected' ? 'your selected supplier list' : `categories: ${(matchedResult.categories || selectedCategories).join(', ')}`}. Outbound WhatsApp messages have been pushed to the pacing queue.
                     </p>
                   </div>
                 </div>
@@ -931,7 +1049,7 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                 <AlertTriangle size={28} className="banner-icon warning-icon" />
                 <div>
                   <h3 className="banner-title">No Matching Suppliers Found</h3>
-                  <p className="banner-subtitle">{matchedResult.message || `No active suppliers were found with category '${category}'.`}</p>
+                  <p className="banner-subtitle">{matchedResult.message || 'No active suppliers matched this RFQ targeting selection.'}</p>
                   <button className="btn btn-secondary btn-sm" onClick={() => setActiveTab('suppliers')}>Add Category Suppliers</button>
                 </div>
               </div>
