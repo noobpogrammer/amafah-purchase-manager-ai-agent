@@ -609,12 +609,34 @@ def should_invoke_commercial_parser(
     active_session,
     open_rfqs: list,
 ) -> bool:
-    """Only spend LLM tokens when there is real procurement context or signal."""
+    """Use the AI fact parser whenever real procurement context exists.
+
+    Supplier language is too varied to gate reliably with regex. Deterministic
+    code only skips empty messages and obvious social acknowledgements when
+    there is no locked/pending negotiation context. The AI parser remains the
+    semantic source of truth for everything else.
+    """
+    text = (message_text or "").strip()
+    if not text:
+        return False
+
     if matched_rfq_supplier or pending or active_session:
         return True
+
     if not open_rfqs:
         return False
-    return _message_has_procurement_signal(message_text, open_rfqs)
+
+    # Safe token-saving exception: obvious social acknowledgements contain no
+    # commercial facts and do not need semantic extraction.
+    social_only = re.fullmatch(
+        r"\s*(?:ok(?:ay)?|thanks?|thank\s+you|noted|sure|alright|great|👍(?:🏻|🏼|🏽|🏾|🏿)?|👌(?:🏻|🏼|🏽|🏾|🏿)?|🙏(?:🏻|🏼|🏽|🏾|🏿)?)\s*[.!]*\s*",
+        text,
+        re.IGNORECASE,
+    )
+    if social_only:
+        return False
+
+    return True
 
 
 def select_state_aware_routing_candidates(
