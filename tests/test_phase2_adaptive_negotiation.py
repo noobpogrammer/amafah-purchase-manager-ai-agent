@@ -1045,3 +1045,62 @@ class TestFavorableQuoteBuyerSemantics:
 
         assert msg == "Thanks for letting us know."
         assert "quote" not in msg.lower()
+
+
+class TestDreamNestFalsePositiveTradeoffs:
+    def test_same_requested_quantity_is_not_tradeoff(self):
+        result = negotiation_engine.evaluate_supplier_tradeoff(
+            message_text="Quantity: 1 Brand: FLEXTOP Final Price: 2415",
+            rfq_constraints=[],
+            rfq={"quantity": 1, "specs": "10MM"},
+            extracted_quantity=1,
+            extracted_variant="FLEXTOP",
+            commercial_parse={
+                "quantity": {"value": 1, "minimum_order_quantity": None},
+                "specification": None,
+                "tradeoff": {"present": True, "dimension": "quantity"},
+                "delivery": None,
+                "payment_terms": None,
+            },
+        )
+
+        assert result["has_tradeoff"] is False
+        assert result["is_authorized"] is True
+
+    def test_plain_brand_variant_is_not_specification_tradeoff(self):
+        result = negotiation_engine.evaluate_supplier_tradeoff(
+            message_text="Brand EZFLEX 10mmx5c 1 roll 2175",
+            rfq_constraints=[],
+            rfq={"quantity": 1, "specs": "10MM"},
+            extracted_quantity=1,
+            extracted_variant="EZFLEX",
+            commercial_parse={
+                "quantity": {"value": 1, "minimum_order_quantity": None},
+                "specification": {"alternative": "EZFLEX"},
+                "tradeoff": {"present": True, "dimension": "specification"},
+                "delivery": None,
+                "payment_terms": None,
+            },
+        )
+
+        assert result["has_tradeoff"] is False
+        assert result["is_authorized"] is True
+
+    def test_explicit_substitution_still_requires_spec_authorization(self):
+        result = negotiation_engine.evaluate_supplier_tradeoff(
+            message_text="We cannot supply the requested brand. Alternative EZFLEX instead.",
+            rfq_constraints=[],
+            rfq={"quantity": 1, "specs": "10MM"},
+            extracted_variant="EZFLEX",
+            commercial_parse={
+                "quantity": None,
+                "specification": {"alternative": "EZFLEX"},
+                "tradeoff": {"present": True, "dimension": "specification"},
+                "delivery": None,
+                "payment_terms": None,
+            },
+        )
+
+        assert result["has_tradeoff"] is True
+        assert result["is_authorized"] is False
+        assert result["dimension"] == "specification"
