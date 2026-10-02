@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { fetchRFQs, fetchRFQDetail, triggerAIRanking, formatRfqDropdownLabel } from '../api';
-import { Sparkles, Trophy, CheckCircle, BarChart3, AlertCircle, Clock, ChevronDown, ChevronUp } from 'lucide-react';
+import { Sparkles, Trophy, CheckCircle, BarChart3, AlertCircle, Clock, ChevronDown, ChevronUp, Search } from 'lucide-react';
 
 const formatCurrencyInText = (text) => {
   if (!text || typeof text !== 'string') return text;
@@ -13,6 +13,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
   const [loading, setLoading] = useState(true);
   const [rankingLoading, setRankingLoading] = useState(false);
   const [showQuoteHistory, setShowQuoteHistory] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
     async function loadRFQsList() {
@@ -65,6 +66,18 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
     }
   };
 
+  const filteredRfqs = rfqs.filter((r) => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return true;
+    const supplierNames = (r.rfq_suppliers || [])
+      .map((entry) => entry.suppliers?.name || '')
+      .join(' ')
+      .toLowerCase();
+    return (r.product_name || '').toLowerCase().includes(q)
+      || (r.category || '').toLowerCase().includes(q)
+      || supplierNames.includes(q);
+  });
+
   const currentRfq = reportData?.rfq;
   const quotes = reportData?.quotes || [];
   const quoteHistory = reportData?.quoteHistory || [];
@@ -110,15 +123,26 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
             Evaluates price, delivery speed, and quality notes across commercial offers to recommend the optimal choice.
           </p>
         </div>
-        {/* RFQ Switcher Dropdown */}
+        {/* RFQ Search + Switcher */}
         <div className="rfq-select-dropdown">
-          <label className="form-label">Select RFQ:</label>
+          <label className="form-label">Search / Select RFQ:</label>
+          <div style={{ position: 'relative', marginBottom: '0.4rem' }}>
+            <Search size={16} style={{ position: 'absolute', left: '0.75rem', top: '50%', transform: 'translateY(-50%)', opacity: 0.65 }} />
+            <input
+              type="search"
+              className="input-field"
+              placeholder="Search product or supplier..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              style={{ paddingLeft: '2.1rem' }}
+            />
+          </div>
           <select
             className="input-field select-input"
             value={selectedRfqId || ''}
             onChange={(e) => setSelectedRfqId(e.target.value)}
           >
-            {rfqs.map((r) => (
+            {filteredRfqs.map((r) => (
               <option key={r.id} value={r.id}>
                 {formatRfqDropdownLabel(r)}
               </option>
