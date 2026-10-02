@@ -235,7 +235,7 @@ export default function RFQDetailView({
       .toLowerCase();
     return statusMatches && (
       (r.product_name || '').toLowerCase().includes(q)
-      || (r.category || '').toLowerCase().includes(q)
+      || ([...(r.categories || []), r.category].filter(Boolean).join(' ')).toLowerCase().includes(q)
       || supplierNames.includes(q)
     );
   });
@@ -321,7 +321,9 @@ export default function RFQDetailView({
                       <strong>{rfq.product_name}</strong>
                       <div className="flex-items gap-1">
                         {getRfqStatusBadge(rfq.status)}
-                        <span className="badge badge-category">{rfq.category}</span>
+                        {(rfq.categories?.length ? rfq.categories : [rfq.category]).filter(Boolean).map((cat) => (
+                          <span key={cat} className="badge badge-category">{cat}</span>
+                        ))}
                       </div>
                     </div>
                     <div className="rfq-item-meta">
@@ -355,7 +357,9 @@ export default function RFQDetailView({
                   <div>
                     <div className="flex-items gap-2 mb-1">
                       {getRfqStatusBadge(detailData.rfq.status)}
-                      <span className="badge badge-category">{detailData.rfq.category}</span>
+                      {(detailData.rfq.categories?.length ? detailData.rfq.categories : [detailData.rfq.category]).filter(Boolean).map((cat) => (
+                        <span key={cat} className="badge badge-category">{cat}</span>
+                      ))}
                     </div>
                     <h3 className="rfq-product-title">{detailData.rfq.product_name}</h3>
                     <p className="rfq-specs-text">
