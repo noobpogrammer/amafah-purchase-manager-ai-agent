@@ -149,7 +149,3160 @@ class RFQCreateRequest(BaseModel):
                     raise ValueError("quantity max must be a positive integer")
                 if q_min is not None and q_max is not None and int(q_min) > int(q_max):
                     raise ValueError("quantity min cannot be greater than max")
+            elif self.flexibility.get("quantity_flexible"):
+                q_min = self.flexibility.get("quantity_min")
+                q_max = self.flexibility.get("quantity_max")
+                if q_min is not None and int(q_min) <= 0:
+                    raise ValueError("quantity_min must be a positive integer")
+                if q_max is not None and int(q_max) <= 0:
+                    raise ValueError("quantity_max must be a positive integer")
+                if q_min is not None and q_max is not None and int(q_min) > int(q_max):
+                    raise ValueError("quantity_min cannot be greater than quantity_max")
+
+            deliv_dict = self.flexibility.get("delivery")
+            if isinstance(deliv_dict, dict) and deliv_dict.get("authorized"):
+                d_max = deliv_dict.get("max_days")
+                if d_max is not None and int(d_max) <= 0:
+                    raise ValueError("delivery max_days must be a positive integer")
+            elif self.flexibility.get("delivery_flexible"):
+                d_max = self.flexibility.get("delivery_max_days")
+                if d_max is not None and int(d_max) <= 0:
+                    raise ValueError("delivery_max_days must be a positive integer")
+
+            spec_dict = self.flexibility.get("specification")
+            if isinstance(spec_dict, dict) and spec_dict.get("authorized"):
+                alt = spec_dict.get("allowed_alternatives")
+                if alt is not None and not str(alt).strip():
+                    raise ValueError("specification allowed_alternatives cannot be empty when authorized")
+            elif self.flexibility.get("specs_flexible"):
+                alt = self.flexibility.get("allowed_alternatives")
+                if alt is not None and not str(alt).strip():
+                    raise ValueError("allowed_alternatives cannot be empty when authorized")
         return self
+
+def normalize_bulk_description(value: str) -> str:
+    text = (value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+\d+\s*(pcs|pc|nos|bag|pkt)\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*[,;]\s*$", "", text)
+    return text.strip()
+
+
+def extract_bulk_specs(description: str) -> Optional[str]:
+    text = (description or "").strip()
+    if not text:
+        return None
+
+    patterns = [
+        r"\d+\s*X\s*\d+",
+        r"\d+(?:\.\d+)?\s*(?:MM|CM|M|W|KW|V|A)",
+        r"\d+(?:\.\d+)?\s*(?:x|X)\s*\d+(?:\.\d+)?",
+    ]
+    matches = []
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            matches.append(match.group(0).strip())
+
+    if not matches:
+        return None
+
+    cleaned = []
+    for item in matches:
+        normalized = re.sub(r"\s+", "", item)
+        if normalized not in cleaned:
+            cleaned.append(normalized)
+    return "/".join(cleaned)
+
+
+def normalize_csv_key(value: Optional[str]) -> str:
+    text = (value or "").lower().strip()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def extract_row_value(row: dict, aliases: list[str]):
+    for raw_key, raw_value in row.items():
+        normalized = normalize_csv_key(raw_key)
+        if normalized in aliases:
+            return raw_value
+    return None
+
+
+def normalize_requisition_row(row: dict, row_index: int) -> Optional[dict]:
+    if not row:
+        return None
+
+    description = extract_row_value(row, ["description", "item description"])
+    if description is None or not str(description).strip():
+        return None
+
+    description = str(description).strip()
+    clean_description = normalize_bulk_description(description)
+    qty_raw = extract_row_value(row, ["qty", "quantity"])
+    last_quote_raw = extract_row_value(row, ["last cost", "last quote", "last qoute", "last quotation"])
+
+    try:
+        quantity = int(float(str(qty_raw).replace(",", "")))
+    except (TypeError, ValueError):
+        quantity = None
+
+    try:
+        if last_quote_raw not in (None, ""):
+            lq_val = float(str(last_quote_raw).replace(",", ""))
+            if math.isnan(lq_val) or math.isinf(lq_val) or lq_val <= 0:
+                last_quote = None
+            else:
+                last_quote = lq_val
+        else:
+            last_quote = None
+    except (TypeError, ValueError):
+        last_quote = None
+
+    product_name = clean_description if clean_description else description
+    row_number_value = extract_row_value(row, ["sl", "sl #", "sl no", "sl no.", "sl no "])
+    row_number = row_number_value if row_number_value not in (None, "") else row_index
+
+    return {
+        "row_number": row_number,
+        "product_name": product_name,
+        "specs": extract_bulk_specs(clean_description or description),
+        "quantity": quantity,
+        "last_quote": last_quote,
+        "raw_description": description,
+    }
+
+
+def parse_material_requisition_csv(csv_text: str) -> list[dict]:
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows = []
+    for row_index, row in enumerate(reader, start=2):
+        normalized = normalize_requisition_row(row, row_index)
+        if normalized is not None:
+            rows.append(normalized)
+    return rows
+
+
+def require_admin_access(request: Request):
+    admin_key = os.getenv("ADMIN_API_KEY", "").strip()
+    if not admin_key:
+        return
+
+    supplied = request.headers.get("x-admin-key") or request.headers.get("authorization", "").replace("Bearer ", "").strip()
+    if not supplied or supplied != admin_key:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+
+
+async def enqueue_message(
+    phone_number: str,
+    message: str,
+    rfq_id: str = None,
+    supplier_id: str = None,
+    message_log_id: str = None,
+):
+    """Pushes an outbound message onto the asyncio queue for paced sending."""
+    await outbound_queue.put((phone_number, message, rfq_id, supplier_id, message_log_id))
+
+
+def extract_evolution_message_ids(resp: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extracts canonical WhatsApp message ID (e.g. key.id) and any alternate ID from Evolution API response.
+    Returns (canonical_id, alt_id).
+    """
+    if not resp or not isinstance(resp, dict):
+        return None, None
+
+    candidate_ids = []
+
+    # Check key.id inside resp, response, data, messages[0]
+    for container in [resp, resp.get("response"), resp.get("data")]:
+        if isinstance(container, dict):
+            key = container.get("key")
+            if isinstance(key, dict):
+                k_id = key.get("id") or key.get("stanzaId")
+                if k_id:
+                    candidate_ids.append(str(k_id))
+
+    messages = resp.get("messages")
+    if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+        m_key = messages[0].get("key")
+        if isinstance(m_key, dict):
+            k_id = m_key.get("id")
+            if k_id:
+                candidate_ids.append(str(k_id))
+
+    # Check root fields
+    for field in ["messageId", "stanzaId", "keyId", "id"]:
+        val = resp.get(field)
+        if val and isinstance(val, (str, int)):
+            candidate_ids.append(str(val))
+
+    if not candidate_ids:
+        return None, None
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_ids = []
+    for cid in candidate_ids:
+        cid_str = cid.strip()
+        if cid_str and cid_str not in seen:
+            seen.add(cid_str)
+            unique_ids.append(cid_str)
+
+    if not unique_ids:
+        return None, None
+
+    canonical = unique_ids[0]
+    norm_canonical = db.normalize_message_id(canonical)
+
+    alt_id = None
+    if len(unique_ids) > 1:
+        alt_id = unique_ids[1]
+    elif norm_canonical and norm_canonical != canonical:
+        alt_id = canonical
+        canonical = norm_canonical
+    elif norm_canonical:
+        canonical = norm_canonical
+
+    return canonical, alt_id
+
+
+def extract_inbound_quoted_info(data: dict) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    Safely extracts (quoted_stanza_id, quoted_text, message_type) from inbound webhook data
+    without throwing on NoneType or unexpected nesting.
+    """
+    if not data or not isinstance(data, dict):
+        return None, None, "unknown"
+
+    msg_obj = data.get("message")
+    if not isinstance(msg_obj, dict):
+        msg_obj = {}
+
+    # Determine message type
+    message_type = "conversation"
+    if "extendedTextMessage" in msg_obj:
+        message_type = "extendedTextMessage"
+    elif "imageMessage" in msg_obj:
+        message_type = "imageMessage"
+    elif "documentMessage" in msg_obj:
+        message_type = "documentMessage"
+    elif "audioMessage" in msg_obj:
+        message_type = "audioMessage"
+    elif "buttonsResponseMessage" in msg_obj:
+        message_type = "buttonsResponseMessage"
+    elif "templateButtonReplyMessage" in msg_obj:
+        message_type = "templateButtonReplyMessage"
+    elif "interactiveResponseMessage" in msg_obj:
+        message_type = "interactiveResponseMessage"
+
+    # ContextInfo discovery across all potential locations
+    context_info = None
+    for loc in [
+        data.get("contextInfo"),
+        msg_obj.get("extendedTextMessage", {}).get("contextInfo") if isinstance(msg_obj.get("extendedTextMessage"), dict) else None,
+        msg_obj.get("contextInfo"),
+        msg_obj.get("imageMessage", {}).get("contextInfo") if isinstance(msg_obj.get("imageMessage"), dict) else None,
+        msg_obj.get("documentMessage", {}).get("contextInfo") if isinstance(msg_obj.get("documentMessage"), dict) else None,
+        msg_obj.get("audioMessage", {}).get("contextInfo") if isinstance(msg_obj.get("audioMessage"), dict) else None,
+        msg_obj.get("buttonsResponseMessage", {}).get("contextInfo") if isinstance(msg_obj.get("buttonsResponseMessage"), dict) else None,
+        msg_obj.get("templateButtonReplyMessage", {}).get("contextInfo") if isinstance(msg_obj.get("templateButtonReplyMessage"), dict) else None,
+        msg_obj.get("interactiveResponseMessage", {}).get("contextInfo") if isinstance(msg_obj.get("interactiveResponseMessage"), dict) else None,
+        data.get("messageContextInfo"),
+    ]:
+        if isinstance(loc, dict) and loc:
+            context_info = loc
+            break
+
+    quoted_stanza_id = None
+    quoted_text = None
+
+    if context_info:
+        quoted_stanza_id = context_info.get("stanzaId")
+        q_msg = context_info.get("quotedMessage")
+        if isinstance(q_msg, dict):
+            quoted_text = (
+                q_msg.get("conversation")
+                or (q_msg.get("extendedTextMessage", {}).get("text") if isinstance(q_msg.get("extendedTextMessage"), dict) else None)
+                or q_msg.get("text")
+            )
+
+    # Direct quoted object (some Evolution / Baileys webhook versions)
+    if not quoted_stanza_id:
+        quoted = data.get("quoted")
+        if isinstance(quoted, dict):
+            q_key = quoted.get("key")
+            if isinstance(q_key, dict):
+                quoted_stanza_id = q_key.get("id")
+            if not quoted_stanza_id:
+                quoted_stanza_id = quoted.get("stanzaId")
+            if not quoted_text:
+                q_sub_msg = quoted.get("message")
+                if isinstance(q_sub_msg, dict):
+                    quoted_text = q_sub_msg.get("conversation") or q_sub_msg.get("text")
+
+    if not quoted_stanza_id:
+        quoted_key = data.get("quotedKey")
+        if isinstance(quoted_key, dict):
+            quoted_stanza_id = quoted_key.get("id")
+
+    if quoted_stanza_id:
+        quoted_stanza_id = str(quoted_stanza_id).strip()
+
+    if quoted_text:
+        quoted_text = str(quoted_text)
+
+    return quoted_stanza_id, quoted_text, message_type
+
+
+async def outbound_worker():
+    """Background worker that processes outbound WhatsApp messages one by one with randomized delay."""
+    while True:
+        try:
+            item = await outbound_queue.get()
+            if len(item) == 5:
+                phone_number, message, rfq_id, supplier_id, message_log_id = item
+            elif len(item) == 4:
+                phone_number, message, rfq_id, supplier_id = item
+                message_log_id = None
+            else:
+                phone_number, message = item[:2]
+                rfq_id, supplier_id, message_log_id = None, None, None
+
+            # 1. Atomically claim message (queued -> sending) immediately before send attempt
+            if message_log_id:
+                try:
+                    claimed = db.mark_message_sending(message_log_id)
+                except Exception as claim_err:
+                    print(f"[Outbound Worker] Claim check error for message {message_log_id}: {claim_err}")
+                    claimed = False
+
+                if not claimed:
+                    print(f"[Outbound Worker] Skipping message {message_log_id} to {phone_number}: acquisition failed (not in 'queued' state or claim error).")
+                    outbound_queue.task_done()
+                    continue
+
+            try:
+                resp = await run_in_threadpool(send_whatsapp_message, phone_number, message)
+                
+                # Extract Evolution message IDs safely (canonical and alternate)
+                canonical_id, alt_id = extract_evolution_message_ids(resp)
+
+                # 2. Transition to 'sent'
+                if message_log_id:
+                    if alt_id:
+                        db.mark_message_sent(
+                            message_log_id,
+                            evolution_message_id=canonical_id,
+                            external_message_id=canonical_id,
+                            external_alt_message_id=alt_id,
+                        )
+                    else:
+                        db.mark_message_sent(message_log_id, evolution_message_id=canonical_id)
+
+                # Correlation persistence: update rfq_suppliers.sent_message_id and sent_message_alt_id
+                if canonical_id and rfq_id and supplier_id:
+                    if alt_id:
+                        db.update_rfq_supplier_sent_message_id(
+                            rfq_id,
+                            supplier_id,
+                            canonical_id,
+                            sent_message_alt_id=alt_id,
+                        )
+                    else:
+                        db.update_rfq_supplier_sent_message_id(rfq_id, supplier_id, canonical_id)
+
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+                # Ambiguous transport error: cannot determine if Evolution accepted or dropped it
+                clean_msg = f"Transport/timeout error: {type(net_err).__name__} - {str(net_err)}"
+                if message_log_id:
+                    db.mark_message_unknown(message_log_id, clean_msg)
+                print(f"[Outbound Worker] Ambiguous transport error to {phone_number} (marked 'unknown'): {net_err}")
+            except requests.exceptions.HTTPError as http_err:
+                # Definite API rejection (HTTP 4xx/5xx)
+                clean_msg = f"HTTP error {http_err.response.status_code if http_err.response is not None else ''}: {str(http_err)}"
+                if message_log_id:
+                    db.mark_message_failed(message_log_id, clean_msg)
+                print(f"[Outbound Worker] Definite HTTP failure sending to {phone_number} (marked 'failed'): {http_err}")
+            except Exception as e:
+                # Other failure (e.g. missing config, JSON decode error, or runtime issue)
+                clean_msg = f"Send failure: {str(e)}"
+                if message_log_id:
+                    db.mark_message_failed(message_log_id, clean_msg)
+                print(f"[Outbound Worker] Error sending WhatsApp message to {phone_number} (marked 'failed'): {e}")
+            finally:
+                outbound_queue.task_done()
+
+
+            # Random jittered delay between outbound messages
+            delay = random.uniform(OUTBOUND_MIN_DELAY, OUTBOUND_MAX_DELAY)
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[Outbound Worker] Unexpected error in worker loop: {e}")
+
+
+def send_whatsapp_message(phone_number: str, message: str) -> dict:
+    """Send a text message through the configured Evolution API instance."""
+    if not EVOLUTION_API_URL or not EVOLUTION_API_KEY or not EVOLUTION_INSTANCE:
+        raise RuntimeError("Evolution API configuration is missing")
+
+    url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE}"
+    headers = {
+        "Content-Type": "application/json",
+        "apikey": EVOLUTION_API_KEY,
+    }
+    payload = {
+        "number": phone_number,
+        "text": message,
+        "delay": EVOLUTION_TYPING_DELAY_MS,
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    try:
+        return response.json()
+    except Exception:
+        return {"status": "ok", "raw": response.text}
+
+
+def normalize_phone(remote_jid: str) -> str:
+    """Strips everything from '@' onward and device suffixes to normalize WhatsApp remoteJid to plain digits."""
+    if not remote_jid:
+        return ""
+    user_part = remote_jid.split("@")[0]
+    return user_part.split(":")[0]
+
+
+
+def _message_has_procurement_signal(message_text: str, open_rfqs: list) -> bool:
+    """Cheap deterministic pre-LLM relevance check for standalone supplier messages."""
+    text = (message_text or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+
+    # Explicit RFQ/product/spec references are strong evidence.
+    for entry in open_rfqs or []:
+        rfq = entry.get("rfqs", entry) if isinstance(entry, dict) else {}
+        if not isinstance(rfq, dict):
+            continue
+        rfq_id = str(rfq.get("id") or "").lower()
+        product = str(rfq.get("product_name") or "").strip().lower()
+        specs = str(rfq.get("specs") or "").strip().lower()
+        if rfq_id and rfq_id in lower:
+            return True
+        if product and product in lower:
+            return True
+        if specs and len(specs) > 3 and specs in lower:
+            return True
+
+    # Commercial language / units / terms.
+    commercial_pattern = re.compile(
+        r"\b(?:aed|dhs?|dirhams?|quote|quotation|price|rate|offer|counter|discount|"
+        r"reduce|lower|best|final|delivery|lead\s*time|ready|stock|available|availability|"
+        r"qty|quantity|moq|pcs?|pieces?|units?|nos?|dozen|dozens|pack|packs|packaging|"
+        r"brand|grade|spec|specification|payment|advance|credit|pi|invoice|warranty)\b",
+        re.IGNORECASE,
+    )
+    if commercial_pattern.search(text):
+        return True
+
+    # Compact currency formats commonly used by suppliers: "48aed", "48dhs", "aed48".
+    if re.search(
+        r"(?:\d+(?:\.\d+)?\s*(?:aed|dhs?|dirhams?)\b|\b(?:aed|dhs?|dirhams?)\s*\d+(?:\.\d+)?)",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+
+    # Common terse supplier quote forms: "72", "72.50", "72 / pc", "48 per dozen".
+    if re.fullmatch(
+        r"\s*\d+(?:\.\d+)?\s*(?:/\s*|per\s+)?(?:pc|pcs|piece|pieces|unit|units|dozen|dozens)?\s*",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+def should_invoke_commercial_parser(
+    message_text: str,
+    *,
+    matched_rfq_supplier,
+    pending,
+    active_session,
+    open_rfqs: list,
+) -> bool:
+    """Use the AI fact parser whenever real procurement context exists.
+
+    Supplier language is too varied to gate reliably with regex. Deterministic
+    code only skips empty messages and obvious social acknowledgements when
+    there is no locked/pending negotiation context. The AI parser remains the
+    semantic source of truth for everything else.
+    """
+    text = (message_text or "").strip()
+    if not text:
+        return False
+
+    if matched_rfq_supplier or pending or active_session:
+        return True
+
+    if not open_rfqs:
+        return False
+
+    # Safe token-saving exception: obvious social acknowledgements contain no
+    # commercial facts and do not need semantic extraction.
+    social_only = re.fullmatch(
+        r"\s*(?:ok(?:ay)?|thanks?|thank\s+you|noted|sure|alright|great|👍(?:🏻|🏼|🏽|🏾|🏿)?|👌(?:🏻|🏼|🏽|🏾|🏿)?|🙏(?:🏻|🏼|🏽|🏾|🏿)?)\s*[.!]*\s*",
+        text,
+        re.IGNORECASE,
+    )
+    if social_only:
+        return False
+
+    return True
+
+
+def select_state_aware_routing_candidates(
+    *,
+    routing_intent: str,
+    all_open_rfqs: list,
+    unanswered_rfqs: list,
+    responded_rfqs: list,
+    session_entry=None,
+    active_session: Optional[dict] = None,
+    conversation_history: Optional[list] = None,
+    incoming_message_text: str = "",
+) -> dict:
+    """
+    Narrow RFQ candidates from trusted database state plus a routing-only message label.
+
+    The routing label never chooses an RFQ ID. Exact stanza/product/pending-clarification
+    routing is handled before this helper. UNKNOWN fails safe by preserving the broader
+    candidate set instead of guessing.
+    """
+    intent = str(routing_intent or "UNKNOWN").upper()
+    if intent not in {"NEW_QUOTE", "REVISION", "NEGOTIATION_REPLY", "UNKNOWN"}:
+        intent = "UNKNOWN"
+
+    def candidate_id(entry):
+        rfq = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+        if isinstance(rfq, dict) and rfq.get("id"):
+            return str(rfq["id"])
+        return None
+
+    # A terse numeric reply can be a direct answer to the agent's latest
+    # negotiation question even without words like "final" or "revised".
+    # Only use this continuity signal when the recent outbound message was
+    # negotiation-specific and the incoming reply is short enough that treating
+    # it as a complete first quote would be risky.
+    recent_negotiation_prompt = False
+    if session_entry and active_session:
+        session_rfq_id = str(active_session.get("rfq_id") or "")
+        negotiation_prompt_pattern = re.compile(
+            r"\b(?:could\s+you\s+do|can\s+you\s+do|improve\s+(?:the\s+)?(?:price|rate)|"
+            r"reduce\s+(?:the\s+)?(?:price|rate)|counter(?:offer)?|best\s+price|"
+            r"lower\s+(?:the\s+)?(?:price|rate)|meet\s+(?:us|you)\s+at|still\s+trying\s+to\s+improve)\b",
+            re.IGNORECASE,
+        )
+        for msg in reversed(conversation_history or []):
+            if not isinstance(msg, dict):
+                continue
+            if (
+                msg.get("direction") == "outbound"
+                and str(msg.get("related_rfq_id") or "") == session_rfq_id
+            ):
+                recent_negotiation_prompt = bool(
+                    negotiation_prompt_pattern.search(str(msg.get("body") or ""))
+                )
+                break
+
+    incoming = str(incoming_message_text or "").strip()
+    incoming_words = re.findall(r"[A-Za-z0-9.]+", incoming)
+    has_full_quote_detail = bool(
+        re.search(
+            r"\b(?:delivery|days?|weeks?|brand|spec|specification|qty|quantity|moq|"
+            r"per\s+(?:piece|unit|pc)|each)\b",
+            incoming,
+            re.IGNORECASE,
+        )
+    )
+    terse_continuation = (
+        recent_negotiation_prompt
+        and bool(incoming)
+        and len(incoming_words) <= 5
+        and not has_full_quote_detail
+    )
+
+    if terse_continuation and session_entry:
+        pool = [session_entry]
+        source = "conversation_context"
+    elif intent == "NEGOTIATION_REPLY" and session_entry:
+        pool = [session_entry]
+        source = "negotiation_session"
+    elif intent == "NEW_QUOTE":
+        pool = list(unanswered_rfqs or [])
+        source = "routing_new_quote"
+    elif intent in {"REVISION", "NEGOTIATION_REPLY"}:
+        pool = list(responded_rfqs or [])
+        source = f"routing_{intent.lower()}"
+    else:
+        pool = list(all_open_rfqs or [])
+        source = "routing_unknown"
+
+    # Classification/state disagreement must broaden safely rather than force a
+    # message onto an incompatible RFQ.
+    if not pool:
+        pool = list(all_open_rfqs or [])
+        intent = "UNKNOWN"
+        source = "routing_unknown"
+
+    # Conversation continuity only breaks ties *inside* an already-compatible
+    # revision/negotiation pool.
+    if len(pool) > 1 and intent in {"REVISION", "NEGOTIATION_REPLY"}:
+        pool_ids = {candidate_id(e) for e in pool}
+        pool_ids.discard(None)
+        for msg in reversed(conversation_history or []):
+            linked_id = msg.get("related_rfq_id") if isinstance(msg, dict) else None
+            if linked_id and str(linked_id) in pool_ids:
+                chosen = next(
+                    (e for e in pool if candidate_id(e) == str(linked_id)),
+                    None,
+                )
+                if chosen is not None:
+                    return {
+                        "candidates": [chosen],
+                        "matched_rfq_id": candidate_id(chosen),
+                        "match_source": "conversation_context",
+                        "routing_intent": intent,
+                    }
+
+    matched_rfq_id = candidate_id(pool[0]) if len(pool) == 1 else None
+    if matched_rfq_id and source == "negotiation_session" and active_session:
+        matched_rfq_id = str(active_session.get("rfq_id") or matched_rfq_id)
+
+    return {
+        "candidates": pool,
+        "matched_rfq_id": matched_rfq_id,
+        "match_source": source if matched_rfq_id else None,
+        "routing_intent": intent,
+    }
+
+
+def format_rfq_context(open_rfqs: list, current_supplier_id: str = None) -> str:
+    if not open_rfqs:
+        return "No open RFQs for this supplier."
+    lines = []
+    for entry in open_rfqs:
+        rfq = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+        rfq_id = rfq.get("id") if isinstance(rfq, dict) else None
+        price_min = rfq.get("acceptable_price_min") if isinstance(rfq, dict) else None
+        price_max = rfq.get("acceptable_price_max") if isinstance(rfq, dict) else None
+
+        range_str = "None"
+        if price_min is not None and price_max is not None:
+            range_str = f"AED {price_min} - {price_max}"
+        elif price_min is not None:
+            range_str = f"Min AED {price_min}"
+        elif price_max is not None:
+            range_str = f"Max AED {price_max}"
+
+        comp_str = "None"
+        attempts = 0
+        if current_supplier_id and rfq_id:
+            comp_ctx = db.get_competitive_pricing_context(rfq_id, current_supplier_id)
+            if comp_ctx.get("has_competition"):
+                comp_str = f"Best competing quote is AED {comp_ctx['best_competing_price']} (from {comp_ctx['competing_quotes_count']} other supplier(s))"
+            attempts = db.get_negotiation_attempts(rfq_id, current_supplier_id)
+
+        lines.append(
+            f"- RFQ ID: {rfq_id} | Product: {rfq.get('product_name')} | "
+            f"Specs: {rfq.get('specs', '-')} | Qty: {rfq.get('quantity', '-')} | "
+            f"Acceptable Price Range: {range_str} | "
+            f"Competitive Context: {comp_str} | "
+            f"Negotiation Attempts Made: {attempts}/10"
+        )
+    return "\n".join(lines)
+
+
+def format_prior_quotes_context(prior_quotes: list) -> str:
+    if not prior_quotes:
+        return "No prior quotes on record for this supplier."
+    lines = []
+    for q in prior_quotes:
+        product = q.get("rfqs", {}).get("product_name", "Unknown Product") if isinstance(q.get("rfqs"), dict) else "Unknown Product"
+        lines.append(
+            f"- Product: {product} | RFQ ID: {q['rfq_id']} | Price: AED {q['price']} | "
+            f"Delivery: {q.get('delivery_time', '-')} | Notes: {q.get('quality_notes', '-')}"
+        )
+    return "\n".join(lines)
+
+
+def generate_ranking(rfq_id: str) -> dict:
+    """Generates comparison ranking for commercial offers (variants) received on an RFQ and saves to DB."""
+    quotes = db.get_quotes_for_rfq(rfq_id)
+    if not quotes:
+        return {"error": "No quotes found for this RFQ"}
+
+    valid_quotes = {str(q["id"]): q for q in quotes}
+
+    offers_lines = []
+    for q in quotes:
+        supp_name = (
+            q.get("suppliers", {}).get("name", "Unknown Supplier")
+            if isinstance(q.get("suppliers"), dict)
+            else "Unknown Supplier"
+        )
+        v_label = f", Variant: '{q['variant_label']}'" if q.get("variant_label") else ""
+        offers_lines.append(
+            f"- Quote ID: {q['id']} | Supplier: {supp_name}{v_label} | Price: AED {q['price']} | "
+            f"Delivery: {q.get('delivery_time', '-')} | Notes: {q.get('quality_notes', '-')}"
+        )
+    quotes_summary = "\n".join(offers_lines)
+
+    result = groq_client.rank_quotes(rfq_details=f"RFQ ID: {rfq_id}", quotes_summary=quotes_summary)
+
+    # 1. Deterministic Winner Validation
+    best_quote_id = result.get("best_quote_id")
+    if not best_quote_id or str(best_quote_id) not in valid_quotes:
+        # Check if ranking list has a valid quote_id in item 0
+        ranking_list = result.get("ranking") or []
+        if ranking_list and isinstance(ranking_list, list):
+            first_item = ranking_list[0] if isinstance(ranking_list[0], dict) else {}
+            first_item_qid = first_item.get("quote_id")
+            if first_item_qid and str(first_item_qid) in valid_quotes:
+                best_quote_id = str(first_item_qid)
+            elif first_item.get("supplier_id"):
+                s_id = str(first_item.get("supplier_id"))
+                matching_quotes = [q for q in quotes if str(q.get("supplier_id")) == s_id]
+                if matching_quotes:
+                    best_quote_id = str(matching_quotes[0]["id"])
+
+    if not best_quote_id or str(best_quote_id) not in valid_quotes:
+        # Check if best_supplier_id was returned and matches a quote
+        legacy_supp_id = result.get("best_supplier_id") or (result.get("best_quote_id") if result.get("best_quote_id") else None)
+        if legacy_supp_id:
+            matching_quotes = [q for q in quotes if str(q.get("supplier_id")) == str(legacy_supp_id)]
+            if matching_quotes:
+                best_quote_id = str(matching_quotes[0]["id"])
+
+    # Strict check: Do NOT arbitrarily pick an unrelated quote row if no valid match exists
+    if not best_quote_id or str(best_quote_id) not in valid_quotes:
+        raise ValueError(
+            f"Invalid ranking result: best_quote_id '{best_quote_id}' does not match any valid candidate quote for RFQ {rfq_id}"
+        )
+
+    best_quote_id = str(best_quote_id)
+    winning_quote = valid_quotes[best_quote_id]
+    best_supplier_id = winning_quote.get("supplier_id")
+
+    # 2. Enrich and validate ranking list deterministically
+    raw_ranking_items = result.get("ranking") or []
+    enriched_ranking = []
+    seen_qids = set()
+
+    for item in raw_ranking_items:
+        if not isinstance(item, dict):
+            continue
+        qid = str(item.get("quote_id")) if item.get("quote_id") else None
+        if not qid and item.get("supplier_id"):
+            s_id = str(item.get("supplier_id"))
+            matching_quotes = [q for q in quotes if str(q.get("supplier_id")) == s_id and str(q["id"]) not in seen_qids]
+            if matching_quotes:
+                qid = str(matching_quotes[0]["id"])
+
+        if qid and qid in valid_quotes and qid not in seen_qids:
+            seen_qids.add(qid)
+            q_row = valid_quotes[qid]
+            supp_name = (
+                q_row.get("suppliers", {}).get("name", "Unknown Supplier")
+                if isinstance(q_row.get("suppliers"), dict)
+                else "Unknown Supplier"
+            )
+            enriched_ranking.append({
+                "rank": int(item.get("rank", len(enriched_ranking) + 1)),
+                "quote_id": qid,
+                "supplier_id": q_row.get("supplier_id"),
+                "supplier_name": supp_name,
+                "variant_label": q_row.get("variant_label"),
+                "price": q_row.get("price"),
+                "delivery_time": q_row.get("delivery_time"),
+                "quality_notes": q_row.get("quality_notes"),
+                "summary": item.get("summary", ""),
+            })
+
+    # Append any valid candidate quotes omitted by LLM
+    for qid, q_row in valid_quotes.items():
+        if qid not in seen_qids:
+            seen_qids.add(qid)
+            supp_name = (
+                q_row.get("suppliers", {}).get("name", "Unknown Supplier")
+                if isinstance(q_row.get("suppliers"), dict)
+                else "Unknown Supplier"
+            )
+            enriched_ranking.append({
+                "rank": len(enriched_ranking) + 1,
+                "quote_id": qid,
+                "supplier_id": q_row.get("supplier_id"),
+                "supplier_name": supp_name,
+                "variant_label": q_row.get("variant_label"),
+                "price": q_row.get("price"),
+                "delivery_time": q_row.get("delivery_time"),
+                "quality_notes": q_row.get("quality_notes"),
+                "summary": f"AED {q_row.get('price')}",
+            })
+
+    enriched_ranking.sort(key=lambda x: x["rank"])
+
+    enriched_ranking_json = {
+        "best_quote_id": best_quote_id,
+        "best_supplier_id": best_supplier_id,
+        "reasoning": result.get("reasoning", ""),
+        "ranking": enriched_ranking,
+    }
+
+    db.save_ranking(
+        rfq_id=rfq_id,
+        best_supplier_id=best_supplier_id,
+        reasoning=result.get("reasoning", ""),
+        ranking_json=enriched_ranking_json,
+        best_quote_id=best_quote_id,
+    )
+    return enriched_ranking_json
+
+
+def check_and_auto_rank(rfq_id: str):
+    """Generates ranking for an RFQ if quotes exist and ranking has not been created yet."""
+    quotes = db.get_quotes_for_rfq(rfq_id)
+    if quotes and not db.ranking_exists(rfq_id):
+        print(f"Triggering quote ranking for RFQ: {rfq_id}")
+        generate_ranking(rfq_id)
+
+
+async def finalize_rfq_job(rfq: dict):
+    """
+    Executes idempotent finalization steps for an RFQ (after atomic claim or during recovery):
+    1. Generates and persists AI quote ranking if quotes exist and ranking is not yet saved.
+    2. Idempotently creates and enqueues closure notifications for participating suppliers using event_key.
+    3. Marks RFQ finalization as 'completed' with finalized_at timestamp.
+    """
+    rfq_id = rfq.get("id")
+    if not rfq_id:
+        return
+    prod = rfq.get("product_name") or "RFQ Item"
+    client_id = rfq.get("client_id")
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # 1. Idempotent Ranking
+    try:
+        quotes = db.get_quotes_for_rfq(rfq_id)
+        if quotes:
+            if not db.ranking_exists(rfq_id):
+                print(f"[{now_iso}] [Finalization] Generating ranking for RFQ '{prod}' (id: {rfq_id})...")
+                generate_ranking(rfq_id)
+            else:
+                print(f"[{now_iso}] [Finalization] Ranking already exists for RFQ {rfq_id}, skipping duplicate generation.")
+    except Exception as rank_err:
+        tb = traceback.format_exc()
+        print(f"[{now_iso}] [Finalization ERROR] Ranking generation failed for RFQ {rfq_id}: {rank_err}\n{tb}")
+        db.log_webhook_error(str(rank_err), tb, {"job": "finalize_rfq_job", "stage": "ranking", "rfq_id": rfq_id})
+        # Leave in 'processing' state so recovery can retry later
+        return
+
+    # 2. Idempotent Closure Notifications
+    try:
+        rfq_suppliers = rfq.get("rfq_suppliers") or []
+        if not rfq_suppliers:
+            rfq_suppliers = db.get_rfq_suppliers_for_rfq(rfq_id)
+
+        msg = f"RFQ for '{prod}' is now closed as the deadline has passed. Thank you!"
+        all_notifications_confirmed = True
+
+        for item in rfq_suppliers:
+            supplier = item.get("suppliers") or {}
+            supplier_id = supplier.get("id") or item.get("supplier_id")
+            phone = supplier.get("phone_number")
+            if not phone and supplier_id:
+                sup_row = db.get_supplier_by_id(supplier_id)
+                if sup_row:
+                    phone = sup_row.get("phone_number")
+                    if not client_id:
+                        client_id = sup_row.get("client_id")
+
+            if phone and supplier_id:
+                c_id = client_id or supplier.get("client_id")
+                event_key = f"rfq_closed:{rfq_id}:{supplier_id}"
+                existing_msg = db.get_message_by_event_key(event_key)
+                if not existing_msg:
+                    msg_log_id = db.log_message(c_id, supplier_id, "outbound", msg, related_rfq_id=rfq_id, event_key=event_key)
+                    if msg_log_id:
+                        await enqueue_message(phone, msg, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+                    else:
+                        print(f"[{now_iso}] [Finalization ERROR] Failed to establish durable closure message for supplier {supplier_id} (event_key: {event_key}).")
+                        all_notifications_confirmed = False
+                else:
+                    print(f"[{now_iso}] [Finalization] Closure notification already logged for supplier {supplier_id} (event_key: {event_key}), skipping.")
+
+        if not all_notifications_confirmed:
+            print(f"[{now_iso}] [Finalization] Incomplete notification persistence for RFQ {rfq_id}. Leaving in 'processing' state.")
+            return
+
+    except Exception as notif_err:
+        tb = traceback.format_exc()
+        print(f"[{now_iso}] [Finalization ERROR] Notification creation failed for RFQ {rfq_id}: {notif_err}\n{tb}")
+        db.log_webhook_error(str(notif_err), tb, {"job": "finalize_rfq_job", "stage": "notifications", "rfq_id": rfq_id})
+        return
+
+    # 3. Mark Finalization Completed & Expire Active Negotiation Sessions
+    try:
+        db.expire_negotiation_sessions_for_rfq(rfq_id)
+        marked = db.mark_rfq_finalization_completed(rfq_id)
+        if marked:
+            print(f"[{now_iso}] [Finalization] RFQ '{prod}' ({rfq_id}) marked finalization_status='completed' and active negotiation sessions expired.")
+    except Exception as comp_err:
+        tb = traceback.format_exc()
+        print(f"[{now_iso}] [Finalization ERROR] Failed marking finalization completed for RFQ {rfq_id}: {comp_err}\n{tb}")
+        db.log_webhook_error(str(comp_err), tb, {"job": "finalize_rfq_job", "stage": "mark_completed", "rfq_id": rfq_id})
+
+
+async def check_deadlines_and_reminders():
+    """Background cron job that checks active RFQs and handles deadline expiry & reminders."""
+    now = datetime.now(timezone.utc)
+    print(f"[{now.isoformat()}] [Scheduler] Running check_deadlines_and_reminders...")
+
+    # =========================================================================
+    # Section A: Acquire Newly Expired Active RFQs
+    # =========================================================================
+    try:
+        expired_rfqs = db.get_active_rfqs_past_deadline()
+        print(f"[{now.isoformat()}] [Scheduler] Found {len(expired_rfqs)} active RFQ(s) past deadline.")
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[{now.isoformat()}] [Scheduler ERROR] Failed to fetch expired RFQs: {e}\n{tb}")
+        db.log_webhook_error(str(e), tb, {"job": "check_deadlines_and_reminders", "stage": "fetch_expired_rfqs"})
+        expired_rfqs = []
+
+    for rfq in expired_rfqs:
+        rfq_id = rfq.get("id")
+        prod = rfq.get("product_name") or "RFQ Item"
+        try:
+            claimed = db.claim_rfq_for_finalization(rfq_id)
+            if claimed:
+                print(f"[{now.isoformat()}] [Scheduler] Successfully claimed finalization authority for RFQ '{prod}' (id: {rfq_id}).")
+                await finalize_rfq_job(rfq)
+            else:
+                print(f"[{now.isoformat()}] [Scheduler] Skipped RFQ '{prod}' (id: {rfq_id}): authority not acquired (already claimed or inactive).")
+        except Exception as rfq_err:
+            tb = traceback.format_exc()
+            print(f"[{now.isoformat()}] [Scheduler ERROR] Failed processing expired RFQ {rfq_id}: {rfq_err}\n{tb}")
+            db.log_webhook_error(str(rfq_err), tb, {"job": "check_deadlines_and_reminders", "rfq_id": rfq_id})
+
+    # =========================================================================
+    # Section B: Recover Incomplete Finalizations (status='closed' & finalization_status='processing')
+    # =========================================================================
+    try:
+        processing_rfqs = db.get_rfqs_pending_finalization_recovery()
+        if processing_rfqs:
+            print(f"[{now.isoformat()}] [Scheduler] Found {len(processing_rfqs)} incomplete RFQ(s) in 'processing' state. Resuming recovery...")
+        for prfq in processing_rfqs:
+            prfq_id = prfq.get("id")
+            try:
+                await finalize_rfq_job(prfq)
+            except Exception as rec_err:
+                tb = traceback.format_exc()
+                print(f"[{now.isoformat()}] [Scheduler ERROR] Recovery failed for RFQ {prfq_id}: {rec_err}\n{tb}")
+                db.log_webhook_error(str(rec_err), tb, {"job": "check_deadlines_and_reminders", "stage": "recovery", "rfq_id": prfq_id})
+    except Exception as proc_err:
+        tb = traceback.format_exc()
+        print(f"[{now.isoformat()}] [Scheduler ERROR] Failed fetching processing RFQs for recovery: {proc_err}\n{tb}")
+        db.log_webhook_error(str(proc_err), tb, {"job": "check_deadlines_and_reminders", "stage": "fetch_processing_rfqs"})
+
+    # =========================================================================
+    # Section C: Supplier Reminders (strictly for active, open RFQs with percentage < 100)
+    # =========================================================================
+    try:
+        active_items = db.get_active_rfq_suppliers_with_deadlines()
+        print(f"[{now.isoformat()}] [Scheduler] Found {len(active_items)} active rfq_supplier items pending responses.")
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[{now.isoformat()}] [Scheduler ERROR] Failed to fetch active RFQ suppliers: {e}\n{tb}")
+        db.log_webhook_error(str(e), tb, {"job": "check_deadlines_and_reminders", "stage": "fetch_active_items"})
+        return
+
+    for item in active_items:
+        item_id = item.get("id")
+        try:
+            rfq = item.get("rfqs") or {}
+            supplier = item.get("suppliers") or {}
+            # 1. Strictly verify RFQ is active and open (deadline has not elapsed)
+            if not db.is_rfq_open(rfq):
+                continue
+
+            # Delivery guardrail: rfq_suppliers.status='sent' only means the supplier
+            # was matched/queued. It does NOT prove Evolution/WhatsApp accepted the
+            # initial RFQ. Reminders are allowed only after the persistent outbound
+            # message lifecycle confirms status='sent'.
+            delivery = db.get_initial_rfq_delivery_status(rfq.get("id"), supplier.get("id"))
+            if not delivery or delivery.get("status") != "sent":
+                delivery_state = delivery.get("status") if delivery else "missing"
+                print(
+                    f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: "
+                    f"initial WhatsApp RFQ delivery is '{delivery_state}', not confirmed sent."
+                )
+                continue
+
+            sent_at_str = delivery.get("sent_at")
+            if not sent_at_str:
+                print(
+                    f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: "
+                    "confirmed delivery row is missing sent_at timestamp."
+                )
+                continue
+
+            try:
+                sent_at = datetime.fromisoformat(sent_at_str.replace("Z", "+00:00"))
+                if sent_at.tzinfo is None:
+                    sent_at = sent_at.replace(tzinfo=timezone.utc)
+            except Exception as parse_err:
+                print(f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: invalid sent_at format '{sent_at_str}': {parse_err}")
+                continue
+
+            deadline_hours = rfq.get("deadline_hours") or 24
+            total_seconds = deadline_hours * 3600
+            elapsed_seconds = (now - sent_at).total_seconds()
+            if total_seconds <= 0:
+                continue
+
+            percentage = (elapsed_seconds / total_seconds) * 100
+            if percentage >= 100:
+                # Never trigger reminders for RFQs that have reached or exceeded deadline
+                continue
+
+            reminder_count = item.get("reminder_count") or 0
+            phone = supplier.get("phone_number")
+            prod = rfq.get("product_name") or "RFQ Item"
+
+            print(
+                f"[{now.isoformat()}] [Scheduler] Checking item {item_id}: RFQ '{prod}' (id: {rfq.get('id')}), "
+                f"supplier '{supplier.get('name')}', sent_at: {sent_at.isoformat()}, elapsed: {elapsed_seconds:.0f}s/{total_seconds:.0f}s ({percentage:.1f}%), reminders_sent: {reminder_count}"
+            )
+
+            # Reminder thresholds for pending suppliers (50%, 70%, 90%)
+            if percentage >= 90 and reminder_count == 2:
+                print(f"[{now.isoformat()}] [Scheduler] Triggering 90% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
+                msg = f"Final reminder — closing the RFQ for '{prod}' soon! Please reply with your quote if available."
+                client_id = rfq.get("client_id") or supplier.get("client_id")
+                msg_log_id = db.log_message(client_id, supplier.get("id"), "outbound", msg, related_rfq_id=rfq.get("id"))
+                await enqueue_message(phone, msg, rfq_id=rfq.get("id"), supplier_id=supplier.get("id"), message_log_id=msg_log_id)
+                db.update_rfq_supplier_reminder(item["id"], 3)
+            elif percentage >= 70 and reminder_count == 1:
+                print(f"[{now.isoformat()}] [Scheduler] Triggering 70% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
+                msg = f"Reminder regarding RFQ for '{prod}'. Please send your quote when ready."
+                client_id = rfq.get("client_id") or supplier.get("client_id")
+                msg_log_id = db.log_message(client_id, supplier.get("id"), "outbound", msg, related_rfq_id=rfq.get("id"))
+                await enqueue_message(phone, msg, rfq_id=rfq.get("id"), supplier_id=supplier.get("id"), message_log_id=msg_log_id)
+                db.update_rfq_supplier_reminder(item["id"], 2)
+            elif percentage >= 50 and reminder_count == 0:
+                print(f"[{now.isoformat()}] [Scheduler] Triggering 50% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
+                msg = f"Hi! Just checking in on the RFQ for '{prod}'."
+                client_id = rfq.get("client_id") or supplier.get("client_id")
+                msg_log_id = db.log_message(client_id, supplier.get("id"), "outbound", msg, related_rfq_id=rfq.get("id"))
+                await enqueue_message(phone, msg, rfq_id=rfq.get("id"), supplier_id=supplier.get("id"), message_log_id=msg_log_id)
+                db.update_rfq_supplier_reminder(item["id"], 1)
+        except Exception as item_err:
+            tb = traceback.format_exc()
+            print(f"[{now.isoformat()}] [Scheduler ERROR] Failed processing item {item_id}: {item_err}\n{tb}")
+            db.log_webhook_error(str(item_err), tb, {"job": "check_deadlines_and_reminders", "item_id": item_id})
+
+
+REQUIRED_ENV_VARS = [
+    "GROQ_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "EVOLUTION_API_URL",
+    "EVOLUTION_API_KEY",
+    "EVOLUTION_INSTANCE",
+]
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup validation: verify all required backend env vars exist and are non-empty
+    missing = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+    if missing:
+        raise RuntimeError(
+            f"Backend configuration error: Missing required environment variable(s): {', '.join(missing)}. "
+            f"Please check your root .env file."
+        )
+
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Starting outbound message worker task...")
+    worker_task = asyncio.create_task(outbound_worker())
+
+    # Startup recovery: re-enqueue persistent messages with status = 'queued'
+    try:
+        queued_msgs = db.get_queued_outbound_messages()
+        recovered_count = 0
+        for qm in queued_msgs:
+            msg_id = qm.get("id")
+            body = qm.get("body")
+            rfq_id = qm.get("related_rfq_id")
+            supplier_id = qm.get("supplier_id")
+            phone = None
+            if qm.get("suppliers") and isinstance(qm.get("suppliers"), dict):
+                phone = qm.get("suppliers").get("phone_number")
+            elif supplier_id:
+                s = db.get_supplier_by_id(supplier_id)
+                if s:
+                    phone = s.get("phone_number")
+            if phone and body:
+                await enqueue_message(phone, body, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_id)
+                recovered_count += 1
+        if recovered_count > 0:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Recovered and re-enqueued {recovered_count} queued outbound message(s).")
+    except Exception as rec_err:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan ERROR] Failed to recover queued outbound messages: {rec_err}")
+
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Registering check_deadlines_and_reminders job on AsyncIOScheduler (interval: 15m, next_run: now)...")
+    scheduler.add_job(
+        check_deadlines_and_reminders,
+        "interval",
+        minutes=15,
+        next_run_time=datetime.now(timezone.utc),
+        id="check_deadlines_and_reminders",
+        replace_existing=True,
+    )
+    scheduler.start()
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] AsyncIOScheduler started successfully.")
+    yield
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Shutting down scheduler and worker task...")
+    scheduler.shutdown()
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Outbound worker and scheduler shut down cleanly.")
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(lifespan=lifespan)
+
+
+def _cors_origins() -> list[str]:
+    origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ]
+    extra = ",".join(
+        part
+        for part in (
+            os.getenv("CORS_ORIGINS", ""),
+            os.getenv("FRONTEND_URL", ""),
+        )
+        if part
+    )
+    for raw in extra.split(","):
+        origin = raw.strip().rstrip("/")
+        if origin and origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
+    # Deployed Railway frontends until CORS_ORIGINS / FRONTEND_URL is set.
+    allow_origin_regex=r"https://.*\.up\.railway\.app",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def acknowledgement_for_quote_variants(variants: list[dict]) -> str:
+    """Return a supplier-facing acknowledgement that matches what was actually received."""
+    if variants and all(v.get("is_available", True) is False for v in variants):
+        return UNAVAILABLE_ACK_MSG
+    return THANK_YOU_MSG
+
+
+def build_rfq_invitation_message(
+    product_name: str,
+    specs: Optional[str],
+    quantity: Optional[int],
+    deadline_hours: int,
+    required_delivery_days: Optional[int] = None,
+) -> str:
+    """Build the canonical Everyware supplier-facing RFQ invitation."""
+    lines = [f"* Product: {product_name}"]
+    clean_specs = (specs or "").strip()
+    if clean_specs and clean_specs not in {".", "-", "N/A", "n/a"}:
+        lines.append(f"* Specs: {clean_specs}")
+    lines.append(f"* Quantity: {quantity if quantity is not None else 'N/A'}")
+    lines.append(f"* Quote Required Within: {deadline_hours} hour(s)")
+    if required_delivery_days is not None and required_delivery_days > 0:
+        day_str = "day" if required_delivery_days == 1 else "days"
+        lines.append(f"* Required Delivery: Within {required_delivery_days} {day_str}")
+
+    return (
+        "Hi! This is Everyware®️ (Al Noon Int’l Trading LLC).\n\n"
+        "We're requesting a quote for the following item:\n"
+        + "\n".join(lines)
+        + "\n\nPlease respond to this message with your final price per unit (AED) "
+          "and estimated delivery time.\n\nThanks."
+    )
+
+
+def is_supplier_final_price_statement(message: str) -> bool:
+    """Detects whether supplier explicitly stated their price is final, lowest, or non-negotiable."""
+    if not message:
+        return False
+    return negotiation_engine.is_final_price_declared(message)
+
+
+def generate_adaptive_negotiation_message(
+    strategy: str,
+    counter_price: float,
+    supplier_last_concession: float = 0.0,
+    product_name: str = None,
+    variant_label: str = None,
+) -> str:
+    """
+    Generates warm, professional WhatsApp negotiation phrasing based on strategy & movement.
+    Avoids repetitive identical templates.
+    """
+    var_prefix = f"For the {variant_label} option, " if variant_label else ""
+    if strategy == "ANCHOR":
+        return f"{var_prefix}Thanks for the quote. We're looking for a more competitive rate on this order. Could you do AED {counter_price:g} per piece?"
+    elif strategy == "STRETCH_SAVINGS":
+        return f"{var_prefix}Thanks for the competitive price. Could you make it AED {counter_price:g} per piece for this order?"
+    elif strategy == "RECIPROCAL_CONCESSION":
+        if supplier_last_concession >= 5.0:
+            return f"{var_prefix}Thanks for moving significantly on the price. We're getting closer. Could you meet us at AED {counter_price:g} per piece?"
+        else:
+            return f"{var_prefix}Appreciate the flexibility. We're getting closer on our end. Could you improve it to AED {counter_price:g} per piece?"
+    elif strategy == "HOLD_POSITION":
+        return f"{var_prefix}Understood. We're still trying to improve the rate on this order. Is there any further flexibility on the price?"
+    elif strategy == "FINAL_PUSH":
+        return f"{var_prefix}We appreciate the effort on the pricing. Could you make AED {counter_price:g} per piece your best rate for this order?"
+    elif strategy == "INFORMATION_SEEKING":
+        return f"{var_prefix}Understood on the current rate. Would the pricing improve if we adjust the order quantity or delivery schedule?"
+    else:
+        return f"{var_prefix}Thanks for the update. Could you consider AED {counter_price:g} per piece?"
+
+
+
+
+async def process_multi_rfq_quote_batch(
+    *,
+    parsed_items: list,
+    all_open_rfqs: list,
+    supplier: dict,
+    client_id: str,
+    raw_message: str,
+    inbound_log_id: str,
+    pending_clarification: Optional[dict] = None,
+) -> Optional[dict]:
+    """Process one supplier WhatsApp message containing quotes for multiple RFQs.
+
+    The AI parser maps natural-language line items to authoritative open RFQs.
+    Every mapped RFQ then passes through the SAME record_quote -> negotiation
+    engine -> hard-validator pipeline as a normal single-RFQ reply.
+    """
+    if not parsed_items or len(parsed_items) < 2:
+        return None
+
+    supplier_id = supplier.get("id")
+    phone_number = supplier.get("phone_number")
+    if not supplier_id:
+        return None
+
+    grouped = {}
+    source_items = {}
+    for item in parsed_items:
+        if not isinstance(item, dict):
+            return None
+        rfq_id = str(item.get("candidate_rfq_id") or "").strip()
+        price = item.get("price")
+        confidence = float(item.get("confidence") or 0.0)
+        if not rfq_id or price is None or confidence < 0.70:
+            return None
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            return None
+        if price <= 0:
+            return None
+
+        variant = {
+            "variant_label": item.get("variant_label"),
+            "price": price,
+            "delivery_time": item.get("delivery_time"),
+            "quality_notes": item.get("quality_notes"),
+            "quantity": item.get("quantity"),
+            "is_available": True,
+        }
+        grouped.setdefault(rfq_id, []).append(variant)
+        source_items.setdefault(rfq_id, []).append(item)
+
+    if len(grouped) < 2:
+        return None
+
+    validations = []
+    for rfq_id, variants in grouped.items():
+        proposal = ActionProposal(
+            tool_name="record_quote",
+            arguments={"rfq_id": rfq_id, "variants": variants},
+            raw_message=raw_message,
+        )
+        validation = validate_action(
+            proposal,
+            client_id=client_id,
+            supplier_id=supplier_id,
+            context_rfqs=all_open_rfqs,
+            matched_rfq_id=None,
+            pending_clarification=None,
+            input_origin="supplier",
+            source_message_id=inbound_log_id,
+        )
+        if not validation.is_valid:
+            logger.warning(
+                "Multi-RFQ batch validation failed for RFQ %s: %s",
+                rfq_id,
+                validation.reason,
+            )
+            return None
+        validations.append((rfq_id, validation))
+
+    results = []
+    sent_followup = False
+
+    for rfq_id, validation in validations:
+        rfq_entry = next(
+            (
+                e for e in all_open_rfqs
+                if str((e.get("rfqs", e) if isinstance(e, dict) else {}).get("id")) == str(rfq_id)
+            ),
+            None,
+        )
+        if not rfq_entry:
+            return None
+
+        try:
+            prior_quotes = db.get_supplier_prior_quotes(supplier_id, [rfq_id]) or []
+        except Exception:
+            prior_quotes = []
+
+        try:
+            attempts = db.get_negotiation_attempts(rfq_id, supplier_id)
+        except Exception:
+            attempts = 0
+
+        try:
+            active_session = db.get_active_negotiation_session(client_id, rfq_id, supplier_id)
+        except Exception:
+            active_session = None
+
+        per_rfq_context = AgentContext(
+            client_id=client_id,
+            supplier_id=supplier_id,
+            supplier_name=supplier.get("name"),
+            supplier_phone=phone_number,
+            input_origin="supplier",
+            matched_rfq_id=rfq_id,
+            match_source="multi_rfq_batch",
+            open_rfqs=[rfq_entry],
+            pending_clarification=None,
+            prior_quotes=prior_quotes,
+            negotiation_attempts={rfq_id: attempts if isinstance(attempts, (int, float)) else 0},
+            active_negotiation_session=active_session,
+            conversation_history=[],
+            source_message_id=inbound_log_id,
+        )
+
+        items = source_items.get(rfq_id) or []
+        cheapest_item = min(
+            items,
+            key=lambda x: float(x.get("price")),
+        )
+        final_for_best_variant = bool(cheapest_item.get("supplier_final"))
+
+        semantic_lines = []
+        for item in items:
+            parts = []
+            if item.get("product_reference"):
+                parts.append(str(item.get("product_reference")))
+            if item.get("variant_label"):
+                parts.append(f"Brand {item.get('variant_label')}")
+            if item.get("quantity") is not None:
+                parts.append(f"Quantity {item.get('quantity')}")
+            parts.append(f"AED {float(item.get('price')):g}")
+            if item.get("supplier_final"):
+                parts.append("final")
+            semantic_lines.append(" | ".join(parts))
+        semantic_message = "\n".join(semantic_lines)
+
+        decision = db.record_agent_decision(
+            client_id=client_id,
+            origin="supplier",
+            tool_name="record_quote",
+            arguments={**validation.sanitized_args, "multi_rfq_batch": True},
+            validation_status="approved",
+            validation_reason=None,
+            execution_status="pending",
+            rfq_id=rfq_id,
+            supplier_id=supplier_id,
+            inbound_message_id=inbound_log_id,
+        )
+        decision_id = decision.get("id") if isinstance(decision, dict) else None
+
+        result = await execute_validated_action(
+            validation,
+            per_rfq_context,
+            semantic_message,
+            supplier,
+            client_id,
+            decision_id=decision_id,
+            quote_raw_override=raw_message,
+            supplier_final_override=final_for_best_variant,
+            suppress_acknowledgement=True,
+        )
+        results.append(result)
+
+        if result.get("status") in {
+            "negotiation_sent",
+            "escalated_to_human",
+            "awaiting_authorization",
+        }:
+            sent_followup = True
+
+    if pending_clarification:
+        try:
+            db.resolve_pending_clarification(pending_clarification["id"])
+        except Exception:
+            pass
+
+    # If every line merely recorded with no counter/final/authorization message,
+    # acknowledge the batch once instead of sending one thank-you per RFQ.
+    if not sent_followup:
+        acknowledgement = "Thanks! We've recorded the quoted items and will review them."
+        msg_log_id = db.log_message(
+            client_id,
+            supplier_id,
+            "outbound",
+            acknowledgement,
+        )
+        if phone_number and msg_log_id:
+            await enqueue_message(
+                phone_number,
+                acknowledgement,
+                supplier_id=supplier_id,
+                message_log_id=msg_log_id,
+            )
+
+    return {
+        "status": "multi_rfq_quotes_processed",
+        "rfq_count": len(results),
+        "results": results,
+    }
+
+
+async def execute_validated_action(
+    validation: ValidationResult,
+    context: AgentContext,
+    raw_message: str,
+    supplier: dict,
+    client_id: str,
+    decision_id: str = None,
+    *,
+    quote_raw_override: Optional[str] = None,
+    supplier_final_override: Optional[bool] = None,
+    suppress_acknowledgement: bool = False,
+) -> dict:
+    """
+    Executes a policy-approved action deterministically:
+    - record_quote: records single/batch quote variants and evaluates historical last quote tolerance
+    - negotiate_price: records counteroffer and sends negotiation message within attempt limit
+    - request_clarification: creates/advances pending clarification
+    - send_procurement_message: sends safe informational message
+    - escalate_to_human: creates operator review flag
+    """
+    phone_number = supplier.get("phone_number")
+    supplier_id = supplier["id"]
+
+    try:
+        if validation.action == "record_quote":
+            args = validation.sanitized_args
+            target_rfq_id = args["rfq_id"]
+            variants = args.get("variants")
+            if not variants:
+                variants = [{
+                    "variant_label": args.get("variant_label"),
+                    "price": args.get("price"),
+                    "delivery_time": args.get("delivery_time"),
+                    "quality_notes": args.get("quality_notes"),
+                    "is_available": args.get("is_available", True),
+                }]
+
+            # Fallback to preserved commercial terms from pending_clarification if supplier response only identified the product
+            if variants and len(variants) == 1 and context.pending_clarification:
+                if variants[0].get("price") is None and context.pending_clarification.get("extracted_price") is not None:
+                    variants[0]["price"] = context.pending_clarification.get("extracted_price")
+                if variants[0].get("delivery_time") is None and context.pending_clarification.get("extracted_delivery") is not None:
+                    variants[0]["delivery_time"] = context.pending_clarification.get("extracted_delivery")
+                if variants[0].get("quality_notes") is None and context.pending_clarification.get("extracted_notes") is not None:
+                    variants[0]["quality_notes"] = context.pending_clarification.get("extracted_notes")
+
+            # Ensure quote provenance reflects supplier's original message, not operator instruction
+            quote_raw = (
+                quote_raw_override
+                if quote_raw_override is not None
+                else (context.review_raw_message if (context.input_origin == "operator" and context.review_raw_message) else raw_message)
+            )
+
+            # Check if existing quotes already match to avoid duplicate records from operator hold commands
+            should_record = True
+            if context.input_origin == "operator":
+                existing_quotes = [q for q in context.prior_quotes if q.get("rfq_id") == target_rfq_id]
+                all_match = True
+                for v in variants:
+                    matching = [
+                        q for q in existing_quotes
+                        if (q.get("variant_label") or "").strip().casefold() == (v.get("variant_label") or "").strip().casefold()
+                        and q.get("price") == v.get("price")
+                        and q.get("is_available", True) == v.get("is_available", True)
+                    ]
+                    if not matching:
+                        all_match = False
+                        break
+                if existing_quotes and all_match:
+                    should_record = False
+
+            persisted_quotes = []
+            if should_record:
+                if len(variants) == 1 and variants[0].get("variant_label") is None and variants[0].get("is_available", True) is True:
+                    persisted = db.record_quote(
+                        rfq_id=target_rfq_id,
+                        supplier_id=supplier_id,
+                        price=variants[0].get("price"),
+                        delivery_time=variants[0].get("delivery_time"),
+                        quality_notes=variants[0].get("quality_notes"),
+                        raw_message=quote_raw,
+                        source_message_id=context.source_message_id,
+                    )
+                    if persisted:
+                        persisted_quotes = [persisted]
+                else:
+                    persisted_quotes = db.record_quotes_batch(
+                        rfq_id=target_rfq_id,
+                        supplier_id=supplier_id,
+                        variants=variants,
+                        raw_message=quote_raw,
+                        source_message_id=context.source_message_id,
+                    ) or []
+            elif context.input_origin == "operator":
+                persisted_quotes = [
+                    q for q in context.prior_quotes
+                    if str(q.get("rfq_id")) == str(target_rfq_id)
+                ]
+
+            # Negotiate against the supplier's best (lowest) available priced
+            # variant for this RFQ. Preserve all variants for ranking/history.
+            negotiation_variant = None
+            for v in variants or []:
+                if not v.get("is_available", True) or v.get("price") is None:
+                    continue
+                try:
+                    pv = float(v.get("price"))
+                except (TypeError, ValueError):
+                    continue
+                if pv <= 0:
+                    continue
+                if negotiation_variant is None or pv < float(negotiation_variant.get("price")):
+                    negotiation_variant = v
+
+            persisted_quote_id = None
+            if negotiation_variant and persisted_quotes:
+                target_label = (negotiation_variant.get("variant_label") or "").strip().casefold()
+                target_price = float(negotiation_variant.get("price"))
+                for pq in persisted_quotes:
+                    if not isinstance(pq, dict):
+                        continue
+                    try:
+                        pq_price = float(pq.get("price"))
+                    except (TypeError, ValueError):
+                        continue
+                    pq_label = (pq.get("variant_label") or "").strip().casefold()
+                    if pq_label == target_label and abs(pq_price - target_price) < 0.001:
+                        persisted_quote_id = pq.get("id")
+                        break
+            if persisted_quote_id is None and persisted_quotes and isinstance(persisted_quotes[0], dict):
+                persisted_quote_id = persisted_quotes[0].get("id")
+
+            if context.source_message_id and target_rfq_id:
+                db.update_message_related_rfq(context.source_message_id, target_rfq_id)
+
+            # Resolve pending clarification if one was active for this supplier
+            if context.pending_clarification:
+                db.resolve_pending_clarification(context.pending_clarification["id"])
+                db.revert_unresolved_candidates(
+                    supplier_id=supplier_id,
+                    resolved_rfq_id=target_rfq_id,
+                    candidate_rfq_ids=context.pending_clarification.get("pending_rfq_ids", []),
+                )
+
+            # Retrieve target RFQ for historical price evaluation
+            target_rfq = next((r.get("rfqs", r) for r in (context.open_rfqs or []) if str(r.get("rfqs", r).get("id")) == str(target_rfq_id)), None)
+            if not target_rfq and target_rfq_id:
+                try:
+                    target_rfq = db.get_rfq_by_id(target_rfq_id)
+                except Exception:
+                    pass
+
+            rfq_last_quote = target_rfq.get("last_quote") if isinstance(target_rfq, dict) else None
+            price_val = None
+            if negotiation_variant and negotiation_variant.get("price") is not None:
+                try:
+                    pv = float(negotiation_variant.get("price"))
+                    if pv > 0:
+                        price_val = pv
+                except Exception:
+                    pass
+
+            hist_ctx = db.build_historical_price_context(rfq_last_quote, price_val) if (rfq_last_quote is not None and price_val is not None) else None
+            attempts_made = db.get_negotiation_attempts(target_rfq_id, supplier_id) if target_rfq_id else 0
+            if not isinstance(attempts_made, (int, float)):
+                attempts_made = 0
+
+            is_final = (
+                bool(supplier_final_override)
+                if supplier_final_override is not None
+                else (is_supplier_final_price_statement(raw_message) or bool(quote_raw and is_supplier_final_price_statement(quote_raw)))
+            )
+
+            # 1. Evaluate negotiation preflight, constraints and active session
+            active_session = db.get_active_negotiation_session(client_id, target_rfq_id, supplier_id) if target_rfq_id else None
+            prior_quotes_for_rfq = [q for q in (context.prior_quotes or []) if str(q.get("rfq_id")) == str(target_rfq_id)]
+            rfq_constraints = db.get_rfq_negotiation_constraints(client_id, target_rfq_id) if target_rfq_id else []
+            extracted_deliv = negotiation_variant.get("delivery_time") if negotiation_variant else None
+            extracted_q = negotiation_variant.get("quantity") if negotiation_variant else None
+            extracted_var = negotiation_variant.get("variant_label") if negotiation_variant else None
+
+            preflight = negotiation_engine.build_negotiation_preflight(
+                rfq=target_rfq or {},
+                supplier_quote=price_val if price_val is not None else 0.0,
+                previous_quotes=prior_quotes_for_rfq,
+                active_session=active_session,
+                raw_message_text=raw_message,
+                rfq_constraints=rfq_constraints,
+                extracted_delivery=extracted_deliv,
+                extracted_quantity=extracted_q,
+                extracted_variant=extracted_var,
+            ) if (target_rfq and price_val is not None) else None
+
+            tradeoff_info = preflight.get("tradeoff_evaluation", {}) if preflight else {}
+            is_unauthorized_tradeoff = bool(tradeoff_info.get("has_tradeoff") and not tradeoff_info.get("is_authorized"))
+
+            # 2. Persist / update negotiation session
+            persisted_session = None
+            if preflight and target_rfq_id and price_val is not None:
+                no_mov = (active_session.get("no_movement_count", 0) + 1) if (active_session and preflight.get("supplier_behavior") in ("NO_MOVEMENT", "PRICE_INCREASED")) else 0
+                session_status = "awaiting_authorization" if is_unauthorized_tradeoff else "active"
+                session_update = {
+                    "status": session_status,
+                    "preferred_target": preflight["preferred_target"],
+                    "acceptable_max": preflight["acceptable_max"],
+                    "tolerated_final_ceiling": preflight["tolerated_final_ceiling"],
+                    "initial_supplier_offer": preflight["initial_supplier_offer"],
+                    "previous_supplier_offer": preflight["previous_supplier_offer"],
+                    "latest_supplier_offer": price_val,
+                    "supplier_total_concession": preflight["supplier_total_concession"],
+                    "supplier_last_concession": preflight["supplier_last_concession"],
+                    "no_movement_count": no_mov,
+                    "supplier_final_detected": is_final or preflight["supplier_final_detected"],
+                    "selected_strategy": preflight["selected_strategy"],
+                    "last_quote_id": persisted_quote_id,
+                }
+                persisted_session = db.create_or_update_negotiation_session(
+                    client_id, target_rfq_id, supplier_id, **session_update
+                )
+
+            # Check if unauthorized trade-off requires human authorization
+            if is_unauthorized_tradeoff and target_rfq_id and context.input_origin != "operator":
+                dim = tradeoff_info.get("dimension") or "terms"
+                prop_val = tradeoff_info.get("supplier_proposed_value")
+                curr_val = tradeoff_info.get("current_value")
+                flag_meta = {
+                    "type": "negotiation_tradeoff_authorization",
+                    "dimension": dim,
+                    "current_value": curr_val,
+                    "supplier_proposed_value": prop_val,
+                    "supplier_latest_price": price_val,
+                    "supplier_message": raw_message,
+                    "session_id": persisted_session.get("id") if persisted_session else None,
+                    "quote_id": str(persisted_quote_id) if persisted_quote_id else None,
+                }
+                db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=target_rfq_id,
+                    reason=tradeoff_info.get("reason") or f"Supplier proposed {dim} trade-off requiring buyer authorization.",
+                    category="negotiation_tradeoff_authorization",
+                    raw_message=raw_message,
+                    metadata=flag_meta,
+                )
+                dim_phrase = "delivery schedule" if dim == "delivery" else ("order quantity" if dim == "quantity" else "specification")
+                holding_msg = f"Thanks for the option. Let me confirm internally whether that {dim_phrase} can work and we'll get back to you."
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", holding_msg, related_rfq_id=target_rfq_id)
+                if phone_number and msg_log_id:
+                    await enqueue_message(phone_number, holding_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+                return {"status": "awaiting_authorization", "rfq_id": target_rfq_id, "quote_id": str(persisted_quote_id)}
+
+            # 3. Check whether to trigger adaptive autonomous counteroffer
+            has_valid_session = bool(persisted_session and persisted_session.get("id"))
+            can_auto_negotiate = (
+                context.input_origin != "operator"
+                and preflight
+                and preflight.get("should_counter")
+                and not is_final
+                and attempts_made < MAX_NEGOTIATION_ATTEMPTS
+                and negotiation_variant is not None
+                and negotiation_variant.get("is_available", True) is True
+                and has_valid_session
+            )
+
+            if (
+                context.input_origin != "operator"
+                and preflight
+                and preflight.get("should_counter")
+                and not is_final
+                and attempts_made < MAX_NEGOTIATION_ATTEMPTS
+                and not has_valid_session
+            ):
+                logger.error(
+                    "Durable negotiation session persistence failed for RFQ %s and supplier %s; stopping autonomous negotiation to fail closed.",
+                    target_rfq_id,
+                    supplier_id,
+                )
+                supp_name = supplier.get("name") or "Supplier"
+                flag_res = db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=target_rfq_id,
+                    reason=f"Negotiation Session Persistence Error: Unable to save durable negotiation state for {supp_name}. Autonomous counter withheld.",
+                    category="system_error",
+                    raw_message=raw_message,
+                )
+                flag_id = flag_res[0]["id"] if flag_res and len(flag_res) > 0 else None
+                msg_log_id = db.log_message(
+                    client_id,
+                    supplier_id,
+                    "outbound",
+                    HUMAN_ACK_MSG,
+                    related_rfq_id=target_rfq_id,
+                )
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log negotiation-session failure holding message.")
+                await enqueue_message(
+                    phone_number,
+                    HUMAN_ACK_MSG,
+                    rfq_id=target_rfq_id,
+                    supplier_id=supplier_id,
+                    message_log_id=msg_log_id,
+                )
+                return {
+                    "status": "escalated_to_human",
+                    "reason": "Negotiation session persistence failed; autonomous negotiation stopped.",
+                    "category": "system_error",
+                    "rfq_id": target_rfq_id,
+                    "quote_id": str(persisted_quote_id) if persisted_quote_id else None,
+                    "flag_id": flag_id,
+                }
+
+            if can_auto_negotiate and persisted_quote_id:
+                counter_price = float(preflight["recommended_anchor"])
+                approved_draft = generate_adaptive_negotiation_message(
+                    strategy=preflight["selected_strategy"],
+                    counter_price=counter_price,
+                    supplier_last_concession=preflight["supplier_last_concession"],
+                    product_name=target_rfq.get("product_name") if isinstance(target_rfq, dict) else None,
+                    variant_label=negotiation_variant.get("variant_label") if negotiation_variant else None,
+                )
+                try:
+                    negotiation_message = groq_client.write_supplier_message(
+                        purpose="negotiation",
+                        approved_facts={
+                            "product_name": target_rfq.get("product_name") if isinstance(target_rfq, dict) else None,
+                            "supplier_price": float(price_val),
+                            "counter_price": counter_price,
+                            "strategy": preflight.get("selected_strategy"),
+                            "delivery_time": negotiation_variant.get("delivery_time") if negotiation_variant else None,
+                            "variant_label": negotiation_variant.get("variant_label") if negotiation_variant else None,
+                            "communication_goal": "Send the approved counteroffer without changing any commercial terms.",
+                        },
+                        draft_message=approved_draft,
+                        usage_context={"client_id": client_id, "supplier_id": supplier_id, "rfq_id": target_rfq_id},
+                    )
+                except Exception as writer_err:
+                    logger.warning("Qwen negotiation writer failed; using deterministic approved fallback: %s", type(writer_err).__name__)
+                    negotiation_message = approved_draft
+
+                followup_proposal = ActionProposal(
+                    tool_name="negotiate_price",
+                    arguments={
+                        "rfq_id": target_rfq_id,
+                        "quote_id": str(persisted_quote_id),
+                        "quoted_price": float(price_val),
+                        "counter_price": counter_price,
+                        "negotiation_message": negotiation_message,
+                        "delivery_time": negotiation_variant.get("delivery_time") if negotiation_variant else None,
+                        "quality_notes": negotiation_variant.get("quality_notes") if negotiation_variant else None,
+                        "variant_label": negotiation_variant.get("variant_label") if negotiation_variant else None,
+                    },
+                    raw_message=raw_message,
+                )
+                followup_validation = validate_action(
+                    followup_proposal,
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    context_rfqs=context.open_rfqs,
+                    matched_rfq_id=context.matched_rfq_id,
+                    pending_clarification=context.pending_clarification,
+                    input_origin="supplier",
+                    negotiation_preflight=preflight,
+                )
+
+                if followup_validation.is_valid:
+                    if decision_id:
+                        db.update_agent_decision(
+                            decision_id,
+                            validation_status="approved",
+                            execution_status="executed",
+                            arguments={
+                                **dict(args),
+                                "quote_persisted_before_negotiation": True,
+                                "persisted_quote_id": str(persisted_quote_id),
+                                "strategy": preflight.get("selected_strategy"),
+                                "preferred_target": preflight.get("preferred_target"),
+                                "tolerated_final_ceiling": preflight.get("tolerated_final_ceiling"),
+                            },
+                            executed_at=datetime.now(timezone.utc).isoformat(),
+                        )
+
+                    followup_decision = db.record_agent_decision(
+                        client_id=client_id,
+                        origin="supplier",
+                        tool_name="negotiate_price",
+                        arguments=followup_validation.sanitized_args,
+                        validation_status="approved",
+                        validation_reason=f"Adaptive negotiation ({preflight.get('selected_strategy')}) toward optimum price.",
+                        execution_status="pending",
+                        rfq_id=target_rfq_id,
+                        supplier_id=supplier_id,
+                        inbound_message_id=context.source_message_id,
+                    )
+                    followup_decision_id = followup_decision.get("id") if followup_decision else None
+                    return await execute_validated_action(
+                        followup_validation,
+                        context,
+                        raw_message,
+                        supplier,
+                        client_id,
+                        decision_id=followup_decision_id,
+                    )
+
+                logger.warning(
+                    "Post-persist negotiation rejected for RFQ %s: %s",
+                    target_rfq_id,
+                    followup_validation.reason,
+                )
+                escalation_reason = (
+                    "Negotiation Safety Conflict: the negotiation engine proposed an autonomous "
+                    f"counteroffer, but the Policy Validator could not safely approve it. "
+                    f"Validator reason: {followup_validation.reason}"
+                )
+                if persisted_session and persisted_session.get("id"):
+                    db.complete_negotiation_session(
+                        persisted_session["id"],
+                        status="awaiting_human_review",
+                    )
+                flag_res = db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=target_rfq_id,
+                    reason=escalation_reason,
+                    category="requires_business_knowledge",
+                    raw_message=raw_message,
+                )
+                flag_id = flag_res[0]["id"] if flag_res and len(flag_res) > 0 else None
+                msg_log_id = db.log_message(
+                    client_id,
+                    supplier_id,
+                    "outbound",
+                    HUMAN_ACK_MSG,
+                    related_rfq_id=target_rfq_id,
+                )
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log negotiation safety-conflict holding message.")
+                await enqueue_message(
+                    phone_number,
+                    HUMAN_ACK_MSG,
+                    rfq_id=target_rfq_id,
+                    supplier_id=supplier_id,
+                    message_log_id=msg_log_id,
+                )
+                return {
+                    "status": "escalated_to_human",
+                    "reason": escalation_reason,
+                    "category": "negotiation_safety_conflict",
+                    "rfq_id": target_rfq_id,
+                    "quote_id": str(persisted_quote_id),
+                    "flag_id": flag_id,
+                }
+
+            # 4. Handle Stop / Escalation conditions
+            if preflight and persisted_session and persisted_session.get("id"):
+                if preflight["reason_code"] == "TARGET_REACHED":
+                    db.complete_negotiation_session(persisted_session["id"], status="target_reached")
+                elif preflight["reason_code"] == "COUNTER_ACCEPTED":
+                    db.complete_negotiation_session(persisted_session["id"], status="completed")
+
+            should_escalate_attention = False
+            escalation_reason = None
+
+            if preflight and price_val is not None and context.input_origin != "operator":
+                supp_name = supplier.get("name") or "Supplier"
+                prod_name = target_rfq.get("product_name") if isinstance(target_rfq, dict) else "Product"
+                var_label = negotiation_variant.get("variant_label") if negotiation_variant else None
+                var_line = f"Variant:\n{var_label}\n\n" if var_label else ""
+                
+                pref_target = preflight["preferred_target"]
+                tol_ceiling = preflight["tolerated_final_ceiling"]
+                acc_max = preflight["acceptable_max"]
+                is_above_ceiling = (acc_max is not None and price_val > acc_max)
+                diff_from_target = round(price_val - pref_target, 2) if pref_target else "N/A"
+                diff_above_ceiling = round(price_val - acc_max, 2) if acc_max else "N/A"
+
+                if is_final:
+                    should_escalate_attention = True
+                    if is_above_ceiling:
+                        final_reason = (
+                            f"Supplier stated AED {price_val} is their final price, which is "
+                            f"AED {diff_above_ceiling} above the explicit hard maximum."
+                        )
+                    else:
+                        final_reason = (
+                            f"Supplier stated AED {price_val} is their final price. "
+                            "Autonomous negotiation has stopped and a human decision is required."
+                        )
+                    escalation_reason = (
+                        f"Final Quote Decision Required\n\n"
+                        f"Supplier:\n{supp_name}\n\n"
+                        f"Product:\n{prod_name}\n\n"
+                        f"{var_line}"
+                        f"Historical Last Quote:\nAED {rfq_last_quote if rfq_last_quote else 'N/A'}\n\n"
+                        f"Preferred Target:\nAED {pref_target if pref_target else 'N/A'}\n\n"
+                        f"Acceptable Maximum:\nAED {acc_max if acc_max else 'N/A'}\n\n"
+                        f"Hard Maximum:\nAED {tol_ceiling if tol_ceiling else 'N/A'}\n\n"
+                        f"Supplier Final Quote:\nAED {price_val}\n\n"
+                        f"Delivery:\n{extracted_deliv or 'Not specified'}\n\n"
+                        f"Negotiation Attempts:\n{attempts_made}/{MAX_NEGOTIATION_ATTEMPTS}\n\n"
+                        f"Reason:\n{final_reason}"
+                    )
+                    if persisted_session and persisted_session.get("id"):
+                        db.complete_negotiation_session(persisted_session["id"], status="supplier_final")
+                elif attempts_made >= MAX_NEGOTIATION_ATTEMPTS and (pref_target is None or price_val > pref_target):
+                    should_escalate_attention = True
+                    escalation_reason = (
+                        f"Negotiation Requires Attention\n\n"
+                        f"Supplier:\n{supp_name}\n\n"
+                        f"Product:\n{prod_name}\n\n"
+                        f"{var_line}"
+                        f"Historical Last Quote:\nAED {rfq_last_quote if rfq_last_quote else 'N/A'}\n\n"
+                        f"Preferred Target:\nAED {pref_target if pref_target else 'N/A'}\n\n"
+                        f"Acceptable Maximum:\nAED {acc_max if acc_max else 'N/A'}\n\n"
+                        f"Hard Maximum:\nAED {tol_ceiling if tol_ceiling else 'N/A'}\n\n"
+                        f"Supplier Latest Quote:\nAED {price_val}\n\n"
+                        f"Difference from Last Quote:\nAED +{diff_from_target}\n\n"
+                        f"Negotiation Attempts:\n{MAX_NEGOTIATION_ATTEMPTS}/{MAX_NEGOTIATION_ATTEMPTS}\n\n"
+                        f"Reason:\nAutonomous negotiation limit reached ({MAX_NEGOTIATION_ATTEMPTS}/{MAX_NEGOTIATION_ATTEMPTS}) while supplier price AED {price_val} remains above preferred target."
+                    )
+                    if persisted_session and persisted_session.get("id"):
+                        db.complete_negotiation_session(persisted_session["id"], status="awaiting_human_review")
+
+            if should_escalate_attention and escalation_reason:
+                is_final_quote_decision = bool(is_final)
+                flag_metadata = {}
+                flag_category = "requires_business_knowledge"
+                outbound_review_msg = HUMAN_ACK_MSG
+                if is_final_quote_decision:
+                    flag_category = "supplier_final_quote_decision"
+                    flag_metadata = {
+                        "type": "supplier_final_quote_decision",
+                        "quote_id": str(persisted_quote_id) if persisted_quote_id else None,
+                        "supplier_final_price": price_val,
+                        "delivery_time": extracted_deliv,
+                        "preferred_target": pref_target,
+                        "acceptable_max": acc_max,
+                        "tolerated_final_ceiling": tol_ceiling,
+                        "above_tolerated_ceiling": is_above_ceiling,
+                        "negotiation_attempts": attempts_made,
+                    }
+                    delivery_phrase = f" with {extracted_deliv} delivery" if extracted_deliv else ""
+                    outbound_review_msg = (
+                        f"Thanks. We've noted your final quote of AED {price_val:g} per piece"
+                        f"{delivery_phrase}. We'll review it internally and get back to you."
+                    )
+
+                flag_res = db.flag_for_human_review(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    rfq_id=target_rfq_id,
+                    reason=escalation_reason,
+                    category=flag_category,
+                    raw_message=raw_message,
+                    metadata=flag_metadata,
+                )
+                flag_id = flag_res[0]["id"] if flag_res and len(flag_res) > 0 else None
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", outbound_review_msg, related_rfq_id=target_rfq_id)
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log outbound message durably.")
+                await enqueue_message(phone_number, outbound_review_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+
+                if decision_id:
+                    updated_args = dict(args)
+                    if preflight:
+                        updated_args.update({
+                            "last_quote": rfq_last_quote,
+                            "preferred_target": preflight.get("preferred_target"),
+                            "tolerated_final_ceiling": preflight.get("tolerated_final_ceiling"),
+                            "acceptable_max": preflight.get("acceptable_max"),
+                            "negotiation_attempt": attempts_made,
+                            "supplier_final_price_detected": is_final,
+                        })
+                    db.update_agent_decision(
+                        decision_id,
+                        validation_status="approved",
+                        execution_status="executed",
+                        outbound_message_id=msg_log_id,
+                        flag_id=flag_id,
+                        arguments=updated_args,
+                        executed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                return {
+                    "status": "escalated_to_human",
+                    "reason": escalation_reason,
+                    "category": "supplier_final_quote_decision" if is_final_quote_decision else "requires_business_knowledge",
+                    "rfq_id": target_rfq_id,
+                    "flag_id": flag_id,
+                }
+
+            if suppress_acknowledgement:
+                if decision_id:
+                    updated_args = dict(args)
+                    if preflight:
+                        updated_args.update({
+                            "last_quote": rfq_last_quote,
+                            "preferred_target": preflight.get("preferred_target"),
+                            "tolerated_final_ceiling": preflight.get("tolerated_final_ceiling"),
+                            "acceptable_max": preflight.get("acceptable_max"),
+                            "negotiation_attempt": attempts_made,
+                            "supplier_final_price_detected": is_final,
+                        })
+                    db.update_agent_decision(
+                        decision_id,
+                        validation_status="approved",
+                        execution_status="executed",
+                        arguments=updated_args,
+                        executed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                return {"status": "recorded", "rfq_id": target_rfq_id}
+
+            # Semantic acknowledgement: an unavailable product is not a quote.
+            acknowledgement_msg = acknowledgement_for_quote_variants(variants)
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", acknowledgement_msg, related_rfq_id=target_rfq_id)
+            if not msg_log_id:
+                raise RuntimeError("Failed to log outbound acknowledgement durably.")
+            await enqueue_message(phone_number, acknowledgement_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+
+            if decision_id:
+                updated_args = dict(args)
+                if preflight:
+                    updated_args.update({
+                        "last_quote": rfq_last_quote,
+                        "preferred_target": preflight.get("preferred_target"),
+                        "tolerated_final_ceiling": preflight.get("tolerated_final_ceiling"),
+                        "acceptable_max": preflight.get("acceptable_max"),
+                        "negotiation_attempt": attempts_made,
+                        "supplier_final_price_detected": is_final,
+                    })
+                db.update_agent_decision(
+                    decision_id,
+                    validation_status="approved",
+                    execution_status="executed",
+                    outbound_message_id=msg_log_id,
+                    arguments=updated_args,
+                    executed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            if context.match_source in ("exact_stanza", "quoted_text"):
+                return {"status": "recorded_via_quoted_message", "rfq_id": target_rfq_id}
+            elif context.pending_clarification:
+                return {
+                    "status": "recorded_from_clarification",
+                    "rfq_id": target_rfq_id,
+                    "clarification_id": context.pending_clarification["id"],
+                }
+            else:
+                return {"status": "recorded", "rfq_id": target_rfq_id}
+
+        elif validation.action == "negotiate_price":
+            args = validation.sanitized_args
+            target_rfq_id = args["rfq_id"]
+            quote_id = args.get("quote_id")
+            quoted_price = args.get("quoted_price")
+            counter_price = args.get("counter_price")
+            approved_draft = args["negotiation_message"]
+            delivery = args.get("delivery_time")
+            notes = args.get("quality_notes")
+            variant_label = args.get("variant_label")
+            strategy = args.get("selected_strategy")
+            try:
+                neg_msg = groq_client.write_supplier_message(
+                    purpose="negotiation",
+                    approved_facts={
+                        "supplier_price": quoted_price,
+                        "counter_price": counter_price,
+                        "strategy": strategy,
+                        "delivery_time": delivery,
+                        "variant_label": variant_label,
+                        "communication_goal": "Send the policy-approved counteroffer without changing commercial terms.",
+                    },
+                    draft_message=approved_draft,
+                    usage_context={"client_id": client_id, "supplier_id": supplier_id, "rfq_id": target_rfq_id},
+                )
+            except Exception as writer_err:
+                logger.warning("Qwen negotiation writer failed; using policy-approved fallback: %s", type(writer_err).__name__)
+                neg_msg = approved_draft
+
+            attempts = db.increment_negotiation_attempts(target_rfq_id, supplier_id)
+            if attempts <= 0:
+                if context.pending_clarification:
+                    db.resolve_pending_clarification(context.pending_clarification["id"])
+                    db.revert_unresolved_candidates(
+                        supplier_id=supplier_id,
+                        resolved_rfq_id=target_rfq_id,
+                        candidate_rfq_ids=context.pending_clarification.get("pending_rfq_ids", []),
+                    )
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", THANK_YOU_MSG, related_rfq_id=target_rfq_id)
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log outbound message durably.")
+                await enqueue_message(phone_number, THANK_YOU_MSG, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+                if decision_id:
+                    db.update_agent_decision(
+                        decision_id,
+                        validation_status="rejected",
+                        validation_reason="Negotiation attempt limit reached.",
+                        execution_status="not_executed",
+                        outbound_message_id=msg_log_id,
+                    )
+                return {"status": "rejected_by_policy", "reason": "Negotiation attempt limit reached."}
+
+            if context.pending_clarification:
+                db.resolve_pending_clarification(context.pending_clarification["id"])
+                db.revert_unresolved_candidates(
+                    supplier_id=supplier_id,
+                    resolved_rfq_id=target_rfq_id,
+                    candidate_rfq_ids=context.pending_clarification.get("pending_rfq_ids", []),
+                )
+
+            msg_log_id = db.log_message(client_id, supplier_id, "outbound", neg_msg, related_rfq_id=target_rfq_id)
+            if not msg_log_id:
+                raise RuntimeError("Failed to log outbound negotiation message durably.")
+            await enqueue_message(phone_number, neg_msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+
+            # Update negotiation session state
+            active_session = db.get_active_negotiation_session(client_id, target_rfq_id, supplier_id)
+            if active_session:
+                prev_counter = active_session.get("latest_agent_counter")
+                pref_t = active_session.get("preferred_target") or counter_price
+                updated_sess = db.create_or_update_negotiation_session(
+                    client_id=client_id,
+                    rfq_id=target_rfq_id,
+                    supplier_id=supplier_id,
+                    previous_agent_counter=prev_counter,
+                    latest_agent_counter=counter_price,
+                    attempt_count=attempts,
+                    agent_last_concession=round(counter_price - float(prev_counter), 2) if prev_counter is not None else 0.0,
+                    agent_total_concession=round(counter_price - float(pref_t), 2),
+                    last_outbound_message_id=msg_log_id,
+                )
+                if not updated_sess or not updated_sess.get("id"):
+                    logger.error("Failed to durably update negotiation session state after sending counter for RFQ %s", target_rfq_id)
+                    db.flag_for_human_review(
+                        client_id=client_id,
+                        supplier_id=supplier_id,
+                        rfq_id=target_rfq_id,
+                        reason=f"Negotiation Session State Desync: Outbound counter AED {counter_price} was sent, but durable session update failed. Requires operational review.",
+                        category="system_error",
+                    )
+
+            if decision_id:
+                updated_args = dict(args)
+                updated_args["negotiation_attempt"] = attempts
+                updated_args["supplier_final_price_detected"] = False
+                db.update_agent_decision(
+                    decision_id,
+                    validation_status="approved",
+                    execution_status="executed",
+                    outbound_message_id=msg_log_id,
+                    arguments=updated_args,
+                    executed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            return {
+                "status": "negotiation_sent",
+                "rfq_id": target_rfq_id,
+                "quote_id": quote_id,
+                "quoted_price": quoted_price,
+                "counter_price": counter_price,
+                "variant_label": variant_label,
+                "attempts": attempts,
+            }
+
+
+        elif validation.action == "request_clarification":
+            args = validation.sanitized_args
+            candidate_ids = args.get("candidate_rfq_ids") or []
+            approved_question = args["clarifying_question"]
+            candidate_products = []
+            for cid in candidate_ids:
+                rfq_match = next(
+                    (
+                        item.get("rfqs", item)
+                        for item in (context.open_rfqs or [])
+                        if str(item.get("rfqs", item).get("id")) == str(cid)
+                    ),
+                    None,
+                )
+                if isinstance(rfq_match, dict):
+                    candidate_products.append(rfq_match.get("product_name") or str(cid))
+            try:
+                question = groq_client.write_supplier_message(
+                    purpose="clarification",
+                    approved_facts={
+                        "candidate_products": candidate_products,
+                        "communication_goal": "Ask the approved clarification question only; do not add new commercial terms.",
+                    },
+                    draft_message=approved_question,
+                    usage_context={"client_id": client_id, "supplier_id": supplier_id, "rfq_id": context.matched_rfq_id},
+                )
+            except Exception as writer_err:
+                logger.warning("Qwen clarification writer failed; using policy-approved fallback: %s", type(writer_err).__name__)
+                question = approved_question
+            norm_question = " ".join((question or "").lower().split())
+
+            if not context.pending_clarification:
+                # 1. New clarification session
+                round_number = 1
+                no_progress_count = 0
+                created_id = db.create_pending_clarification(
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    candidate_rfq_ids=candidate_ids,
+                    raw_message=raw_message,
+                    extracted_price=args.get("extracted_price"),
+                    extracted_delivery=args.get("extracted_delivery"),
+                    extracted_notes=args.get("extracted_notes"),
+                    round_number=round_number,
+                    no_progress_count=no_progress_count,
+                    last_question=question,
+                )
+                if not created_id:
+                    logger.error("Failed to create initial pending clarification for supplier %s", supplier_id)
+                    db.flag_for_human_review(
+                        client_id=client_id,
+                        supplier_id=supplier_id,
+                        rfq_id=candidate_ids[0] if candidate_ids else (context.matched_rfq_id or None),
+                        reason="Database error: Failed to create pending clarification.",
+                        category="other",
+                        raw_message=raw_message,
+                    )
+                    if decision_id:
+                        db.update_agent_decision(
+                            decision_id,
+                            validation_status="approved",
+                            execution_status="failed",
+                            execution_error="Failed to create pending clarification.",
+                        )
+                    return {"status": "failed_creation", "reason": "Failed to create pending clarification."}
+            else:
+                prev_pc = context.pending_clarification
+                prev_candidates = set(prev_pc.get("pending_rfq_ids") or [])
+                new_candidates = set(candidate_ids)
+                prev_round = prev_pc.get("round_number", 1)
+                prev_no_prog = prev_pc.get("no_progress_count", 0)
+                prev_question = prev_pc.get("last_question") or ""
+                norm_prev_question = " ".join((prev_question or "").lower().split())
+
+                next_round = prev_round + 1
+
+                # Check absolute turn ceiling
+                if next_round > MAX_TOTAL_CLARIFICATION_TURNS:
+                    db.abandon_pending_clarification(prev_pc["id"])
+                    cand_prods = []
+                    for rfq_id in (candidate_ids or list(prev_candidates)):
+                        cand_rfq = next((r.get("rfqs", r) for r in (context.open_rfqs or []) if str(r.get("rfqs", r).get("id")) == str(rfq_id)), None)
+                        if cand_rfq and isinstance(cand_rfq, dict):
+                            cand_prods.append(cand_rfq.get("product_name") or str(rfq_id))
+                        else:
+                            cand_prods.append(str(rfq_id))
+                    prods_str = ", ".join(cand_prods)
+                    reason = f"Clarification session reached maximum turn limit ({MAX_TOTAL_CLARIFICATION_TURNS} turns). Remaining candidates: {prods_str}"
+                    db.flag_for_human_review(
+                        client_id=client_id,
+                        supplier_id=supplier_id,
+                        rfq_id=candidate_ids[0] if candidate_ids else (context.matched_rfq_id or None),
+                        reason=reason,
+                        category="clarification_stalled",
+                        raw_message=raw_message,
+                    )
+                    if decision_id:
+                        db.update_agent_decision(
+                            decision_id,
+                            validation_status="approved",
+                            execution_status="executed",
+                        )
+                    return {"status": "escalated_to_human", "reason": reason, "category": "clarification_stalled"}
+
+                # Calculate semantic delta: Progress vs No Progress
+                is_narrowed = len(new_candidates) < len(prev_candidates) and new_candidates.issubset(prev_candidates)
+                is_same_question = bool(norm_prev_question and norm_question == norm_prev_question)
+
+                if is_narrowed and not is_same_question:
+                    no_progress_count = 0
+                else:
+                    no_progress_count = prev_no_prog + 1
+
+                if no_progress_count >= MAX_NO_PROGRESS_ATTEMPTS:
+                    db.abandon_pending_clarification(prev_pc["id"])
+                    cand_prods = []
+                    for rfq_id in (candidate_ids or list(prev_candidates)):
+                        cand_rfq = next((r.get("rfqs", r) for r in (context.open_rfqs or []) if str(r.get("rfqs", r).get("id")) == str(rfq_id)), None)
+                        if cand_rfq and isinstance(cand_rfq, dict):
+                            cand_prods.append(cand_rfq.get("product_name") or str(rfq_id))
+                        else:
+                            cand_prods.append(str(rfq_id))
+                    prods_str = ", ".join(cand_prods)
+                    reason = f"Clarification stalled after {no_progress_count} uninformative replies. Remaining candidates: {prods_str}"
+                    db.flag_for_human_review(
+                        client_id=client_id,
+                        supplier_id=supplier_id,
+                        rfq_id=candidate_ids[0] if candidate_ids else (context.matched_rfq_id or None),
+                        reason=reason,
+                        category="clarification_stalled",
+                        raw_message=raw_message,
+                    )
+                    if decision_id:
+                        db.update_agent_decision(
+                            decision_id,
+                            validation_status="approved",
+                            execution_status="executed",
+                        )
+                    return {"status": "escalated_to_human", "reason": reason, "category": "clarification_stalled"}
+
+                advanced = db.advance_pending_clarification(
+                    previous_id=prev_pc["id"],
+                    client_id=client_id,
+                    supplier_id=supplier_id,
+                    candidate_rfq_ids=candidate_ids,
+                    raw_message=prev_pc.get("raw_message") or raw_message,
+                    extracted_price=args.get("extracted_price") if args.get("extracted_price") is not None else prev_pc.get("extracted_price"),
+                    extracted_delivery=args.get("extracted_delivery") if args.get("extracted_delivery") is not None else prev_pc.get("extracted_delivery"),
+                    extracted_notes=args.get("extracted_notes") if args.get("extracted_notes") is not None else prev_pc.get("extracted_notes"),
+                    round_number=next_round,
+                    no_progress_count=no_progress_count,
+                    last_question=question,
+                )
+                if not advanced:
+                    logger.error("Failed to atomically advance pending clarification %s", prev_pc["id"])
+                    db.flag_for_human_review(
+                        client_id=client_id,
+                        supplier_id=supplier_id,
+                        rfq_id=candidate_ids[0] if candidate_ids else (context.matched_rfq_id or None),
+                        reason="Database error: Failed to atomically advance pending clarification.",
+                        category="other",
+                        raw_message=raw_message,
+                    )
+                    if decision_id:
+                        db.update_agent_decision(
+                            decision_id,
+                            validation_status="approved",
+                            execution_status="failed",
+                            execution_error="Failed to atomically advance pending clarification.",
+                        )
+                    return {"status": "failed_advancement", "reason": "Failed to atomically advance pending clarification."}
+
+            single_rfq = candidate_ids[0] if len(candidate_ids) == 1 else (context.matched_rfq_id or None)
+            if single_rfq:
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", question, related_rfq_id=single_rfq)
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log outbound clarification message durably.")
+                await enqueue_message(phone_number, question, rfq_id=single_rfq, supplier_id=supplier_id, message_log_id=msg_log_id)
+            else:
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", question)
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log outbound clarification message durably.")
+                await enqueue_message(phone_number, question, message_log_id=msg_log_id)
+
+            if decision_id:
+                db.update_agent_decision(
+                    decision_id,
+                    validation_status="approved",
+                    execution_status="executed",
+                    outbound_message_id=msg_log_id,
+                    executed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            return {"status": "clarification_needed", "question": question}
+
+        elif validation.action == "send_procurement_message":
+            args = validation.sanitized_args
+            approved_message = args["message"]
+            try:
+                msg = groq_client.write_supplier_message(
+                    purpose="procurement_message",
+                    approved_facts={
+                        "operator_instruction": approved_message if context.input_origin == "operator" else None,
+                        "communication_goal": "Write the already-approved procurement message without changing meaning or terms.",
+                    },
+                    draft_message=approved_message,
+                    usage_context={"client_id": client_id, "supplier_id": supplier_id, "rfq_id": args.get("rfq_id") or context.matched_rfq_id},
+                )
+            except Exception as writer_err:
+                logger.warning("Qwen procurement message writer failed; using policy-approved fallback: %s", type(writer_err).__name__)
+                msg = approved_message
+            target_rfq_id = args.get("rfq_id") or context.matched_rfq_id
+            if target_rfq_id:
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", msg, related_rfq_id=target_rfq_id)
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log outbound procurement message durably.")
+                await enqueue_message(phone_number, msg, rfq_id=target_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+            else:
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", msg)
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log outbound procurement message durably.")
+                await enqueue_message(phone_number, msg, supplier_id=supplier_id, message_log_id=msg_log_id)
+
+            if decision_id:
+                db.update_agent_decision(
+                    decision_id,
+                    validation_status="approved",
+                    execution_status="executed",
+                    outbound_message_id=msg_log_id,
+                    executed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            return {"status": "message_sent", "message": msg, "rfq_id": target_rfq_id}
+
+        elif validation.action == "escalate_to_human":
+            args = validation.sanitized_args
+            esc_rfq_id = args.get("rfq_id") or context.matched_rfq_id
+            reason = args.get("reason", "Human review requested by agent")
+            category = args.get("category", "other")
+
+            db.flag_for_human_review(
+                client_id=client_id,
+                supplier_id=supplier_id,
+                rfq_id=esc_rfq_id,
+                reason=reason,
+                category=category,
+                raw_message=raw_message,
+            )
+            if context.pending_clarification:
+                db.abandon_pending_clarification(context.pending_clarification["id"])
+
+            if esc_rfq_id:
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", HUMAN_ACK_MSG, related_rfq_id=esc_rfq_id)
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log outbound human ack message durably.")
+                await enqueue_message(phone_number, HUMAN_ACK_MSG, rfq_id=esc_rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
+            else:
+                msg_log_id = db.log_message(client_id, supplier_id, "outbound", HUMAN_ACK_MSG)
+                if not msg_log_id:
+                    raise RuntimeError("Failed to log outbound human ack message durably.")
+                await enqueue_message(phone_number, HUMAN_ACK_MSG, message_log_id=msg_log_id)
+
+            if decision_id:
+                db.update_agent_decision(
+                    decision_id,
+                    validation_status="approved",
+                    execution_status="executed",
+                    outbound_message_id=msg_log_id,
+                    executed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            return {
+                "status": "escalated",
+                "reason": reason,
+                "category": category,
+            }
+
+        return {"status": "unhandled_action", "action": validation.action}
+
+    except Exception as e:
+        if decision_id:
+            db.update_agent_decision(
+                decision_id,
+                validation_status="approved",
+                execution_status="failed",
+                execution_error=str(e),
+            )
+        raise
+
+
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook(request: Request):
+    payload = {}
+    try:
+        payload = await request.json()
+        # Change 1 — Webhook event filtering: ignore non-upsert events
+        event_type = payload.get("event")
+        if event_type and event_type != "messages.upsert":
+            return {"status": "ignored", "reason": f"non-upsert event: {event_type}"}
+    except Exception as parse_err:
+        print(f"[Webhook Debug Error] Could not parse request body as JSON: {parse_err}")
+
+    try:
+        # Evolution API payload shape
+        data = payload.get("data", {})
+
+        if isinstance(data, list):
+            if not data:
+                return {"status": "ignored", "reason": "empty batched event"}
+            data = data[0]
+
+        key_data = data.get("key", {})
+
+        # Ignore outgoing messages sent by ourselves
+        if key_data.get("fromMe", False):
+            return {"status": "ignored", "reason": "outgoing message (fromMe)"}
+
+        msg_key_id = key_data.get("id")
+
+        raw_remote_jid = str(key_data.get("remoteJid") or "")
+        remote_jid_alt = str(
+            key_data.get("remoteJidAlt")
+            or key_data.get("participantAlt")
+            or ""
+        )
+
+        # Group chats are unrelated to supplier RFQ conversations. Ignoring them
+        # here prevents group JIDs (e.g. 1203...@g.us) from being treated as
+        # supplier phone numbers and flooding webhook_errors.
+        if raw_remote_jid.endswith("@g.us"):
+            return {"status": "ignored", "reason": "group chat message"}
+
+        # Newer WhatsApp/Evolution payloads may use an opaque LID as remoteJid
+        # and expose the actual phone JID in remoteJidAlt. Prefer the phone JID
+        # for supplier matching, falling back to participantAlt when available.
+        sender_jid = raw_remote_jid
+        if raw_remote_jid.endswith("@lid"):
+            sender_jid = remote_jid_alt or raw_remote_jid
+        elif not sender_jid and remote_jid_alt:
+            sender_jid = remote_jid_alt
+
+        sender_phone = normalize_phone(sender_jid)
+        message_text = (
+            data.get("message", {}).get("conversation", "")
+            or data.get("message", {}).get("extendedTextMessage", {}).get("text", "")
+        )
+        quoted_stanza_id, quoted_text, message_type = extract_inbound_quoted_info(data)
+
+        if not sender_phone or not message_text:
+            return {"status": "ignored", "reason": "no message content"}
+
+        # Resolve tenant/client unambiguously by Evolution API instance name
+        instance_name = (
+            payload.get("instance")
+            or payload.get("instanceName")
+            or (data.get("instance") if isinstance(data, dict) else None)
+            or (data.get("instanceName") if isinstance(data, dict) else None)
+            or EVOLUTION_INSTANCE
+        )
+
+        client = db.get_client_by_instance(instance_name) if instance_name else None
+        if not client:
+            err_msg = f"Unknown or unconfigured instance '{instance_name}' in webhook payload."
+            db.log_webhook_error(
+                error_message=err_msg,
+                traceback_str=f"Instance '{instance_name}' does not match any client in database. Raw payload: {payload}",
+                raw_payload=payload,
+            )
+            print(f"[Webhook] {err_msg}")
+            return {"status": "ignored", "reason": f"unknown instance: {instance_name}"}
+
+        client_id = client["id"]
+
+        # Phase 7.1: Durable Webhook Idempotency Claim (atomic at database level)
+        if msg_key_id:
+            claimed = db.claim_webhook_message(client_id, msg_key_id)
+            if not claimed:
+                print(f"[Webhook] Duplicate message '{msg_key_id}' for client '{client_id}' already processed. Ignoring.")
+                return {"status": "ignored", "reason": f"already processed message id: {msg_key_id}"}
+
+        # Look up supplier scoped strictly to this client
+        supplier = db.get_supplier_by_phone(client_id, sender_phone)
+        if not supplier:
+            err_msg = f"Unknown supplier: sender_phone='{sender_phone}' (raw remoteJid='{raw_remote_jid}', resolved senderJid='{sender_jid}') not found for client '{client.get('name')}' (id={client_id}, instance='{instance_name}')."
+            db.log_webhook_error(
+                error_message=err_msg,
+                traceback_str=f"Unmatched incoming WhatsApp message from sender_phone='{sender_phone}' for client {client_id}. Message: {message_text[:500]}",
+                raw_payload=payload,
+            )
+            print(f"[Webhook] {err_msg}")
+            if msg_key_id:
+                db.complete_webhook_message(client_id, msg_key_id)
+            return {"status": "ignored", "reason": "unknown supplier"}
+
+        # Task 2: Log safely, without secrets, phone numbers, or auth tokens
+        print(f"[Webhook] Inbound msg_id='{msg_key_id}' type='{message_type}' quoted_stanzaId='{quoted_stanza_id or 'none'}'")
+
+        inbound_log_id = db.log_message(client_id, supplier["id"], "inbound", message_text)
+        decision_id = None
+
+        # 1. Deterministic Quoted / Stanza Match
+        matched_rfq_supplier = None
+        match_source = None
+        matched_rfq_id = None
+
+        if quoted_stanza_id:
+            matched_rfq_supplier = db.get_rfq_supplier_by_sent_message_id(supplier["id"], quoted_stanza_id)
+            if not matched_rfq_supplier:
+                print(f"[Webhook] Quoted stanzaId '{quoted_stanza_id}' present on msg '{msg_key_id}' but does not match any open RFQ for supplier {supplier['id']}. Failing closed without cross-RFQ fallback.")
+                if msg_key_id:
+                    db.complete_webhook_message(client_id, msg_key_id)
+                return {"status": "ignored", "reason": "quoted_stanza_id already responded or closed"}
+            match_source = "exact_stanza"
+            matched_rfq = matched_rfq_supplier.get("rfqs", matched_rfq_supplier)
+            matched_rfq_id = matched_rfq.get("id") if isinstance(matched_rfq, dict) else None
+            db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
+            print(f"[Webhook] Quoted stanzaId '{quoted_stanza_id}' resolved to RFQ '{matched_rfq_id}'")
+
+        elif quoted_text:
+            matched_rfq_supplier = db.get_rfq_supplier_by_quoted_text(supplier["id"], quoted_text)
+            if matched_rfq_supplier:
+                match_source = "quoted_text"
+                matched_rfq = matched_rfq_supplier.get("rfqs", matched_rfq_supplier)
+                matched_rfq_id = matched_rfq.get("id") if isinstance(matched_rfq, dict) else None
+                db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
+
+        # 2. Check Pending Clarification
+        pending = db.get_pending_clarification_for_supplier(supplier["id"])
+        if pending and not isinstance(pending, dict):
+            pending = None
+
+        # 3. Retrieve Open RFQs & Conversation History for Candidate Evaluation
+        all_open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"]) or []
+        if matched_rfq_supplier and not any(
+            (e.get("rfqs", {}).get("id") or e.get("id")) == (matched_rfq_supplier.get("rfqs", {}).get("id") or matched_rfq_supplier.get("id"))
+            for e in all_open_rfqs
+        ):
+            all_open_rfqs.append(matched_rfq_supplier)
+
+        all_rfq_ids = [
+            (e.get("rfqs", e).get("id") if isinstance(e.get("rfqs", e), dict) else None)
+            for e in all_open_rfqs
+        ]
+        all_rfq_ids = [r for r in all_rfq_ids if r]
+
+        prior_quotes = []
+        if all_rfq_ids:
+            try:
+                prior_quotes = db.get_supplier_prior_quotes(supplier["id"], all_rfq_ids)
+            except Exception as e:
+                logger.warning(f"Error loading prior quotes: {e}")
+
+        try:
+            conv_history = db.get_supplier_conversation_history(client_id, supplier["id"], limit=10, exclude_message_id=inbound_log_id)
+        except Exception as e:
+            logger.warning(f"Error loading conversation history: {e}")
+            conv_history = []
+
+        # Classify open RFQs into Unanswered (Awaiting Initial Response) vs Responded (Open for Revisions)
+        unanswered_rfqs = []
+        responded_rfqs = []
+        for entry in all_open_rfqs:
+            r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+            r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
+            status = entry.get("status") if isinstance(entry, dict) else None
+            has_quote = any(str(q.get("rfq_id")) == r_id for q in prior_quotes)
+            if status == "sent" and not has_quote:
+                unanswered_rfqs.append(entry)
+            else:
+                responded_rfqs.append(entry)
+
+        # Check Active Negotiation Session
+        active_session = db.get_active_negotiation_session_for_supplier(client_id, supplier["id"])
+        session_entry = None
+        if active_session:
+            session_rfq_id = str(active_session.get("rfq_id"))
+            session_entry = next(
+                (e for e in all_open_rfqs if str(e.get("rfqs", e).get("id")) == session_rfq_id),
+                None,
+            )
+
+        # 4. Route candidate RFQs by strict priority
+        # 1. Exact quoted stanza match (always wins, deterministic)
+        # 2. Explicit RFQ ID / product reference
+        # 3. Active pending clarification
+        # 4. Problem 1 Fix: Active session + Unanswered RFQ + Generic Standalone Message -> Pending Clarification
+        # 5. Single unanswered RFQ / Single open RFQ -> Route automatically
+        # 6. Active session continuity (when no unanswered RFQs exist)
+
+        # Deterministic pre-LLM gate: casual WhatsApp chatter must not spend model tokens.
+        msg_lower = (message_text or "").lower()
+        if not should_invoke_commercial_parser(
+            message_text,
+            matched_rfq_supplier=matched_rfq_supplier,
+            pending=pending,
+            active_session=active_session,
+            open_rfqs=all_open_rfqs,
+        ):
+            if msg_key_id:
+                db.complete_webhook_message(client_id, msg_key_id)
+            return {
+                "status": "ignored_non_procurement",
+                "reason": "No active procurement context or deterministic commercial signal",
+            }
+
+        # Structured commercial parsing uses the utility model only after the deterministic gate.
+        commercial_parse = None
+        try:
+            commercial_parse = groq_client.parse_commercial_message(
+                message_text,
+                candidate_rfqs=all_open_rfqs,
+            )
+        except Exception as parse_err:
+            logger.warning(f"Error in parse_commercial_message: {parse_err}")
+
+        explicit_prod = commercial_parse.get("explicit_product_reference") if commercial_parse else None
+
+        # Multi-RFQ batch ingestion: suppliers often answer several RFQs in one
+        # WhatsApp price list. Let the AI fact parser map each line to an active
+        # candidate RFQ, then validate every mutation against hard DB/policy
+        # invariants before recording. This must run before single-RFQ session
+        # continuity so one active negotiation cannot swallow the whole batch.
+        if len(all_open_rfqs) >= 2 and "\n" in (message_text or ""):
+            try:
+                multi_parse = groq_client.parse_multi_rfq_quotes(
+                    message_text,
+                    candidate_rfqs=all_open_rfqs,
+                )
+                multi_result = await process_multi_rfq_quote_batch(
+                    parsed_items=(multi_parse or {}).get("items") or [],
+                    all_open_rfqs=all_open_rfqs,
+                    supplier=supplier,
+                    client_id=client_id,
+                    raw_message=message_text,
+                    inbound_log_id=inbound_log_id,
+                    pending_clarification=pending,
+                )
+                if multi_result:
+                    if msg_key_id:
+                        db.complete_webhook_message(client_id, msg_key_id)
+                    return multi_result
+            except Exception as multi_err:
+                logger.warning("Multi-RFQ quote ingestion failed; continuing normal flow: %s", multi_err)
+
+        if matched_rfq_supplier:
+            # Priority 1: Exact WhatsApp Stanza Match always wins & locks
+            open_rfqs = [matched_rfq_supplier]
+        else:
+            # Check for Priority 2: Explicit RFQ ID or Product Reference
+            explicit_candidates = []
+            for entry in all_open_rfqs:
+                r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+                r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
+                r_prod = (r_obj.get("product_name") or "").strip().lower() if isinstance(r_obj, dict) else ""
+                r_specs = (r_obj.get("specs") or "").strip().lower() if isinstance(r_obj, dict) else ""
+
+                if r_id and (r_id.lower() in msg_lower or f"rfq {r_id.lower()}" in msg_lower):
+                    explicit_candidates.append(entry)
+                    continue
+
+                if r_prod and (r_prod in msg_lower or (explicit_prod and explicit_prod.lower() in r_prod)):
+                    explicit_candidates.append(entry)
+                    continue
+
+                if r_specs and len(r_specs) > 3 and r_specs in msg_lower:
+                    explicit_candidates.append(entry)
+
+            # Deduplicate explicit candidates by RFQ ID
+            unique_explicit = []
+            seen_explicit_ids = set()
+            for cand in explicit_candidates:
+                cand_rfq_id = str(cand.get("rfqs", cand).get("id"))
+                if cand_rfq_id not in seen_explicit_ids:
+                    seen_explicit_ids.add(cand_rfq_id)
+                    unique_explicit.append(cand)
+
+            if len(unique_explicit) == 1:
+                # Priority 2: Explicit RFQ ID / product reference identified
+                open_rfqs = [unique_explicit[0]]
+                matched_rfq_id = str(unique_explicit[0].get("rfqs", unique_explicit[0]).get("id"))
+                match_source = "explicit_product"
+                db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
+            elif pending:
+                # Priority 3: Active Pending Clarification strictly limits candidates to pending_rfq_ids
+                candidate_ids = pending.get("pending_rfq_ids", [])
+                pending_entries = db.get_rfqs_by_ids(candidate_ids) if candidate_ids else []
+
+                matching_pending = []
+                for entry in pending_entries:
+                    r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+                    r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
+                    r_prod = (r_obj.get("product_name") or "").strip().lower() if isinstance(r_obj, dict) else ""
+                    if (r_id and r_id.lower() in msg_lower) or (r_prod and (r_prod in msg_lower or (explicit_prod and explicit_prod.lower() in r_prod))):
+                        matching_pending.append(entry)
+
+                if len(matching_pending) == 1:
+                    open_rfqs = [matching_pending[0]]
+                    matched_rfq_id = str(matching_pending[0].get("rfqs", matching_pending[0]).get("id"))
+                    match_source = "clarification_resolution"
+                    db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
+                else:
+                    open_rfqs = pending_entries
+            else:
+                # Priority 4+: state-aware routing intent narrows candidates but never
+                # selects an RFQ by itself. Exact stanza/product/pending clarification
+                # above always win.
+                routing_result = select_state_aware_routing_candidates(
+                    routing_intent=(commercial_parse or {}).get("routing_intent") or "UNKNOWN",
+                    all_open_rfqs=all_open_rfqs,
+                    unanswered_rfqs=unanswered_rfqs,
+                    responded_rfqs=responded_rfqs,
+                    session_entry=session_entry,
+                    active_session=active_session,
+                    conversation_history=conv_history,
+                    incoming_message_text=message_text,
+                )
+                open_rfqs = routing_result["candidates"]
+                matched_rfq_id = routing_result.get("matched_rfq_id")
+                match_source = routing_result.get("match_source")
+                if matched_rfq_id:
+                    db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
+
+        if not open_rfqs and not matched_rfq_supplier and not pending:
+            if msg_key_id:
+                db.complete_webhook_message(client_id, msg_key_id)
+            return {
+                "status": "no_open_rfq",
+                "note": "message received but no active RFQ to match",
+            }
+
+        # 5. Fetch Negotiation Attempts and Competitive Context for Active Candidates
+        candidate_rfq_ids = []
+        for e in open_rfqs:
+            rfq_obj = e.get("rfqs", e) if isinstance(e, dict) else e
+            if isinstance(rfq_obj, dict) and rfq_obj.get("id"):
+                candidate_rfq_ids.append(rfq_obj["id"])
+
+        negotiation_attempts = {}
+        for r_id in candidate_rfq_ids:
+            try:
+                negotiation_attempts[r_id] = db.get_negotiation_attempts(r_id, supplier["id"])
+            except Exception as e:
+                logger.warning(f"Error loading negotiation attempts for RFQ {r_id}: {e}")
+                negotiation_attempts[r_id] = 0
+
+        competitive_context = {}
+        for r_id in candidate_rfq_ids:
+            try:
+                comp_ctx = db.get_competitive_pricing_context(r_id, supplier["id"])
+                if isinstance(comp_ctx, dict) and comp_ctx.get("has_competition"):
+                    competitive_context[r_id] = f"Best competing quote is AED {comp_ctx['best_competing_price']} (from {comp_ctx['competing_quotes_count']} other supplier(s))"
+            except Exception as e:
+                logger.warning(f"Error loading competitive context for RFQ {r_id}: {e}")
+
+        # 6. Build Single Unified AgentContext
+        context = AgentContext(
+            client_id=client_id,
+            supplier_id=supplier["id"],
+            supplier_name=supplier.get("name"),
+            supplier_phone=supplier.get("phone_number"),
+            input_origin="supplier",
+            matched_rfq_id=matched_rfq_id,
+            match_source=match_source,
+            open_rfqs=open_rfqs,
+            pending_clarification=pending,
+            prior_quotes=prior_quotes,
+            negotiation_attempts=negotiation_attempts,
+            active_negotiation_session=active_session,
+            competitive_context=competitive_context,
+            conversation_history=conv_history,
+            source_message_id=inbound_log_id,
+        )
+
+        # 7. Unified Reasoning Execution
+        try:
+            decision = groq_client.reason_about_procurement_message(message_text, context, input_origin="supplier")
+        except Exception as groq_err:
+            tb_str = traceback.format_exc()
+            print(f"\n=== GROQ ERROR (reason_about_procurement_message) ===\n{tb_str}\n======================================================\n")
+            db.log_webhook_error(f"Groq reason_about_procurement_message error: {groq_err}", tb_str, payload)
+            reason = f"Groq AI service error during message reasoning: {str(groq_err)}"
+            db.flag_for_human_review(
+                client_id=client_id,
+                supplier_id=supplier["id"],
+                rfq_id=matched_rfq_id,
+                reason=reason,
+                category="other",
+                raw_message=message_text,
+            )
+            if pending:
+                db.abandon_pending_clarification(pending["id"])
+            msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
+            await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
+            if msg_key_id:
+                db.complete_webhook_message(client_id, msg_key_id)
+            return {"status": "escalated_due_to_groq_error", "reason": reason}
+
+        decision_tool = decision.get("tool_name", "")
+        decision_args = dict(decision.get("arguments", {}))
+        if decision_tool in ("record_quote", "negotiate_price") and not decision_args.get("rfq_id") and matched_rfq_id:
+            decision_args["rfq_id"] = matched_rfq_id
+
+        proposal = ActionProposal(
+            tool_name=decision_tool,
+            arguments=decision_args,
+            raw_message=message_text,
+        )
+
+        # Record Agent Decision (provisional pending validator verdict)
+        target_rfq_for_decision = proposal.arguments.get("rfq_id") or matched_rfq_id
+        decision_record = db.record_agent_decision(
+            client_id=client_id,
+            origin="supplier",
+            tool_name=proposal.tool_name,
+            arguments=proposal.arguments,
+            validation_status="approved",
+            validation_reason=None,
+            execution_status="pending",
+            rfq_id=target_rfq_for_decision,
+            supplier_id=supplier["id"],
+            inbound_message_id=inbound_log_id,
+        )
+        decision_id = decision_record.get("id") if decision_record else None
+
+        # 8. Policy Validator Execution (with Deterministic Stanza Lock & Semantic Clarification Context)
+        validation = validate_action(
+            proposal,
+            client_id=client_id,
+            supplier_id=supplier["id"],
+            context_rfqs=open_rfqs,
+            matched_rfq_id=context.matched_rfq_id,
+            pending_clarification=context.pending_clarification,
+            input_origin="supplier",
+            source_message_id=inbound_log_id,
+        )
+
+        if not validation.is_valid:
+            print(f"[Policy Validator] Rejected action '{proposal.tool_name}': {validation.reason}")
+            if decision_id:
+                db.update_agent_decision(
+                    decision_id,
+                    validation_status="rejected",
+                    validation_reason=validation.reason,
+                    execution_status="not_executed",
+                )
+
+            # One controlled validator-guided repair attempt for recoverable
+            # sequencing/prerequisite failures. The Policy Validator remains
+            # authoritative: the model only proposes a corrected next tool call.
+            recoverable_policy_rejection = (
+                isinstance(validation.reason, str)
+                and (
+                    validation.reason.startswith("Negotiation blocked:")
+                    or (
+                        proposal.tool_name == "negotiate_price"
+                        and "does not match trusted effective quote price" in validation.reason
+                    )
+                )
+                and matched_rfq_id
+            )
+
+            if recoverable_policy_rejection:
+                try:
+                    repaired = groq_client.reason_with_validator_feedback(
+                        message_text=message_text,
+                        context=context,
+                        rejected_tool_name=proposal.tool_name,
+                        rejected_arguments=proposal.arguments,
+                        validator_reason=validation.reason,
+                        input_origin="supplier",
+                    )
+                    repaired_tool = repaired.get("tool_name", "")
+                    repaired_args = dict(repaired.get("arguments", {}))
+                    if repaired_tool in ("record_quote", "negotiate_price") and not repaired_args.get("rfq_id"):
+                        repaired_args["rfq_id"] = matched_rfq_id
+
+                    repaired_proposal = ActionProposal(
+                        tool_name=repaired_tool,
+                        arguments=repaired_args,
+                        raw_message=message_text,
+                    )
+                    repaired_validation = validate_action(
+                        repaired_proposal,
+                        client_id=client_id,
+                        supplier_id=supplier["id"],
+                        context_rfqs=open_rfqs,
+                        matched_rfq_id=context.matched_rfq_id,
+                        pending_clarification=context.pending_clarification,
+                        input_origin="supplier",
+                        source_message_id=inbound_log_id,
+                    )
+
+                    repaired_decision = db.record_agent_decision(
+                        client_id=client_id,
+                        origin="supplier",
+                        tool_name=repaired_proposal.tool_name,
+                        arguments=repaired_proposal.arguments,
+                        validation_status="approved" if repaired_validation.is_valid else "rejected",
+                        validation_reason=(
+                            "Validator-guided one-shot repair."
+                            if repaired_validation.is_valid
+                            else repaired_validation.reason
+                        ),
+                        execution_status="pending" if repaired_validation.is_valid else "not_executed",
+                        rfq_id=repaired_proposal.arguments.get("rfq_id") or matched_rfq_id,
+                        supplier_id=supplier["id"],
+                        inbound_message_id=inbound_log_id,
+                    )
+                    repaired_decision_id = repaired_decision.get("id") if repaired_decision else None
+
+                    if repaired_validation.is_valid:
+                        exec_res = await execute_validated_action(
+                            repaired_validation,
+                            context,
+                            message_text,
+                            supplier,
+                            client_id,
+                            decision_id=repaired_decision_id,
+                        )
+                        if msg_key_id:
+                            db.complete_webhook_message(client_id, msg_key_id)
+                        return exec_res
+
+                    logger.warning(
+                        "Validator-guided repair rejected for RFQ %s: %s",
+                        matched_rfq_id,
+                        repaired_validation.reason,
+                    )
+                except Exception as repair_err:
+                    logger.warning(
+                        "Validator-guided repair failed for RFQ %s: %s",
+                        matched_rfq_id,
+                        repair_err,
+                    )
+
+            db.flag_for_human_review(
+                client_id=client_id,
+                supplier_id=supplier["id"],
+                rfq_id=proposal.arguments.get("rfq_id") or matched_rfq_id,
+                reason=f"Policy Validator rejection: {validation.reason}",
+                category="other",
+                raw_message=message_text,
+            )
+            if pending:
+                db.abandon_pending_clarification(pending["id"])
+            if matched_rfq_id:
+                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG, related_rfq_id=matched_rfq_id)
+                await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, rfq_id=matched_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
+            else:
+                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
+                await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
+            if msg_key_id:
+                db.complete_webhook_message(client_id, msg_key_id)
+            return {"status": "rejected_by_policy", "reason": validation.reason}
+
+        # 9. Consolidated Deterministic Execution
+        exec_res = await execute_validated_action(validation, context, message_text, supplier, client_id, decision_id=decision_id)
+        if msg_key_id:
+            db.complete_webhook_message(client_id, msg_key_id)
+        return exec_res
+
+    except Exception as e:
+        tb_str = traceback.format_exc()
+        print(f"\n=== WEBHOOK ERROR ===\n{tb_str}\n=====================\n")
+        db.log_webhook_error(str(e), tb_str, payload)
+        if "client_id" in locals() and client_id and "msg_key_id" in locals() and msg_key_id:
+            db.fail_webhook_message(client_id, msg_key_id, str(e))
+        if "decision_id" in locals() and decision_id:
+            db.update_agent_decision(decision_id, execution_status="failed", execution_error=str(e))
+        return {"status": "error_logged", "note": "internal error, logged for review"}
+
+
+@app.post("/auth/reset-password")
+async def reset_password(payload: PasswordResetRequest, request: Request):
+    """Update the authenticated user's password through Supabase Auth.
+
+    This is a server-side fallback for browsers that fail to send the direct
+    cross-origin PUT used by supabase-js. The caller's own access token is
+    verified and forwarded to Supabase; the service-role key is not used.
+    """
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    token = auth_header.split(None, 1)[1].strip()
+    claims = verify_jwt(token)
+    if not claims.get("sub"):
+        raise HTTPException(status_code=401, detail="Token missing sub claim")
+
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    public_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("VITE_SUPABASE_ANON_KEY")
+    if not supabase_url or not public_key:
+        raise HTTPException(status_code=500, detail="Supabase Auth is not configured")
+
+    def _update_password():
+        return requests.put(
+            f"{supabase_url}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": public_key,
+                "Content-Type": "application/json",
+            },
+            json={"password": payload.password},
+            timeout=15,
+        )
+
+    try:
+        response = await run_in_threadpool(_update_password)
+    except requests.RequestException as exc:
+        logger.exception("Supabase password update request failed")
+        raise HTTPException(status_code=502, detail="Could not reach authentication service") from exc
+
+    if response.status_code >= 400:
+        try:
+            error_body = response.json()
+        except ValueError:
+            error_body = {}
+        detail = (
+            error_body.get("msg")
+            or error_body.get("message")
+            or error_body.get("error_description")
+            or error_body.get("error")
+            or "Password update failed"
+        )
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    return {"status": "password_updated"}
 
 
 @app.post("/rfq/create")
@@ -219,7 +3372,6 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
         "matched_suppliers_count": len(matched_suppliers),
         "suppliers": [{"id": s["id"], "name": s["name"], "phone": s["phone_number"]} for s in matched_suppliers],
     }
-
 
 @app.post("/rfq/bulk-create")
 async def bulk_create_rfq_endpoint(
