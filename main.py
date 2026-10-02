@@ -1381,12 +1381,11 @@ async def process_multi_rfq_quote_batch(
     inbound_log_id: str,
     pending_clarification: Optional[dict] = None,
 ) -> Optional[dict]:
-    """Validate and persist a supplier message that quotes multiple RFQs at once.
+    """Process one supplier WhatsApp message containing quotes for multiple RFQs.
 
-    Semantic mapping is produced by the AI fact parser. This function only
-    enforces hard invariants through the existing policy validator, then records
-    each RFQ quote without allowing one active negotiation session to swallow
-    the entire batch.
+    The AI parser maps natural-language line items to authoritative open RFQs.
+    Every mapped RFQ then passes through the SAME record_quote -> negotiation
+    engine -> hard-validator pipeline as a normal single-RFQ reply.
     """
     if not parsed_items or len(parsed_items) < 2:
         return None
@@ -1397,6 +1396,7 @@ async def process_multi_rfq_quote_batch(
         return None
 
     grouped = {}
+    source_items = {}
     for item in parsed_items:
         if not isinstance(item, dict):
             return None
@@ -1412,16 +1412,17 @@ async def process_multi_rfq_quote_batch(
         if price <= 0:
             return None
 
-        grouped.setdefault(rfq_id, []).append({
+        variant = {
             "variant_label": item.get("variant_label"),
             "price": price,
             "delivery_time": item.get("delivery_time"),
             "quality_notes": item.get("quality_notes"),
+            "quantity": item.get("quantity"),
             "is_available": True,
-        })
+        }
+        grouped.setdefault(rfq_id, []).append(variant)
+        source_items.setdefault(rfq_id, []).append(item)
 
-    # Only treat this as a true multi-RFQ batch when at least 2 different RFQs
-    # were confidently identified.
     if len(grouped) < 2:
         return None
 
@@ -1451,35 +1452,107 @@ async def process_multi_rfq_quote_batch(
             return None
         validations.append((rfq_id, validation))
 
-    recorded = []
+    results = []
+    sent_followup = False
+
     for rfq_id, validation in validations:
-        variants = validation.sanitized_args.get("variants") or []
-        persisted = db.record_quotes_batch(
-            rfq_id=rfq_id,
+        rfq_entry = next(
+            (
+                e for e in all_open_rfqs
+                if str((e.get("rfqs", e) if isinstance(e, dict) else {}).get("id")) == str(rfq_id)
+            ),
+            None,
+        )
+        if not rfq_entry:
+            return None
+
+        try:
+            prior_quotes = db.get_supplier_prior_quotes(supplier_id, [rfq_id]) or []
+        except Exception:
+            prior_quotes = []
+
+        try:
+            attempts = db.get_negotiation_attempts(rfq_id, supplier_id)
+        except Exception:
+            attempts = 0
+
+        try:
+            active_session = db.get_active_negotiation_session(client_id, rfq_id, supplier_id)
+        except Exception:
+            active_session = None
+
+        per_rfq_context = AgentContext(
+            client_id=client_id,
             supplier_id=supplier_id,
-            variants=variants,
-            raw_message=raw_message,
+            supplier_name=supplier.get("name"),
+            supplier_phone=phone_number,
+            input_origin="supplier",
+            matched_rfq_id=rfq_id,
+            match_source="multi_rfq_batch",
+            open_rfqs=[rfq_entry],
+            pending_clarification=None,
+            prior_quotes=prior_quotes,
+            negotiation_attempts={rfq_id: attempts if isinstance(attempts, (int, float)) else 0},
+            active_negotiation_session=active_session,
+            conversation_history=[],
             source_message_id=inbound_log_id,
-        ) or []
+        )
+
+        items = source_items.get(rfq_id) or []
+        cheapest_item = min(
+            items,
+            key=lambda x: float(x.get("price")),
+        )
+        final_for_best_variant = bool(cheapest_item.get("supplier_final"))
+
+        semantic_lines = []
+        for item in items:
+            parts = []
+            if item.get("product_reference"):
+                parts.append(str(item.get("product_reference")))
+            if item.get("variant_label"):
+                parts.append(f"Brand {item.get('variant_label')}")
+            if item.get("quantity") is not None:
+                parts.append(f"Quantity {item.get('quantity')}")
+            parts.append(f"AED {float(item.get('price')):g}")
+            if item.get("supplier_final"):
+                parts.append("final")
+            semantic_lines.append(" | ".join(parts))
+        semantic_message = "\n".join(semantic_lines)
 
         decision = db.record_agent_decision(
             client_id=client_id,
             origin="supplier",
             tool_name="record_quote",
-            arguments={"rfq_id": rfq_id, "variants": variants, "multi_rfq_batch": True},
+            arguments={**validation.sanitized_args, "multi_rfq_batch": True},
             validation_status="approved",
             validation_reason=None,
-            execution_status="completed" if persisted else "failed",
-            execution_error=None if persisted else "Quote persistence returned no rows",
+            execution_status="pending",
             rfq_id=rfq_id,
             supplier_id=supplier_id,
             inbound_message_id=inbound_log_id,
         )
-        recorded.append({
-            "rfq_id": rfq_id,
-            "quote_ids": [q.get("id") for q in persisted if isinstance(q, dict) and q.get("id")],
-            "decision_id": decision.get("id") if isinstance(decision, dict) else None,
-        })
+        decision_id = decision.get("id") if isinstance(decision, dict) else None
+
+        result = await execute_validated_action(
+            validation,
+            per_rfq_context,
+            semantic_message,
+            supplier,
+            client_id,
+            decision_id=decision_id,
+            quote_raw_override=raw_message,
+            supplier_final_override=final_for_best_variant,
+            suppress_acknowledgement=True,
+        )
+        results.append(result)
+
+        if result.get("status") in {
+            "negotiation_sent",
+            "escalated_to_human",
+            "awaiting_authorization",
+        }:
+            sent_followup = True
 
     if pending_clarification:
         try:
@@ -1487,25 +1560,28 @@ async def process_multi_rfq_quote_batch(
         except Exception:
             pass
 
-    acknowledgement = "Thanks! We've recorded the quoted items and will review them."
-    msg_log_id = db.log_message(
-        client_id,
-        supplier_id,
-        "outbound",
-        acknowledgement,
-    )
-    if phone_number and msg_log_id:
-        await enqueue_message(
-            phone_number,
+    # If every line merely recorded with no counter/final/authorization message,
+    # acknowledge the batch once instead of sending one thank-you per RFQ.
+    if not sent_followup:
+        acknowledgement = "Thanks! We've recorded the quoted items and will review them."
+        msg_log_id = db.log_message(
+            client_id,
+            supplier_id,
+            "outbound",
             acknowledgement,
-            supplier_id=supplier_id,
-            message_log_id=msg_log_id,
         )
+        if phone_number and msg_log_id:
+            await enqueue_message(
+                phone_number,
+                acknowledgement,
+                supplier_id=supplier_id,
+                message_log_id=msg_log_id,
+            )
 
     return {
-        "status": "multi_rfq_quotes_recorded",
-        "rfq_count": len(recorded),
-        "recorded": recorded,
+        "status": "multi_rfq_quotes_processed",
+        "rfq_count": len(results),
+        "results": results,
     }
 
 
