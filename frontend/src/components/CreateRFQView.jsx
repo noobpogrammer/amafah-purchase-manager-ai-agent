@@ -268,6 +268,23 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
           const cleanedProductName = description.replace(/\s+\d+\s*(pcs|pc|nos|bag|pkt)\s*$/i, '').trim();
           const qtyRaw = getSheetValue(row, ['qty', 'quantity']);
           const lastQuoteRaw = getSheetValue(row, ['last cost', 'last quote', 'last quotation', 'last qoute']);
+          const preferredTargetRaw = getSheetValue(row, [
+            'preferred target price',
+            'preferred target',
+            'target price',
+            'acceptable price min',
+            'absolute minimum',
+            'minimum price',
+            'min price',
+          ]);
+          const maximumAcceptableRaw = getSheetValue(row, [
+            'maximum acceptable price',
+            'maximum acceptable',
+            'acceptable price max',
+            'absolute maximum',
+            'maximum price',
+            'max price',
+          ]);
           const rowNumberRaw = getSheetValue(row, ['sl', 'sl #', 'sl no', 'sl no.', 'sl no ']);
 
           let quantityValue = null;
@@ -282,6 +299,15 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
             lastQuoteValue = Number.isFinite(asNumber) ? asNumber : null;
           }
 
+          const parseOptionalPrice = (rawValue) => {
+            if (rawValue === '' || rawValue === null || rawValue === undefined) return null;
+            const parsed = Number(String(rawValue).replace(/[^0-9.-]/g, ''));
+            return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+          };
+
+          const preferredTargetValue = parseOptionalPrice(preferredTargetRaw);
+          const maximumAcceptableValue = parseOptionalPrice(maximumAcceptableRaw);
+
           return {
             id: `${idx + 1}`,
             rowNumber: rowNumberRaw || idx + 2,
@@ -290,6 +316,8 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
             specs: (description.match(/\d+\s*(?:X|x)\s*\d+|\d+(?:\.\d+)?\s*(?:MM|CM|M|W|KW|V|A)/i)?.[0] || '').trim(),
             quantity: quantityValue,
             last_quote: lastQuoteValue,
+            acceptable_price_min: preferredTargetValue,
+            acceptable_price_max: maximumAcceptableValue,
             category: category || categories[0] || 'General',
             deadline_hours: deadlineHours,
             selected: true,
@@ -319,7 +347,13 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
     setBulkRows((prev) => prev.map((row) => {
       if (row.id !== id) return row;
       const copy = { ...row };
-      if (field === 'quantity' || field === 'deadline_hours' || field === 'last_quote') {
+      if (
+        field === 'quantity'
+        || field === 'deadline_hours'
+        || field === 'last_quote'
+        || field === 'acceptable_price_min'
+        || field === 'acceptable_price_max'
+      ) {
         const n = value === '' || value === null ? null : Number(String(value).replace(/[^0-9.-]/g, ''));
         copy[field] = Number.isFinite(n) ? n : null;
       } else {
@@ -341,6 +375,28 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
       return;
     }
 
+    for (const row of selectedRows) {
+      const target = row.acceptable_price_min;
+      const max = row.acceptable_price_max;
+
+      if (target !== null && target !== undefined && Number(target) <= 0) {
+        setErrorMsg(`Row ${row.rowNumber}: Preferred Target Price must be greater than 0.`);
+        return;
+      }
+      if (max !== null && max !== undefined && Number(max) <= 0) {
+        setErrorMsg(`Row ${row.rowNumber}: Maximum Acceptable Price must be greater than 0.`);
+        return;
+      }
+      if (
+        target !== null && target !== undefined
+        && max !== null && max !== undefined
+        && Number(target) > Number(max)
+      ) {
+        setErrorMsg(`Row ${row.rowNumber}: Preferred Target Price cannot be greater than Maximum Acceptable Price.`);
+        return;
+      }
+    }
+
     const formData = new FormData();
     formData.append('file', bulkFile);
     formData.append('category', selectedRows[0].category || category || 'General');
@@ -353,6 +409,8 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
       deadline_hours: row.deadline_hours,
       specs: row.specs,
       last_quote: row.last_quote,
+      acceptable_price_min: row.acceptable_price_min,
+      acceptable_price_max: row.acceptable_price_max,
     }));
     formData.append('row_updates', JSON.stringify(rowUpdates));
 
@@ -734,7 +792,10 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                           <th>Specs</th>
                           <th>Qty</th>
                           <th>Last Quote</th>
+                          <th>Preferred Target Price</th>
+                          <th>Maximum Acceptable Price</th>
                           <th>Category</th>
+                          <th>Deadline (Hours)</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -752,6 +813,28 @@ export default function CreateRFQView({ onRFQCreated, setActiveTab, setSelectedR
                               <input type="number" className="input-field" value={row.quantity ?? ''} onChange={(e) => updateBulkRowField(row.id, 'quantity', e.target.value)} />
                             </td>
                             <td>{row.last_quote ?? '—'}</td>
+                            <td>
+                              <input
+                                type="number"
+                                className="input-field"
+                                min="0.01"
+                                step="0.01"
+                                placeholder="e.g. 2.50"
+                                value={row.acceptable_price_min ?? ''}
+                                onChange={(e) => updateBulkRowField(row.id, 'acceptable_price_min', e.target.value)}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="number"
+                                className="input-field"
+                                min="0.01"
+                                step="0.01"
+                                placeholder="e.g. 4.00"
+                                value={row.acceptable_price_max ?? ''}
+                                onChange={(e) => updateBulkRowField(row.id, 'acceptable_price_max', e.target.value)}
+                              />
+                            </td>
                             <td>
                               <select value={row.category} onChange={(e) => updateBulkRowCategory(row.id, e.target.value)}>
                                 {categories.map((cat) => (
