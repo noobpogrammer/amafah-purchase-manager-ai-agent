@@ -1516,6 +1516,10 @@ async def execute_validated_action(
     supplier: dict,
     client_id: str,
     decision_id: str = None,
+    *,
+    quote_raw_override: Optional[str] = None,
+    supplier_final_override: Optional[bool] = None,
+    suppress_acknowledgement: bool = False,
 ) -> dict:
     """
     Executes a policy-approved action deterministically:
@@ -1552,7 +1556,11 @@ async def execute_validated_action(
                     variants[0]["quality_notes"] = context.pending_clarification.get("extracted_notes")
 
             # Ensure quote provenance reflects supplier's original message, not operator instruction
-            quote_raw = context.review_raw_message if (context.input_origin == "operator" and context.review_raw_message) else raw_message
+            quote_raw = (
+                quote_raw_override
+                if quote_raw_override is not None
+                else (context.review_raw_message if (context.input_origin == "operator" and context.review_raw_message) else raw_message)
+            )
 
             # Check if existing quotes already match to avoid duplicate records from operator hold commands
             should_record = True
@@ -1600,11 +1608,38 @@ async def execute_validated_action(
                     if str(q.get("rfq_id")) == str(target_rfq_id)
                 ]
 
-            persisted_quote_id = (
-                persisted_quotes[0].get("id")
-                if (persisted_quotes and isinstance(persisted_quotes, list) and isinstance(persisted_quotes[0], dict))
-                else None
-            )
+            # Negotiate against the supplier's best (lowest) available priced
+            # variant for this RFQ. Preserve all variants for ranking/history.
+            negotiation_variant = None
+            for v in variants or []:
+                if not v.get("is_available", True) or v.get("price") is None:
+                    continue
+                try:
+                    pv = float(v.get("price"))
+                except (TypeError, ValueError):
+                    continue
+                if pv <= 0:
+                    continue
+                if negotiation_variant is None or pv < float(negotiation_variant.get("price")):
+                    negotiation_variant = v
+
+            persisted_quote_id = None
+            if negotiation_variant and persisted_quotes:
+                target_label = (negotiation_variant.get("variant_label") or "").strip().casefold()
+                target_price = float(negotiation_variant.get("price"))
+                for pq in persisted_quotes:
+                    if not isinstance(pq, dict):
+                        continue
+                    try:
+                        pq_price = float(pq.get("price"))
+                    except (TypeError, ValueError):
+                        continue
+                    pq_label = (pq.get("variant_label") or "").strip().casefold()
+                    if pq_label == target_label and abs(pq_price - target_price) < 0.001:
+                        persisted_quote_id = pq.get("id")
+                        break
+            if persisted_quote_id is None and persisted_quotes and isinstance(persisted_quotes[0], dict):
+                persisted_quote_id = persisted_quotes[0].get("id")
 
             if context.source_message_id and target_rfq_id:
                 db.update_message_related_rfq(context.source_message_id, target_rfq_id)
@@ -1628,31 +1663,32 @@ async def execute_validated_action(
 
             rfq_last_quote = target_rfq.get("last_quote") if isinstance(target_rfq, dict) else None
             price_val = None
-            if variants and isinstance(variants, list) and len(variants) > 0:
-                for v in variants:
-                    if v.get("is_available", True) and v.get("price") is not None:
-                        try:
-                            pv = float(v.get("price"))
-                            if pv > 0:
-                                price_val = pv
-                                break
-                        except Exception:
-                            pass
+            if negotiation_variant and negotiation_variant.get("price") is not None:
+                try:
+                    pv = float(negotiation_variant.get("price"))
+                    if pv > 0:
+                        price_val = pv
+                except Exception:
+                    pass
 
             hist_ctx = db.build_historical_price_context(rfq_last_quote, price_val) if (rfq_last_quote is not None and price_val is not None) else None
             attempts_made = db.get_negotiation_attempts(target_rfq_id, supplier_id) if target_rfq_id else 0
             if not isinstance(attempts_made, (int, float)):
                 attempts_made = 0
 
-            is_final = is_supplier_final_price_statement(raw_message) or bool(quote_raw and is_supplier_final_price_statement(quote_raw))
+            is_final = (
+                bool(supplier_final_override)
+                if supplier_final_override is not None
+                else (is_supplier_final_price_statement(raw_message) or bool(quote_raw and is_supplier_final_price_statement(quote_raw)))
+            )
 
             # 1. Evaluate negotiation preflight, constraints and active session
             active_session = db.get_active_negotiation_session(client_id, target_rfq_id, supplier_id) if target_rfq_id else None
             prior_quotes_for_rfq = [q for q in (context.prior_quotes or []) if str(q.get("rfq_id")) == str(target_rfq_id)]
             rfq_constraints = db.get_rfq_negotiation_constraints(client_id, target_rfq_id) if target_rfq_id else []
-            extracted_deliv = variants[0].get("delivery_time") if variants else None
-            extracted_q = variants[0].get("quantity") if variants else None
-            extracted_var = variants[0].get("variant_label") if variants else None
+            extracted_deliv = negotiation_variant.get("delivery_time") if negotiation_variant else None
+            extracted_q = negotiation_variant.get("quantity") if negotiation_variant else None
+            extracted_var = negotiation_variant.get("variant_label") if negotiation_variant else None
 
             preflight = negotiation_engine.build_negotiation_preflight(
                 rfq=target_rfq or {},
@@ -1732,9 +1768,8 @@ async def execute_validated_action(
                 and preflight.get("should_counter")
                 and not is_final
                 and attempts_made < MAX_NEGOTIATION_ATTEMPTS
-                and len(variants) == 1
-                and variants[0].get("is_available", True) is True
-                and variants[0].get("variant_label") is None
+                and negotiation_variant is not None
+                and negotiation_variant.get("is_available", True) is True
                 and has_valid_session
             )
 
@@ -1793,7 +1828,7 @@ async def execute_validated_action(
                     counter_price=counter_price,
                     supplier_last_concession=preflight["supplier_last_concession"],
                     product_name=target_rfq.get("product_name") if isinstance(target_rfq, dict) else None,
-                    variant_label=variants[0].get("variant_label") if variants else None,
+                    variant_label=negotiation_variant.get("variant_label") if negotiation_variant else None,
                 )
                 try:
                     negotiation_message = groq_client.write_supplier_message(
@@ -1803,8 +1838,8 @@ async def execute_validated_action(
                             "supplier_price": float(price_val),
                             "counter_price": counter_price,
                             "strategy": preflight.get("selected_strategy"),
-                            "delivery_time": variants[0].get("delivery_time") if variants else None,
-                            "variant_label": variants[0].get("variant_label") if variants else None,
+                            "delivery_time": negotiation_variant.get("delivery_time") if negotiation_variant else None,
+                            "variant_label": negotiation_variant.get("variant_label") if negotiation_variant else None,
                             "communication_goal": "Send the approved counteroffer without changing any commercial terms.",
                         },
                         draft_message=approved_draft,
@@ -1822,9 +1857,9 @@ async def execute_validated_action(
                         "quoted_price": float(price_val),
                         "counter_price": counter_price,
                         "negotiation_message": negotiation_message,
-                        "delivery_time": variants[0].get("delivery_time"),
-                        "quality_notes": variants[0].get("quality_notes"),
-                        "variant_label": None,
+                        "delivery_time": negotiation_variant.get("delivery_time") if negotiation_variant else None,
+                        "quality_notes": negotiation_variant.get("quality_notes") if negotiation_variant else None,
+                        "variant_label": negotiation_variant.get("variant_label") if negotiation_variant else None,
                     },
                     raw_message=raw_message,
                 )
@@ -1940,22 +1975,22 @@ async def execute_validated_action(
             if preflight and price_val is not None and context.input_origin != "operator":
                 supp_name = supplier.get("name") or "Supplier"
                 prod_name = target_rfq.get("product_name") if isinstance(target_rfq, dict) else "Product"
-                var_label = variants[0].get("variant_label") if variants else None
+                var_label = negotiation_variant.get("variant_label") if negotiation_variant else None
                 var_line = f"Variant:\n{var_label}\n\n" if var_label else ""
                 
                 pref_target = preflight["preferred_target"]
                 tol_ceiling = preflight["tolerated_final_ceiling"]
                 acc_max = preflight["acceptable_max"]
-                is_above_ceiling = (tol_ceiling is not None and price_val > tol_ceiling)
+                is_above_ceiling = (acc_max is not None and price_val > acc_max)
                 diff_from_target = round(price_val - pref_target, 2) if pref_target else "N/A"
-                diff_above_ceiling = round(price_val - tol_ceiling, 2) if tol_ceiling else "N/A"
+                diff_above_ceiling = round(price_val - acc_max, 2) if acc_max else "N/A"
 
                 if is_final:
                     should_escalate_attention = True
                     if is_above_ceiling:
                         final_reason = (
                             f"Supplier stated AED {price_val} is their final price, which is "
-                            f"AED {diff_above_ceiling} above the tolerated final ceiling."
+                            f"AED {diff_above_ceiling} above the explicit hard maximum."
                         )
                     else:
                         final_reason = (
@@ -1970,7 +2005,7 @@ async def execute_validated_action(
                         f"Historical Last Quote:\nAED {rfq_last_quote if rfq_last_quote else 'N/A'}\n\n"
                         f"Preferred Target:\nAED {pref_target if pref_target else 'N/A'}\n\n"
                         f"Acceptable Maximum:\nAED {acc_max if acc_max else 'N/A'}\n\n"
-                        f"Tolerated Final Ceiling:\nAED {tol_ceiling if tol_ceiling else 'N/A'}\n\n"
+                        f"Hard Maximum:\nAED {tol_ceiling if tol_ceiling else 'N/A'}\n\n"
                         f"Supplier Final Quote:\nAED {price_val}\n\n"
                         f"Delivery:\n{extracted_deliv or 'Not specified'}\n\n"
                         f"Negotiation Attempts:\n{attempts_made}/{MAX_NEGOTIATION_ATTEMPTS}\n\n"
@@ -1988,7 +2023,7 @@ async def execute_validated_action(
                         f"Historical Last Quote:\nAED {rfq_last_quote if rfq_last_quote else 'N/A'}\n\n"
                         f"Preferred Target:\nAED {pref_target if pref_target else 'N/A'}\n\n"
                         f"Acceptable Maximum:\nAED {acc_max if acc_max else 'N/A'}\n\n"
-                        f"Tolerated Final Ceiling:\nAED {tol_ceiling if tol_ceiling else 'N/A'}\n\n"
+                        f"Hard Maximum:\nAED {tol_ceiling if tol_ceiling else 'N/A'}\n\n"
                         f"Supplier Latest Quote:\nAED {price_val}\n\n"
                         f"Difference from Last Quote:\nAED +{diff_from_target}\n\n"
                         f"Negotiation Attempts:\n{MAX_NEGOTIATION_ATTEMPTS}/{MAX_NEGOTIATION_ATTEMPTS}\n\n"
@@ -2063,6 +2098,27 @@ async def execute_validated_action(
                     "rfq_id": target_rfq_id,
                     "flag_id": flag_id,
                 }
+
+            if suppress_acknowledgement:
+                if decision_id:
+                    updated_args = dict(args)
+                    if preflight:
+                        updated_args.update({
+                            "last_quote": rfq_last_quote,
+                            "preferred_target": preflight.get("preferred_target"),
+                            "tolerated_final_ceiling": preflight.get("tolerated_final_ceiling"),
+                            "acceptable_max": preflight.get("acceptable_max"),
+                            "negotiation_attempt": attempts_made,
+                            "supplier_final_price_detected": is_final,
+                        })
+                    db.update_agent_decision(
+                        decision_id,
+                        validation_status="approved",
+                        execution_status="executed",
+                        arguments=updated_args,
+                        executed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                return {"status": "recorded", "rfq_id": target_rfq_id}
 
             # Semantic acknowledgement: an unavailable product is not a quote.
             acknowledgement_msg = acknowledgement_for_quote_variants(variants)
