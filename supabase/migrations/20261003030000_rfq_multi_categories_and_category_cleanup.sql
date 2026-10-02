@@ -22,7 +22,7 @@ create or replace function public.delete_category_clean(
 )
 returns jsonb
 language plpgsql
-security definer
+security invoker
 set search_path = public, pg_temp
 as $$
 declare
@@ -82,3 +82,11 @@ begin
   );
 end;
 $$;
+
+
+-- This cleanup RPC is backend-only. The FastAPI backend uses the Supabase
+-- service-role client; browser roles must not be able to mutate tenant data
+-- by supplying an arbitrary client_id.
+revoke execute on function public.delete_category_clean(uuid, text) from public;
+revoke execute on function public.delete_category_clean(uuid, text) from anon, authenticated;
+grant execute on function public.delete_category_clean(uuid, text) to service_role;
