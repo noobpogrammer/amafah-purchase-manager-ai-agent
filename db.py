@@ -101,6 +101,114 @@ def get_supplier_by_phone_any_client(phone_number: str):
     return None
 
 
+def is_client_automation_paused(client_id: str) -> bool:
+    """Returns True when automated procurement handling is paused for a tenant."""
+    if not client_id:
+        return False
+    try:
+        res = (
+            supabase.table("clients")
+            .select("automation_paused")
+            .eq("id", client_id)
+            .maybe_single()
+            .execute()
+        )
+        return bool((res.data or {}).get("automation_paused"))
+    except Exception as e:
+        logger.warning("is_client_automation_paused error for client %s: %s", client_id, e)
+        # Fail safe for automation: on pause-state lookup errors, do not invent a pause.
+        return False
+
+
+def set_client_automation_pause(client_id: str, paused: bool, reason: str = None) -> dict | None:
+    """Pause/resume tenant automation without closing RFQs or resolving human-attention rows.
+
+    On resume, active RFQ due_by timestamps are shifted by the exact pause duration
+    so the pause behaves like frozen time rather than silently expiring RFQs.
+    """
+    if not client_id:
+        return None
+
+    now = datetime.now(timezone.utc)
+    current_res = (
+        supabase.table("clients")
+        .select("id, automation_paused, automation_paused_at")
+        .eq("id", client_id)
+        .maybe_single()
+        .execute()
+    )
+    current = current_res.data or {}
+    was_paused = bool(current.get("automation_paused"))
+
+    if paused:
+        payload = {
+            "automation_paused": True,
+            "automation_paused_at": current.get("automation_paused_at") or now.isoformat(),
+            "automation_pause_reason": reason or "Paused by operator",
+        }
+        res = supabase.table("clients").update(payload).eq("id", client_id).execute()
+        return res.data[0] if res.data else None
+
+    # Resume: freeze semantics require extending all active deadlines by paused duration.
+    paused_at_raw = current.get("automation_paused_at")
+    if was_paused and paused_at_raw:
+        try:
+            paused_at = datetime.fromisoformat(str(paused_at_raw).replace("Z", "+00:00"))
+            if paused_at.tzinfo is None:
+                paused_at = paused_at.replace(tzinfo=timezone.utc)
+            delta = now - paused_at
+            active = (
+                supabase.table("rfqs")
+                .select("id, due_by")
+                .eq("client_id", client_id)
+                .eq("status", "active")
+                .execute()
+            )
+            for rfq in (active.data or []):
+                due_raw = rfq.get("due_by")
+                if not due_raw:
+                    continue
+                due = datetime.fromisoformat(str(due_raw).replace("Z", "+00:00"))
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=timezone.utc)
+                supabase.table("rfqs").update({
+                    "due_by": (due + delta).isoformat()
+                }).eq("id", rfq["id"]).execute()
+        except Exception as e:
+            logger.error("Failed shifting RFQ deadlines while resuming client %s: %s", client_id, e)
+            raise
+
+    res = (
+        supabase.table("clients")
+        .update({
+            "automation_paused": False,
+            "automation_paused_at": None,
+            "automation_pause_reason": None,
+        })
+        .eq("id", client_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def get_message_client_id(message_log_id: str) -> str | None:
+    """Resolve the tenant for a persisted outbound message."""
+    if not message_log_id:
+        return None
+    try:
+        res = (
+            supabase.table("message_log")
+            .select("client_id")
+            .eq("id", message_log_id)
+            .maybe_single()
+            .execute()
+        )
+        return (res.data or {}).get("client_id")
+    except Exception as e:
+        logger.warning("get_message_client_id error for message %s: %s", message_log_id, e)
+        return None
+
+
 def get_client_by_instance(instance_name: str):
     """Lookup a client row by whatsapp_instance name.
 
