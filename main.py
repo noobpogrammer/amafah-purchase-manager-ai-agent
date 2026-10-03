@@ -468,6 +468,18 @@ async def outbound_worker():
                 phone_number, message = item[:2]
                 rfq_id, supplier_id, message_log_id = None, None, None
 
+            # Pause fail-safe: even a message queued just before the pause must not
+            # leave the system after the tenant has entered human-only mode.
+            if message_log_id:
+                try:
+                    queued_client_id = db.get_message_client_id(message_log_id)
+                    if queued_client_id and db.is_client_automation_paused(queued_client_id):
+                        print(f"[Outbound Worker] Skipping queued message {message_log_id}: client automation is paused.")
+                        outbound_queue.task_done()
+                        continue
+                except Exception as pause_err:
+                    print(f"[Outbound Worker] Pause check error for message {message_log_id}: {pause_err}")
+
             # 1. Atomically claim message (queued -> sending) immediately before send attempt
             if message_log_id:
                 try:
@@ -1088,6 +1100,9 @@ async def check_deadlines_and_reminders():
     for rfq in expired_rfqs:
         rfq_id = rfq.get("id")
         prod = rfq.get("product_name") or "RFQ Item"
+        if db.is_client_automation_paused(rfq.get("client_id")):
+            print(f"[{now.isoformat()}] [Scheduler] Skipping finalization for RFQ '{prod}' ({rfq_id}): client automation paused.")
+            continue
         try:
             claimed = db.claim_rfq_for_finalization(rfq_id)
             if claimed:
@@ -1109,6 +1124,9 @@ async def check_deadlines_and_reminders():
             print(f"[{now.isoformat()}] [Scheduler] Found {len(processing_rfqs)} incomplete RFQ(s) in 'processing' state. Resuming recovery...")
         for prfq in processing_rfqs:
             prfq_id = prfq.get("id")
+            if db.is_client_automation_paused(prfq.get("client_id")):
+                print(f"[{now.isoformat()}] [Scheduler] Skipping finalization recovery for RFQ {prfq_id}: client automation paused.")
+                continue
             try:
                 await finalize_rfq_job(prfq)
             except Exception as rec_err:
@@ -1137,6 +1155,8 @@ async def check_deadlines_and_reminders():
         try:
             rfq = item.get("rfqs") or {}
             supplier = item.get("suppliers") or {}
+            if db.is_client_automation_paused(rfq.get("client_id")):
+                continue
             # 1. Strictly verify RFQ is active and open (deadline has not elapsed)
             if not db.is_rfq_open(rfq):
                 continue
@@ -2776,6 +2796,44 @@ async def whatsapp_webhook(request: Request):
         inbound_log_id = db.log_message(client_id, supplier["id"], "inbound", message_text)
         decision_id = None
 
+        # Client-level automation pause: preserve the supplier message and route it
+        # to humans without calling any LLM, mutating quotes, negotiating, clarifying,
+        # or sending an automatic WhatsApp response.
+        if client.get("automation_paused"):
+            paused_rfq_id = None
+            if quoted_stanza_id:
+                try:
+                    paused_match = db.get_rfq_supplier_by_sent_message_id(supplier["id"], quoted_stanza_id)
+                    paused_rfq = paused_match.get("rfqs", paused_match) if isinstance(paused_match, dict) else None
+                    paused_rfq_id = paused_rfq.get("id") if isinstance(paused_rfq, dict) else None
+                except Exception as pause_match_err:
+                    logger.warning("Paused-mode stanza correlation failed: %s", pause_match_err)
+
+            if paused_rfq_id:
+                db.update_message_related_rfq(inbound_log_id, paused_rfq_id)
+
+            db.flag_for_human_review(
+                client_id=client_id,
+                supplier_id=supplier["id"],
+                rfq_id=paused_rfq_id,
+                reason="Automation is paused for this client. New supplier message requires human handling only.",
+                category="automation_paused_human_only",
+                raw_message=message_text,
+                metadata={
+                    "type": "automation_paused_human_only",
+                    "source_message_id": inbound_log_id,
+                    "quoted_stanza_id": quoted_stanza_id,
+                    "pause_reason": client.get("automation_pause_reason"),
+                },
+            )
+            if msg_key_id:
+                db.complete_webhook_message(client_id, msg_key_id)
+            return {
+                "status": "paused_human_only",
+                "rfq_id": paused_rfq_id,
+                "reason": "client automation paused",
+            }
+
         # 1. Deterministic Quoted / Stanza Match
         matched_rfq_supplier = None
         match_source = None
@@ -4156,6 +4214,34 @@ async def get_rfq_activity_endpoint(rfq_id: str, current_user=Depends(get_curren
         "rfq_id": rfq_id,
         "count": len(activity),
         "activity": activity,
+    }
+
+
+class AutomationPauseRequest(BaseModel):
+    paused: bool
+    reason: Optional[str] = None
+
+
+@app.post("/admin/automation/pause")
+async def set_automation_pause_endpoint(
+    req: AutomationPauseRequest,
+    current_user=Depends(get_current_user),
+):
+    """Pause or resume all automated procurement handling for the current tenant."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=400, detail="User has no associated client_id")
+
+    row = db.set_client_automation_pause(client_id, req.paused, req.reason)
+    if not row:
+        raise HTTPException(status_code=500, detail="Could not update automation pause state")
+    return {
+        "status": "paused" if req.paused else "active",
+        "automation_paused": bool(row.get("automation_paused")),
+        "automation_paused_at": row.get("automation_paused_at"),
+        "automation_pause_reason": row.get("automation_pause_reason"),
     }
 
 
