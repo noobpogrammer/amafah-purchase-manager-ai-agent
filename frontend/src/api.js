@@ -84,22 +84,17 @@ export async function fetchSuppliers() {
 }
 
 export async function createSupplier(payload) {
-  const clientId = await getCurrentClientId();
-  if (!clientId) throw new Error('Missing client_id (not authenticated)');
-
-  const { data, error } = await supabase
-    .from('suppliers')
-    .insert({
-      client_id: clientId,
-      name: payload.name,
-      phone_number: payload.phone_number,
-      category: payload.category || [],
-      notes: payload.notes || '',
-      is_active: payload.is_active !== false,
-    })
-    .select();
-  if (error) throw error;
-  return data[0];
+  const response = await authorizedFetch('/admin/suppliers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Failed to create supplier');
+  }
+  const result = await response.json();
+  return result.supplier;
 }
 
 export async function deleteSupplier(id) {
@@ -118,21 +113,19 @@ export async function updateSupplier(id, payload) {
     .from('suppliers')
     .update({
       name: payload.name,
-      phone_number: payload.phone_number,
-      category: payload.category || [],
-      notes: payload.notes,
-      is_active: payload.is_active,
-    })
-    .eq('id', id)
-    .select();
-  if (error) throw error;
-  return data[0];
-}
-
-export async function createRFQ(payload) {
-  const response = await authorizedFetch('/rfq/create', {
-    method: 'POST',
+export async function updateSupplier(id, payload) {
+  const response = await authorizedFetch(`/admin/suppliers/${encodeURIComponent(id)}`, {
+    method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.detail || 'Failed to update supplier');
+  }
+  const result = await response.json();
+  return result.supplier;
+}
     body: JSON.stringify({
       product_name: payload.product_name,
       category: payload.category,
