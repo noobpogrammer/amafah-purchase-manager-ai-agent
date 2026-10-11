@@ -34,6 +34,7 @@ from groq_client import AgentContext
 import guardrails
 from policy_validator import ActionProposal, validate_action, ActionCategory, ValidationResult, MAX_NEGOTIATION_ATTEMPTS
 import negotiation_engine
+from openclaw_bridge import router as openclaw_router
 
 logger = logging.getLogger(__name__)
 
@@ -1309,6 +1310,7 @@ async def lifespan(app: FastAPI):
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(openclaw_router)
 
 
 def _cors_origins() -> list[str]:
