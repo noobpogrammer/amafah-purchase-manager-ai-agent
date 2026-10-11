@@ -308,6 +308,25 @@ def create_supplier(client_id: str, name: str, phone_number: str, categories: li
     }).execute().data
 
 
+def update_supplier(supplier_id: str, client_id: str, *, name: str, phone_number: str, categories: list[str] = None, notes: str = None, is_active: bool = True):
+    """Updates one supplier scoped to the authenticated tenant."""
+    res = (
+        supabase.table("suppliers")
+        .update({
+            "name": name,
+            "phone_number": phone_number,
+            "category": categories or [],
+            "notes": notes,
+            "is_active": bool(is_active),
+        })
+        .eq("id", supplier_id)
+        .eq("client_id", client_id)
+        .is_("deleted_at", "null")
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
 def update_supplier_categories(supplier_id: str, categories: list[str]):
     """Updates a supplier's categories list in Supabase."""
     return supabase.table("suppliers").update({
