@@ -97,6 +97,12 @@ def sync_openclaw_allowlist(phone_number: str, action: str) -> dict:
 OUTBOUND_MIN_DELAY = float(os.getenv("OUTBOUND_MIN_DELAY", "3.0"))
 OUTBOUND_MAX_DELAY = float(os.getenv("OUTBOUND_MAX_DELAY", "8.0"))
 
+# Cutover guard: when false, the legacy FastAPI -> Evolution API sender is
+# completely disabled. OpenClaw owns supplier-facing WhatsApp during migration.
+LEGACY_EVOLUTION_OUTBOUND_ENABLED = os.getenv(
+    "LEGACY_EVOLUTION_OUTBOUND_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 outbound_queue: asyncio.Queue = asyncio.Queue()
 
 
@@ -370,8 +376,25 @@ async def enqueue_message(
     supplier_id: str = None,
     message_log_id: str = None,
 ):
-    """Pushes an outbound message onto the asyncio queue for paced sending."""
+    """Queue a legacy Evolution outbound message only when that path is enabled."""
+    if not LEGACY_EVOLUTION_OUTBOUND_ENABLED:
+        reason = "Legacy Evolution outbound disabled; OpenClaw owns WhatsApp delivery."
+        if message_log_id:
+            try:
+                db.mark_message_failed(message_log_id, reason)
+            except Exception as mark_err:
+                logger.warning("Could not mark suppressed legacy message %s failed: %s", message_log_id, mark_err)
+        logger.info(
+            "[Legacy Outbound Disabled] Suppressed Evolution send to %s (rfq=%s supplier=%s message_log=%s)",
+            phone_number,
+            rfq_id,
+            supplier_id,
+            message_log_id,
+        )
+        return False
+
     await outbound_queue.put((phone_number, message, rfq_id, supplier_id, message_log_id))
+    return True
 
 
 def extract_evolution_message_ids(resp: Any) -> Tuple[Optional[str], Optional[str]]:
@@ -1340,53 +1363,68 @@ async def lifespan(app: FastAPI):
     except Exception as sync_err:
         print(f"[{datetime.now(timezone.utc).isoformat()}] [OpenClaw Sync ERROR] Existing supplier backfill failed: {sync_err}")
 
-    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Starting outbound message worker task...")
-    worker_task = asyncio.create_task(outbound_worker())
+    worker_task = None
+    scheduler_started = False
 
-    # Startup recovery: re-enqueue persistent messages with status = 'queued'
-    try:
-        queued_msgs = db.get_queued_outbound_messages()
-        recovered_count = 0
-        for qm in queued_msgs:
-            msg_id = qm.get("id")
-            body = qm.get("body")
-            rfq_id = qm.get("related_rfq_id")
-            supplier_id = qm.get("supplier_id")
-            phone = None
-            if qm.get("suppliers") and isinstance(qm.get("suppliers"), dict):
-                phone = qm.get("suppliers").get("phone_number")
-            elif supplier_id:
-                s = db.get_supplier_by_id(supplier_id)
-                if s:
-                    phone = s.get("phone_number")
-            if phone and body:
-                await enqueue_message(phone, body, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_id)
-                recovered_count += 1
-        if recovered_count > 0:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Recovered and re-enqueued {recovered_count} queued outbound message(s).")
-    except Exception as rec_err:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan ERROR] Failed to recover queued outbound messages: {rec_err}")
+    if LEGACY_EVOLUTION_OUTBOUND_ENABLED:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Legacy Evolution outbound ENABLED; starting worker and scheduler.")
+        worker_task = asyncio.create_task(outbound_worker())
 
-    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Registering check_deadlines_and_reminders job on AsyncIOScheduler (interval: 15m, next_run: now)...")
-    scheduler.add_job(
-        check_deadlines_and_reminders,
-        "interval",
-        minutes=15,
-        next_run_time=datetime.now(timezone.utc),
-        id="check_deadlines_and_reminders",
-        replace_existing=True,
-    )
-    scheduler.start()
-    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] AsyncIOScheduler started successfully.")
+        # Startup recovery: re-enqueue persistent messages with status = 'queued'
+        try:
+            queued_msgs = db.get_queued_outbound_messages()
+            recovered_count = 0
+            for qm in queued_msgs:
+                msg_id = qm.get("id")
+                body = qm.get("body")
+                rfq_id = qm.get("related_rfq_id")
+                supplier_id = qm.get("supplier_id")
+                phone = None
+                if qm.get("suppliers") and isinstance(qm.get("suppliers"), dict):
+                    phone = qm.get("suppliers").get("phone_number")
+                elif supplier_id:
+                    s = db.get_supplier_by_id(supplier_id)
+                    if s:
+                        phone = s.get("phone_number")
+                if phone and body:
+                    await enqueue_message(phone, body, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_id)
+                    recovered_count += 1
+            if recovered_count > 0:
+                print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Recovered and re-enqueued {recovered_count} queued outbound message(s).")
+        except Exception as rec_err:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan ERROR] Failed to recover queued outbound messages: {rec_err}")
+
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Registering check_deadlines_and_reminders job on AsyncIOScheduler (interval: 15m, next_run: now)...")
+        scheduler.add_job(
+            check_deadlines_and_reminders,
+            "interval",
+            minutes=15,
+            next_run_time=datetime.now(timezone.utc),
+            id="check_deadlines_and_reminders",
+            replace_existing=True,
+        )
+        scheduler.start()
+        scheduler_started = True
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] AsyncIOScheduler started successfully.")
+    else:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Legacy Evolution outbound DISABLED; no outbound worker, queued-message recovery, or reminder scheduler started.")
+
     yield
-    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Shutting down scheduler and worker task...")
-    scheduler.shutdown()
-    worker_task.cancel()
-    try:
-        await worker_task
-    except asyncio.CancelledError:
-        pass
-    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Outbound worker and scheduler shut down cleanly.")
+
+    if scheduler_started:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Shutting down legacy scheduler...")
+        scheduler.shutdown()
+
+    if worker_task is not None:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Shutting down legacy outbound worker...")
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+
+    if scheduler_started or worker_task is not None:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Legacy Evolution outbound components shut down cleanly.")
 
 from fastapi.middleware.cors import CORSMiddleware
 
