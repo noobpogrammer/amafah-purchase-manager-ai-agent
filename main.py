@@ -100,6 +100,29 @@ OUTBOUND_MAX_DELAY = float(os.getenv("OUTBOUND_MAX_DELAY", "8.0"))
 outbound_queue: asyncio.Queue = asyncio.Queue()
 
 
+def sync_existing_suppliers_to_openclaw(client_id: str) -> dict:
+    """Merge all active suppliers for a tenant into the OpenClaw WhatsApp allowlist."""
+    phones = db.list_supplier_phones_for_client(client_id)
+    if not phones:
+        return {"ok": True, "action": "merge", "allowFrom": []}
+    if not OPENCLAW_BASE_URL or not OPENCLAW_TOOL_API_KEY:
+        raise RuntimeError("OpenClaw allowlist sync is not configured")
+    response = requests.post(
+        f"{OPENCLAW_BASE_URL}/internal/whatsapp/allowlist/sync",
+        headers={
+            "Content-Type": "application/json",
+            "X-OpenClaw-Key": OPENCLAW_TOOL_API_KEY,
+        },
+        json={"phone_numbers": phones},
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"OpenClaw supplier backfill failed status={response.status_code} body={response.text[:500]}"
+        )
+    return response.json()
+
+
 class SupplierMutationRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     phone_number: str = Field(..., min_length=8, max_length=32)
@@ -1305,6 +1328,12 @@ async def lifespan(app: FastAPI):
             f"Backend configuration error: Missing required environment variable(s): {', '.join(missing)}. "
             f"Please check your root .env file."
         )
+
+    try:
+        sync_result = await run_in_threadpool(sync_existing_suppliers_to_openclaw, DEMO_CLIENT_ID)
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [OpenClaw Sync] Existing suppliers synchronized: {sync_result}")
+    except Exception as sync_err:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [OpenClaw Sync ERROR] Existing supplier backfill failed: {sync_err}")
 
     print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Starting outbound message worker task...")
     worker_task = asyncio.create_task(outbound_worker())
