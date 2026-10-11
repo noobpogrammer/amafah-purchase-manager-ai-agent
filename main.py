@@ -55,10 +55,57 @@ EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
 EVOLUTION_TYPING_DELAY_MS = int(os.getenv("EVOLUTION_TYPING_DELAY_MS", "1200"))
 
+OPENCLAW_BASE_URL = os.getenv("OPENCLAW_BASE_URL", "").rstrip("/")
+OPENCLAW_TOOL_API_KEY = os.getenv("OPENCLAW_TOOL_API_KEY", "").strip()
+
+
+def sync_openclaw_allowlist(phone_number: str, action: str) -> dict:
+    """Add/remove a supplier phone from OpenClaw's WhatsApp allowlist.
+
+    Fail closed for supplier mutations: if OpenClaw cannot be synchronized,
+    the API raises so the frontend never reports a supplier as ready while
+    WhatsApp admission is stale.
+    """
+    if not OPENCLAW_BASE_URL:
+        raise HTTPException(status_code=503, detail="OpenClaw allowlist sync is not configured")
+    if not OPENCLAW_TOOL_API_KEY:
+        raise HTTPException(status_code=503, detail="OpenClaw tool authentication is not configured")
+
+    try:
+        response = requests.post(
+            f"{OPENCLAW_BASE_URL}/internal/whatsapp/allowlist",
+            headers={
+                "Content-Type": "application/json",
+                "X-OpenClaw-Key": OPENCLAW_TOOL_API_KEY,
+            },
+            json={"action": action, "phone_number": phone_number},
+            timeout=12,
+        )
+    except requests.RequestException as exc:
+        logger.exception("OpenClaw allowlist sync failed")
+        raise HTTPException(status_code=502, detail="Could not synchronize supplier with WhatsApp") from exc
+
+    if not response.ok:
+        logger.error("OpenClaw allowlist sync failed status=%s body=%s", response.status_code, response.text[:500])
+        raise HTTPException(status_code=502, detail="Could not synchronize supplier with WhatsApp")
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Invalid response from OpenClaw allowlist service") from exc
+
 OUTBOUND_MIN_DELAY = float(os.getenv("OUTBOUND_MIN_DELAY", "3.0"))
 OUTBOUND_MAX_DELAY = float(os.getenv("OUTBOUND_MAX_DELAY", "8.0"))
 
 outbound_queue: asyncio.Queue = asyncio.Queue()
+
+
+class SupplierMutationRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    phone_number: str = Field(..., min_length=8, max_length=32)
+    category: List[str] = Field(default_factory=list)
+    notes: Optional[str] = ""
+    is_active: bool = True
 
 
 class PasswordResetRequest(BaseModel):
@@ -4267,6 +4314,104 @@ async def delete_category_endpoint(
     return {"status": "deleted", **result}
 
 
+@app.post("/admin/suppliers")
+async def create_supplier_endpoint(
+    req: SupplierMutationRequest,
+    current_user=Depends(get_current_user),
+):
+    """Create a supplier and keep OpenClaw WhatsApp admission synchronized."""
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=400, detail="User has no associated client_id")
+
+    created_rows = db.create_supplier(
+        client_id,
+        req.name.strip(),
+        req.phone_number.strip(),
+        req.category,
+        req.notes,
+    )
+    supplier = created_rows[0] if created_rows else None
+    if not supplier:
+        raise HTTPException(status_code=500, detail="Could not create supplier")
+
+    try:
+        if req.is_active:
+            sync_openclaw_allowlist(req.phone_number, "add")
+        if req.is_active is False:
+            supplier = db.update_supplier(
+                supplier["id"], client_id,
+                name=req.name.strip(),
+                phone_number=req.phone_number.strip(),
+                categories=req.category,
+                notes=req.notes,
+                is_active=False,
+            ) or supplier
+    except HTTPException:
+        # Roll back the just-created contact so UI and WhatsApp access cannot diverge.
+        db.soft_delete_supplier(supplier["id"], client_id)
+        raise
+
+    return {"status": "created", "supplier": supplier}
+
+
+@app.put("/admin/suppliers/{supplier_id}")
+async def update_supplier_endpoint(
+    supplier_id: str,
+    req: SupplierMutationRequest,
+    current_user=Depends(get_current_user),
+):
+    """Update supplier details and atomically reconcile the OpenClaw allowlist."""
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=400, detail="User has no associated client_id")
+
+    existing = db.get_supplier_by_id(supplier_id)
+    if not existing or existing.get("client_id") != client_id or existing.get("deleted_at"):
+        raise HTTPException(status_code=404, detail="Supplier not found")
+
+    old_phone = existing.get("phone_number")
+    old_active = existing.get("is_active") is not False
+    new_phone = req.phone_number.strip()
+    new_active = req.is_active is not False
+
+    # Reconcile WhatsApp access first. If this fails, Supabase stays unchanged.
+    if old_active and (not new_active or old_phone != new_phone):
+        sync_openclaw_allowlist(old_phone, "remove")
+    try:
+        if new_active and (not old_active or old_phone != new_phone):
+            sync_openclaw_allowlist(new_phone, "add")
+    except HTTPException:
+        if old_active and (not new_active or old_phone != new_phone):
+            try:
+                sync_openclaw_allowlist(old_phone, "add")
+            except Exception:
+                logger.exception("Failed restoring old supplier phone to OpenClaw allowlist")
+        raise
+
+    updated = db.update_supplier(
+        supplier_id,
+        client_id,
+        name=req.name.strip(),
+        phone_number=new_phone,
+        categories=req.category,
+        notes=req.notes,
+        is_active=new_active,
+    )
+    if not updated:
+        # Best-effort rollback of WhatsApp access if database update unexpectedly fails.
+        try:
+            if new_active and (not old_active or old_phone != new_phone):
+                sync_openclaw_allowlist(new_phone, "remove")
+            if old_active:
+                sync_openclaw_allowlist(old_phone, "add")
+        except Exception:
+            logger.exception("Failed rolling back OpenClaw allowlist after supplier DB update failure")
+        raise HTTPException(status_code=500, detail="Could not update supplier")
+
+    return {"status": "updated", "supplier": updated}
+
+
 @app.delete("/admin/suppliers/{supplier_id}")
 async def delete_supplier_endpoint(
     supplier_id: str,
@@ -4280,9 +4425,21 @@ async def delete_supplier_endpoint(
     if not client_id:
         raise HTTPException(status_code=400, detail="User has no associated client_id")
 
+    existing = db.get_supplier_by_id(supplier_id)
+    if not existing or existing.get("client_id") != client_id or existing.get("deleted_at"):
+        raise HTTPException(status_code=404, detail="Supplier not found or already deleted")
+
+    if existing.get("is_active") is not False and existing.get("phone_number"):
+        sync_openclaw_allowlist(existing["phone_number"], "remove")
+
     deleted = db.soft_delete_supplier(supplier_id, client_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="Supplier not found or already deleted")
+        try:
+            if existing.get("is_active") is not False and existing.get("phone_number"):
+                sync_openclaw_allowlist(existing["phone_number"], "add")
+        except Exception:
+            logger.exception("Failed restoring supplier allowlist after delete rollback")
+        raise HTTPException(status_code=500, detail="Could not delete supplier")
 
     return {
         "status": "deleted",
