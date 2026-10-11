@@ -109,11 +109,6 @@ export async function deleteSupplier(id) {
 }
 
 export async function updateSupplier(id, payload) {
-  const { data, error } = await supabase
-    .from('suppliers')
-    .update({
-      name: payload.name,
-export async function updateSupplier(id, payload) {
   const response = await authorizedFetch(`/admin/suppliers/${encodeURIComponent(id)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -126,6 +121,11 @@ export async function updateSupplier(id, payload) {
   const result = await response.json();
   return result.supplier;
 }
+
+export async function createRFQ(payload) {
+  const response = await authorizedFetch('/rfq/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       product_name: payload.product_name,
       category: payload.category,
