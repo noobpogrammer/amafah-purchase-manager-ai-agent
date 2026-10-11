@@ -361,6 +361,34 @@ def update_supplier(supplier_id: str, client_id: str, *, name: str, phone_number
     return res.data[0] if res.data else None
 
 
+def purge_procurement_history():
+    """One-time cleanup of transactional procurement history while preserving suppliers and account/config data."""
+    zero_uuid = "00000000-0000-0000-0000-000000000000"
+
+    # Delete children before parents to satisfy foreign keys.
+    for table in [
+        "agent_decisions",
+        "negotiation_sessions",
+        "rfq_rankings",
+        "flagged_for_review",
+        "quotes",
+        "pending_clarifications",
+        "rfq_negotiation_constraints",
+        "rfq_suppliers",
+        "llm_usage_log",
+        "message_log",
+        "processed_webhooks",
+        "webhook_errors",
+        "rfqs",
+    ]:
+        q = supabase.table(table).delete()
+        if table == "processed_webhooks":
+            q = q.neq("message_id", "__never__")
+        else:
+            q = q.neq("id", zero_uuid)
+        q.execute()
+
+
 def list_supplier_phones_for_client(client_id: str):
     res = supabase.table("suppliers").select("phone_number").eq("client_id", client_id).eq("is_active", True).is_("deleted_at", "null").execute()
     return [row.get("phone_number") for row in (res.data or []) if row.get("phone_number")]
