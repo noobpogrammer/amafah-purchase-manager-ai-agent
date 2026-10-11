@@ -140,7 +140,6 @@ class LogMessageRequest(BaseModel):
 @router.post("/supplier-context", dependencies=[])
 def supplier_context(
     req: SupplierContextRequest,
-    _auth: None = Header(default=None, alias="X-OpenClaw-Auth-Placeholder"),
     x_openclaw_key: Optional[str] = Header(default=None),
 ):
     _require_openclaw_key(x_openclaw_key)
