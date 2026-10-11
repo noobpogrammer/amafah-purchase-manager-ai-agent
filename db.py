@@ -361,32 +361,47 @@ def update_supplier(supplier_id: str, client_id: str, *, name: str, phone_number
     return res.data[0] if res.data else None
 
 
-def purge_procurement_history():
-    """One-time cleanup of transactional procurement history while preserving suppliers and account/config data."""
-    zero_uuid = "00000000-0000-0000-0000-000000000000"
+def _delete_rows_in_batches(table: str, *, filter_column: str | None = None, only_non_null: bool = False, batch_size: int = 100):
+    """Delete rows in small batches to avoid Supabase/PostgREST statement timeouts."""
+    deleted = 0
+    while True:
+        q = supabase.table(table).select("id").limit(batch_size)
+        if filter_column and only_non_null:
+            q = q.not_.is_(filter_column, "null")
+        rows = q.execute().data or []
+        ids = [row.get("id") for row in rows if row.get("id")]
+        if not ids:
+            break
+        supabase.table(table).delete().in_("id", ids).execute()
+        deleted += len(ids)
+    return deleted
 
-    # Delete children before parents to satisfy foreign keys.
-    for table in [
-        "agent_decisions",
-        "negotiation_sessions",
-        "rfq_rankings",
-        "flagged_for_review",
-        "quotes",
-        "pending_clarifications",
-        "rfq_negotiation_constraints",
-        "rfq_suppliers",
-        "llm_usage_log",
-        "message_log",
-        "processed_webhooks",
-        "webhook_errors",
-        "rfqs",
+
+def purge_procurement_history():
+    """Delete RFQ transactional history while preserving suppliers/accounts/configuration."""
+    deleted = {}
+
+    # Child tables first so rfqs can be deleted without FK violations.
+    for table, filter_column, only_non_null in [
+        ("agent_decisions", "rfq_id", True),
+        ("negotiation_sessions", None, False),
+        ("rfq_rankings", None, False),
+        ("flagged_for_review", "rfq_id", True),
+        ("quotes", None, False),
+        ("rfq_negotiation_constraints", None, False),
+        ("rfq_suppliers", None, False),
+        ("llm_usage_log", "rfq_id", True),
+        ("message_log", "related_rfq_id", True),
+        ("pending_clarifications", None, False),
+        ("rfqs", None, False),
     ]:
-        q = supabase.table(table).delete()
-        if table == "processed_webhooks":
-            q = q.neq("message_id", "__never__")
-        else:
-            q = q.neq("id", zero_uuid)
-        q.execute()
+        deleted[table] = _delete_rows_in_batches(
+            table,
+            filter_column=filter_column,
+            only_non_null=only_non_null,
+        )
+
+    return deleted
 
 
 def list_supplier_phones_for_client(client_id: str):
