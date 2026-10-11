@@ -1321,6 +1321,11 @@ REQUIRED_ENV_VARS = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if os.getenv("PURGE_LEGACY_PROCUREMENT_DATA", "").lower() == "true":
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Cleanup] Purging legacy procurement history...")
+        await run_in_threadpool(db.purge_procurement_history)
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Cleanup] Legacy procurement history purged.")
+
     # Startup validation: verify all required backend env vars exist and are non-empty
     missing = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
     if missing:
