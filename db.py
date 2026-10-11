@@ -298,13 +298,47 @@ def list_invite_tokens(client_id: str) -> list[dict]:
 
 
 def create_supplier(client_id: str, name: str, phone_number: str, categories: list[str] = None, notes: str = None):
-    """Creates a new supplier. categories accepts a list of strings (e.g. ['Electronics', 'Hardware'])."""
+    """Create a supplier, or revive the same soft-deleted supplier record.
+
+    Supplier phone is unique per client. A failed external sync can intentionally
+    soft-delete a just-created supplier; a retry should revive that row instead
+    of crashing on the unique constraint.
+    """
+    existing = (
+        supabase.table("suppliers")
+        .select("*")
+        .eq("client_id", client_id)
+        .eq("phone_number", phone_number)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if existing:
+        row = existing[0]
+        if row.get("deleted_at") is not None or row.get("is_active") is False:
+            return (
+                supabase.table("suppliers")
+                .update({
+                    "name": name,
+                    "category": categories or [],
+                    "notes": notes,
+                    "is_active": True,
+                    "deleted_at": None,
+                })
+                .eq("id", row["id"])
+                .eq("client_id", client_id)
+                .execute()
+                .data
+            )
+        return [row]
+
     return supabase.table("suppliers").insert({
         "client_id": client_id,
         "name": name,
         "phone_number": phone_number,
         "category": categories or [],
         "notes": notes,
+        "is_active": True,
     }).execute().data
 
 
