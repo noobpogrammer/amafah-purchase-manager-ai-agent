@@ -106,6 +106,32 @@ LEGACY_EVOLUTION_OUTBOUND_ENABLED = os.getenv(
 outbound_queue: asyncio.Queue = asyncio.Queue()
 
 
+def send_via_openclaw_whatsapp(phone_number: str, message: str) -> dict:
+    """Send a supplier-facing WhatsApp message through the OpenClaw wrapper."""
+    if not OPENCLAW_BASE_URL:
+        raise RuntimeError("OPENCLAW_BASE_URL is not configured")
+    if not OPENCLAW_TOOL_API_KEY:
+        raise RuntimeError("OPENCLAW_TOOL_API_KEY is not configured")
+
+    response = requests.post(
+        f"{OPENCLAW_BASE_URL}/internal/whatsapp/send",
+        headers={
+            "Content-Type": "application/json",
+            "X-OpenClaw-Key": OPENCLAW_TOOL_API_KEY,
+        },
+        json={
+            "phone_number": phone_number,
+            "message": message,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error") or "OpenClaw WhatsApp send failed")
+    return payload
+
+
 def sync_existing_suppliers_to_openclaw(client_id: str) -> dict:
     """Merge all active suppliers for a tenant into the OpenClaw WhatsApp allowlist."""
     phones = db.list_supplier_phones_for_client(client_id)
@@ -376,22 +402,61 @@ async def enqueue_message(
     supplier_id: str = None,
     message_log_id: str = None,
 ):
-    """Queue a legacy Evolution outbound message only when that path is enabled."""
+    """Send through OpenClaw during cutover, otherwise queue the legacy Evolution path."""
     if not LEGACY_EVOLUTION_OUTBOUND_ENABLED:
-        reason = "Legacy Evolution outbound disabled; OpenClaw owns WhatsApp delivery."
         if message_log_id:
             try:
-                db.mark_message_failed(message_log_id, reason)
-            except Exception as mark_err:
-                logger.warning("Could not mark suppressed legacy message %s failed: %s", message_log_id, mark_err)
-        logger.info(
-            "[Legacy Outbound Disabled] Suppressed Evolution send to %s (rfq=%s supplier=%s message_log=%s)",
-            phone_number,
-            rfq_id,
-            supplier_id,
-            message_log_id,
-        )
-        return False
+                claimed = db.mark_message_sending(message_log_id)
+            except Exception as claim_err:
+                logger.warning("OpenClaw send claim failed for message %s: %s", message_log_id, claim_err)
+                claimed = False
+
+            if not claimed:
+                logger.warning(
+                    "[OpenClaw Outbound] Message %s was not claimable; skipping duplicate send.",
+                    message_log_id,
+                )
+                return False
+
+        try:
+            payload = await run_in_threadpool(send_via_openclaw_whatsapp, phone_number, message)
+            message_id = payload.get("message_id")
+
+            if message_log_id:
+                db.mark_message_sent(
+                    message_log_id,
+                    external_message_id=message_id,
+                )
+
+            if message_id and rfq_id and supplier_id:
+                db.update_rfq_supplier_sent_message_id(
+                    rfq_id,
+                    supplier_id,
+                    str(message_id),
+                )
+
+            logger.info(
+                "[OpenClaw Outbound] Sent WhatsApp message to %s (rfq=%s supplier=%s message_log=%s message_id=%s)",
+                phone_number,
+                rfq_id,
+                supplier_id,
+                message_log_id,
+                message_id,
+            )
+            return True
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+            clean_msg = f"OpenClaw transport/timeout error: {type(net_err).__name__} - {str(net_err)}"
+            if message_log_id:
+                db.mark_message_unknown(message_log_id, clean_msg)
+            logger.error("[OpenClaw Outbound] Ambiguous send state to %s: %s", phone_number, net_err)
+            return False
+        except Exception as send_err:
+            clean_msg = f"OpenClaw send failed: {str(send_err)}"
+            if message_log_id:
+                db.mark_message_failed(message_log_id, clean_msg)
+            logger.exception("[OpenClaw Outbound] Failed to send to %s", phone_number)
+            return False
 
     await outbound_queue.put((phone_number, message, rfq_id, supplier_id, message_log_id))
     return True
