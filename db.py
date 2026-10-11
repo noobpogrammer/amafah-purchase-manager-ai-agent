@@ -361,6 +361,11 @@ def update_supplier(supplier_id: str, client_id: str, *, name: str, phone_number
     return res.data[0] if res.data else None
 
 
+def list_supplier_phones_for_client(client_id: str):
+    res = supabase.table("suppliers").select("phone_number").eq("client_id", client_id).eq("is_active", True).is_("deleted_at", "null").execute()
+    return [row.get("phone_number") for row in (res.data or []) if row.get("phone_number")]
+
+
 def update_supplier_categories(supplier_id: str, categories: list[str]):
     """Updates a supplier's categories list in Supabase."""
     return supabase.table("suppliers").update({
