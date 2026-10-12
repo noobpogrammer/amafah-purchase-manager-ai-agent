@@ -2901,6 +2901,9 @@ async def send_bulk_rfq_bundles(client_id: str, supplier_items: dict) -> dict:
     sent_count = 0
     failures = []
     for supplier_id, details in supplier_items.items():
+        if db.is_client_automation_paused(client_id):
+            failures.append({"supplier_id": supplier_id, "reason": "client_automation_paused"})
+            continue
         supplier = details["supplier"]
         phone = supplier.get("phone_number")
         if not phone:
