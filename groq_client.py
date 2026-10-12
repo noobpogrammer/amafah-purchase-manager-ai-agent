@@ -735,6 +735,8 @@ Rules:
 5. Brand/model is a variant_label, not automatically a specification trade-off.
 6. Prices like "1425/-" mean 1425 AED unless the message explicitly says otherwise.
 7. Do not force a match. Use candidate_rfq_id=null and lower confidence when genuinely uncertain.
+11. Only use item numbers to match RFQs when the candidate list explicitly contains item_number from the supplier's quoted outbound message. Otherwise item numbers alone are not evidence.
+12. Printed Ref values can match the supplied reference values, but never invent missing refs.
 8. Do not make procurement decisions, negotiate, accept, reject, or escalate. Extract and map facts only.
 9. Do not merge different RFQ lines into one item.
 10. supplier_final=true only when that specific quoted line is explicitly described as final/fixed/best-and-final. A global brand heading does not make prices final.
@@ -753,6 +755,8 @@ def parse_multi_rfq_quotes(message_text: str, candidate_rfqs: Optional[list] = N
             "product_name": rfq.get("product_name"),
             "specs": rfq.get("specs"),
             "quantity": rfq.get("quantity"),
+            "item_number": rfq.get("item_number"),
+            "reference": rfq.get("reference") or str(rfq.get("id"))[:8],
         })
 
     if not message_text or not message_text.strip() or len(candidates) < 2:
