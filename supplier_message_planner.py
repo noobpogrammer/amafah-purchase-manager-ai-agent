@@ -56,7 +56,7 @@ def format_supplier_bundle(items: Sequence[BundleItem], *, brand: str = "Everywa
     for index, item in enumerate(items, 1):
         if not item.rfq_id or not item.product_name.strip():
             raise ValueError("Missing RFQ reference or product name")
-        row = f"{index}. {item.product_name} | Qty: {item.quantity if item.quantity is not None else 'N/A'}"
+        row = f"{index}. {item.product_name} (Ref: {item.rfq_id[:8]}) | Qty: {item.quantity if item.quantity is not None else 'N/A'}"
         if item.specs and item.specs.strip() not in {".", "-", "N/A"}:
             row += f" | Specs: {item.specs.strip()}"
         if item.deadline_hours is not None:
