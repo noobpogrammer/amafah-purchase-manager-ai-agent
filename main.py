@@ -151,6 +151,42 @@ def send_operator_instruction_to_openclaw(
     return payload
 
 
+def send_scheduled_reminder_via_openclaw(
+    phone_number: str,
+    *,
+    rfq_id: str,
+    product_name: str,
+    reminder_stage: str,
+    suggested_message: str,
+) -> dict:
+    """Ask the supplier's OpenClaw session whether a scheduled reminder should be sent."""
+    if not OPENCLAW_BASE_URL:
+        raise RuntimeError("OPENCLAW_BASE_URL is not configured")
+    if not OPENCLAW_TOOL_API_KEY:
+        raise RuntimeError("OPENCLAW_TOOL_API_KEY is not configured")
+
+    response = requests.post(
+        f"{OPENCLAW_BASE_URL}/internal/procurement/reminder",
+        headers={
+            "Content-Type": "application/json",
+            "X-OpenClaw-Key": OPENCLAW_TOOL_API_KEY,
+        },
+        json={
+            "phone_number": phone_number,
+            "rfq_id": rfq_id,
+            "product_name": product_name,
+            "reminder_stage": reminder_stage,
+            "suggested_message": suggested_message,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error") or "OpenClaw reminder check failed")
+    return payload
+
+
 def sync_existing_suppliers_to_openclaw(client_id: str) -> dict:
     """Merge all active suppliers for a tenant into the OpenClaw WhatsApp allowlist."""
     phones = db.list_supplier_phones_for_client(client_id)
@@ -1181,23 +1217,71 @@ async def check_deadlines_and_reminders():
             if percentage >= 90 and reminder_count == 2:
                 print(f"[{now.isoformat()}] [Scheduler] Triggering 90% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
                 msg = f"Final reminder — closing the RFQ for '{prod}' soon! Please reply with your quote if available."
-                client_id = rfq.get("client_id") or supplier.get("client_id")
-                msg_log_id = db.log_message(client_id, supplier.get("id"), "outbound", msg, related_rfq_id=rfq.get("id"))
-                await enqueue_message(phone, msg, rfq_id=rfq.get("id"), supplier_id=supplier.get("id"), message_log_id=msg_log_id)
+                result = await run_in_threadpool(
+                    send_scheduled_reminder_via_openclaw,
+                    phone,
+                    rfq_id=str(rfq.get("id")),
+                    product_name=prod,
+                    reminder_stage="90%",
+                    suggested_message=msg,
+                )
+                if result.get("sent"):
+                    client_id = rfq.get("client_id") or supplier.get("client_id")
+                    db.log_message(
+                        client_id,
+                        supplier.get("id"),
+                        "outbound",
+                        result.get("message") or msg,
+                        related_rfq_id=rfq.get("id"),
+                        status="sent",
+                        external_message_id=result.get("message_id"),
+                    )
                 db.update_rfq_supplier_reminder(item["id"], 3)
             elif percentage >= 70 and reminder_count == 1:
                 print(f"[{now.isoformat()}] [Scheduler] Triggering 70% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
                 msg = f"Reminder regarding RFQ for '{prod}'. Please send your quote when ready."
-                client_id = rfq.get("client_id") or supplier.get("client_id")
-                msg_log_id = db.log_message(client_id, supplier.get("id"), "outbound", msg, related_rfq_id=rfq.get("id"))
-                await enqueue_message(phone, msg, rfq_id=rfq.get("id"), supplier_id=supplier.get("id"), message_log_id=msg_log_id)
+                result = await run_in_threadpool(
+                    send_scheduled_reminder_via_openclaw,
+                    phone,
+                    rfq_id=str(rfq.get("id")),
+                    product_name=prod,
+                    reminder_stage="70%",
+                    suggested_message=msg,
+                )
+                if result.get("sent"):
+                    client_id = rfq.get("client_id") or supplier.get("client_id")
+                    db.log_message(
+                        client_id,
+                        supplier.get("id"),
+                        "outbound",
+                        result.get("message") or msg,
+                        related_rfq_id=rfq.get("id"),
+                        status="sent",
+                        external_message_id=result.get("message_id"),
+                    )
                 db.update_rfq_supplier_reminder(item["id"], 2)
             elif percentage >= 50 and reminder_count == 0:
                 print(f"[{now.isoformat()}] [Scheduler] Triggering 50% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
                 msg = f"Hi! Just checking in on the RFQ for '{prod}'."
-                client_id = rfq.get("client_id") or supplier.get("client_id")
-                msg_log_id = db.log_message(client_id, supplier.get("id"), "outbound", msg, related_rfq_id=rfq.get("id"))
-                await enqueue_message(phone, msg, rfq_id=rfq.get("id"), supplier_id=supplier.get("id"), message_log_id=msg_log_id)
+                result = await run_in_threadpool(
+                    send_scheduled_reminder_via_openclaw,
+                    phone,
+                    rfq_id=str(rfq.get("id")),
+                    product_name=prod,
+                    reminder_stage="50%",
+                    suggested_message=msg,
+                )
+                if result.get("sent"):
+                    client_id = rfq.get("client_id") or supplier.get("client_id")
+                    db.log_message(
+                        client_id,
+                        supplier.get("id"),
+                        "outbound",
+                        result.get("message") or msg,
+                        related_rfq_id=rfq.get("id"),
+                        status="sent",
+                        external_message_id=result.get("message_id"),
+                    )
                 db.update_rfq_supplier_reminder(item["id"], 1)
         except Exception as item_err:
             tb = traceback.format_exc()
