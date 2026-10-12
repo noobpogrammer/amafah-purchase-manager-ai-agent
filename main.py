@@ -1332,6 +1332,17 @@ async def lifespan(app: FastAPI):
             body = qm.get("body")
             rfq_id = qm.get("related_rfq_id")
             supplier_id = qm.get("supplier_id")
+
+            recovery = db.evaluate_outbound_recovery(qm)
+            if not recovery.get("retry"):
+                reason = recovery.get("reason") or "stale_or_irrelevant"
+                db.suppress_stale_outbound_message(msg_id, reason)
+                print(
+                    f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] "
+                    f"Suppressed stale queued outbound message {msg_id}: {reason}"
+                )
+                continue
+
             phone = None
             if qm.get("suppliers") and isinstance(qm.get("suppliers"), dict):
                 phone = qm.get("suppliers").get("phone_number")
@@ -1339,8 +1350,19 @@ async def lifespan(app: FastAPI):
                 supplier = db.get_supplier_by_id(supplier_id)
                 if supplier:
                     phone = supplier.get("phone_number")
-            if phone and body:
-                await enqueue_message(phone, body, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_id)
+
+            if not phone or not body:
+                db.suppress_stale_outbound_message(msg_id, "missing_phone_or_body")
+                continue
+
+            sent = await enqueue_message(
+                phone,
+                body,
+                rfq_id=rfq_id,
+                supplier_id=supplier_id,
+                message_log_id=msg_id,
+            )
+            if sent:
                 recovered_count += 1
         if recovered_count:
             print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Recovered {recovered_count} queued OpenClaw outbound message(s).")
