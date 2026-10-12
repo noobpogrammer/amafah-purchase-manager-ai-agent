@@ -755,7 +755,7 @@ def save_pending_commercial_draft(
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
 
     clean_ids = []
-    for rfq_id in req.candidate_rfq_ids[:3]:
+    for rfq_id in req.candidate_rfq_ids[:8]:
         rfq = db.get_rfq_by_id(rfq_id, client_id=req.client_id)
         if rfq:
             clean_ids.append(rfq_id)
@@ -785,6 +785,8 @@ def save_pending_commercial_draft(
             .execute()
         )
         if existing.data:
+            if existing.data[0].get("status") == "resolved":
+                return {"saved": True, "draft": existing.data[0], "already_resolved": True}
             row = (
                 db.supabase.table("pending_commercial_drafts")
                 .update(payload)
@@ -945,6 +947,55 @@ def parse_multi_item_quotes(req: MultiItemSupplierQuoteRequest, x_openclaw_key: 
         "source_message_id": req.source_message_id,
         "instruction": "Persist the entire mapped list atomically with record-multi-item-quotes before making commercial commitments.",
     }
+
+
+
+@router.post("/process-multi-item-message")
+def process_multi_item_message(
+    req: MultiItemSupplierQuoteRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """One safe tool call: parse the COMPLETE message and atomically persist it.
+
+    If any item is unresolved, save all known facts for targeted clarification
+    and DO NOT persist a misleading partial commercial batch.
+    """
+    parsed = parse_multi_item_quotes(req, x_openclaw_key)
+    if parsed.get("status") == "CLARIFICATION_REQUIRED":
+        candidate_ids = [str(c["rfq_id"]) for c in parsed.get("candidate_rfqs") or []]
+        saved = save_pending_commercial_draft(
+            PendingCommercialDraftRequest(
+                client_id=req.client_id,
+                supplier_id=req.supplier_id,
+                raw_message=req.message,
+                candidate_rfq_ids=candidate_ids,
+                extracted_facts={
+                    "resolved_items": parsed.get("resolved_items") or [],
+                    "unresolved_items": parsed.get("unresolved_items") or [],
+                    "bundle_id": parsed.get("bundle_id"),
+                },
+                source_message_id=req.source_message_id,
+                reply_to_message_id=req.reply_to_message_id,
+                message_kind="multi_rfq_price_list",
+            ),
+            x_openclaw_key,
+        )
+        return {**parsed, "draft_id": (saved.get("draft") or {}).get("id")}
+    if parsed.get("status") != "MAPPED":
+        return parsed
+    if not req.source_message_id:
+        raise HTTPException(status_code=422, detail="Persist inbound message first and supply its internal message_log UUID.")
+    recorded = record_multi_item_quotes(
+        RecordMultiItemQuotesRequest(
+            client_id=req.client_id,
+            supplier_id=req.supplier_id,
+            source_message_id=req.source_message_id,
+            raw_message=req.message,
+            items=parsed["items"],
+        ),
+        x_openclaw_key,
+    )
+    return {"status": "MULTI_RFQ_RECORDED", "bundle_id": parsed.get("bundle_id"), "recording": recorded}
 
 
 @router.post("/supplier-context", dependencies=[])
