@@ -431,7 +431,7 @@ def authorize_system_outbound(
         return {"authorized": False, "reason": "invalid_message"}
     if db.is_client_automation_paused(req.client_id):
         return {"authorized": False, "reason": "automation_paused"}
-    phone = re.sub(r"\\D", "", req.phone_number or "")
+    phone = re.sub(r"\D", "", req.phone_number or "")
     if not phone:
         return {"authorized": False, "reason": "invalid_recipient"}
     matches = (
@@ -448,7 +448,7 @@ def authorize_system_outbound(
         supplier = db.get_supplier_by_id(bundle["supplier_id"], client_id=req.client_id)
         if not supplier:
             continue
-        if re.sub(r"\\D", "", supplier.get("phone_number") or "") != phone:
+        if re.sub(r"\D", "", supplier.get("phone_number") or "") != phone:
             continue
         items = (
             db.supabase.table("supplier_message_bundle_items")
