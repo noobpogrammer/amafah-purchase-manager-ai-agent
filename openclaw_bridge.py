@@ -181,6 +181,34 @@ class NegotiationContextRequest(BaseModel):
     supplier_id: str
     rfq_id: str
 
+class RfqContextResolveRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    message: str
+    source_message_id: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
+    reply_to_body: Optional[str] = None
+    extracted_facts: dict = Field(default_factory=dict)
+
+
+class PendingCommercialDraftRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    raw_message: str
+    candidate_rfq_ids: list[str] = Field(default_factory=list)
+    extracted_facts: dict = Field(default_factory=dict)
+    source_message_id: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
+    reply_to_body: Optional[str] = None
+    message_kind: Optional[str] = None
+
+
+class ResolveCommercialDraftRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    draft_id: str
+    rfq_id: str
+
 
 @router.post("/activation-gate")
 def activation_gate(
@@ -475,6 +503,309 @@ def review_commercial_action(
         "hard_guard_only": True,
         "supplier_id": supplier.get("id"),
         "rfq_id": req.rfq_id,
+    }
+
+
+@router.post("/resolve-rfq-context")
+def resolve_rfq_context(
+    req: RfqContextResolveRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """Resolve one supplier message against multiple open RFQs using strong context first.
+
+    This endpoint deliberately does not force a guess. It returns RESOLVED only
+    for strong evidence; otherwise it returns a reduced candidate set with
+    evidence for OpenClaw to reason over.
+    """
+    _require_openclaw_key(x_openclaw_key)
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+
+    open_links = db.get_open_rfqs_for_supplier(req.supplier_id)
+    candidates = []
+    candidate_ids = set()
+
+    for link in open_links:
+        rfq = link.get("rfqs") or {}
+        if rfq.get("client_id") != req.client_id or not rfq.get("id"):
+            continue
+        candidate_ids.add(rfq["id"])
+
+        quote_res = (
+            db.supabase.table("quotes")
+            .select("id,price,quantity,delivery_time,is_available,is_accepted,created_at")
+            .eq("rfq_id", rfq["id"])
+            .eq("supplier_id", req.supplier_id)
+            .order("created_at", desc=True)
+            .limit(3)
+            .execute()
+        )
+        quote_rows = quote_res.data or []
+        latest_quote = quote_rows[0] if quote_rows else None
+
+        session = db.get_active_negotiation_session(req.client_id, rfq["id"], req.supplier_id)
+
+        recent_res = (
+            db.supabase.table("message_log")
+            .select("id,direction,body,created_at,external_message_id")
+            .eq("client_id", req.client_id)
+            .eq("supplier_id", req.supplier_id)
+            .eq("related_rfq_id", rfq["id"])
+            .order("created_at", desc=True)
+            .limit(5)
+            .execute()
+        )
+
+        candidates.append({
+            "rfq_id": rfq["id"],
+            "product_name": rfq.get("product_name"),
+            "specs": rfq.get("specs"),
+            "quantity": rfq.get("quantity"),
+            "category": rfq.get("category"),
+            "due_by": rfq.get("due_by"),
+            "supplier_status": link.get("status"),
+            "negotiation_attempts": link.get("negotiation_attempts") or 0,
+            "has_quote_history": bool(quote_rows),
+            "latest_quote": latest_quote,
+            "active_negotiation": bool(session),
+            "recent_rfq_messages": recent_res.data or [],
+        })
+
+    if not candidates:
+        return {
+            "status": "NO_MATCH",
+            "resolved_rfq_id": None,
+            "candidates": [],
+            "reason": "Supplier has no open delivered RFQ candidates.",
+        }
+
+    # 1) Native reply / stanza context is strongest when we have the external id.
+    if req.reply_to_message_id:
+        msg_res = (
+            db.supabase.table("message_log")
+            .select("id,related_rfq_id,body,external_message_id,external_alt_message_id")
+            .eq("client_id", req.client_id)
+            .eq("supplier_id", req.supplier_id)
+            .or_(
+                f"external_message_id.eq.{req.reply_to_message_id},"
+                f"external_alt_message_id.eq.{req.reply_to_message_id}"
+            )
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if msg_res.data:
+            linked = msg_res.data[0].get("related_rfq_id")
+            if linked in candidate_ids:
+                return {
+                    "status": "RESOLVED",
+                    "resolved_rfq_id": linked,
+                    "confidence": "very_high",
+                    "reason": "Native WhatsApp reply context matched a logged RFQ message.",
+                    "candidates": [x for x in candidates if x["rfq_id"] == linked],
+                }
+
+    # 2) If exactly one RFQ has an in-flight negotiation, it is a strong default
+    # for negotiation-like messages, unless stronger explicit context points elsewhere.
+    active_negotiations = [x for x in candidates if x.get("active_negotiation")]
+
+    # 3) Explicit product/spec clues can strongly narrow the set.
+    message_norm = " ".join((req.message or "").lower().split())
+    explicit_matches = []
+    if message_norm:
+        for cand in candidates:
+            product = " ".join(str(cand.get("product_name") or "").lower().split())
+            specs = " ".join(str(cand.get("specs") or "").lower().split())
+            product_tokens = [t for t in product.replace("/", " ").replace("-", " ").split() if len(t) >= 3]
+            spec_tokens = [t for t in specs.replace("/", " ").replace("-", " ").split() if len(t) >= 3]
+            product_hit = bool(product and (product in message_norm or (product_tokens and all(t in message_norm for t in product_tokens))))
+            spec_hit = bool(spec_tokens and len(spec_tokens) <= 4 and all(t in message_norm for t in spec_tokens))
+            if product_hit or spec_hit:
+                explicit_matches.append(cand)
+
+    if len(explicit_matches) == 1:
+        chosen = explicit_matches[0]
+        return {
+            "status": "RESOLVED",
+            "resolved_rfq_id": chosen["rfq_id"],
+            "confidence": "high",
+            "reason": "Current supplier message explicitly matches one open RFQ's product/specification.",
+            "candidates": [chosen],
+        }
+
+    if len(active_negotiations) == 1 and not explicit_matches:
+        chosen = active_negotiations[0]
+        return {
+            "status": "RESOLVED",
+            "resolved_rfq_id": chosen["rfq_id"],
+            "confidence": "high",
+            "reason": "Exactly one open RFQ has an in-flight negotiation for this supplier.",
+            "candidates": [chosen],
+        }
+
+    # 4) Deduction: remove obviously completed/unavailable candidates when there
+    # are other live candidates, but keep them if the current message explicitly
+    # references their product so a supplier can revise/reopen context naturally.
+    reduced = []
+    for cand in candidates:
+        latest = cand.get("latest_quote") or {}
+        unavailable = bool(latest) and latest.get("is_available") is False
+        accepted = bool(latest) and latest.get("is_accepted") is True
+
+        if accepted and cand not in explicit_matches:
+            continue
+        if unavailable and cand not in explicit_matches and len(candidates) > 1:
+            continue
+        reduced.append(cand)
+
+    if not reduced:
+        reduced = candidates
+
+    # 5) Prefer at most three genuinely plausible candidates for clarification.
+    # Ordering is contextual: active negotiation, explicit match, unquoted/new,
+    # then most recent RFQ conversation.
+    def rank(cand):
+        score = 0
+        if cand in explicit_matches:
+            score += 100
+        if cand.get("active_negotiation"):
+            score += 80
+        if not cand.get("has_quote_history"):
+            score += 25
+        if cand.get("recent_rfq_messages"):
+            score += 15
+        if cand.get("supplier_status") == "responded":
+            score += 5
+        return score
+
+    reduced = sorted(reduced, key=rank, reverse=True)[:3]
+
+    if len(reduced) == 1:
+        return {
+            "status": "RESOLVED",
+            "resolved_rfq_id": reduced[0]["rfq_id"],
+            "confidence": "medium",
+            "reason": "Deduction left only one plausible open RFQ.",
+            "candidates": reduced,
+        }
+
+    return {
+        "status": "AMBIGUOUS",
+        "resolved_rfq_id": None,
+        "confidence": "low",
+        "reason": "More than one RFQ remains genuinely plausible after strong-context matching and deduction.",
+        "candidates": reduced,
+        "clarification_guidance": (
+            "Ask one short clarification question naming only these remaining candidates. "
+            "Do not list every RFQ linked to the supplier."
+        ),
+    }
+
+
+@router.post("/pending-commercial-draft")
+def save_pending_commercial_draft(
+    req: PendingCommercialDraftRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """Persist extracted commercial facts before asking an RFQ clarification."""
+    _require_openclaw_key(x_openclaw_key)
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+
+    clean_ids = []
+    for rfq_id in req.candidate_rfq_ids[:3]:
+        rfq = db.get_rfq_by_id(rfq_id, client_id=req.client_id)
+        if rfq:
+            clean_ids.append(rfq_id)
+
+    payload = {
+        "client_id": req.client_id,
+        "supplier_id": req.supplier_id,
+        "source_message_id": req.source_message_id,
+        "reply_to_message_id": req.reply_to_message_id,
+        "reply_to_body": req.reply_to_body,
+        "raw_message": req.raw_message,
+        "message_kind": req.message_kind,
+        "candidate_rfq_ids": clean_ids,
+        "extracted_facts": req.extracted_facts or {},
+        "status": "awaiting_rfq_resolution",
+        "updated_at": db.datetime.now(db.timezone.utc).isoformat(),
+    }
+
+    if req.source_message_id:
+        existing = (
+            db.supabase.table("pending_commercial_drafts")
+            .select("*")
+            .eq("client_id", req.client_id)
+            .eq("supplier_id", req.supplier_id)
+            .eq("source_message_id", req.source_message_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            row = (
+                db.supabase.table("pending_commercial_drafts")
+                .update(payload)
+                .eq("id", existing.data[0]["id"])
+                .execute()
+            )
+            return {"saved": True, "draft": row.data[0] if row.data else existing.data[0]}
+
+    row = db.supabase.table("pending_commercial_drafts").insert(payload).execute()
+    if not row.data:
+        raise HTTPException(status_code=500, detail="Pending commercial draft could not be persisted.")
+    return {"saved": True, "draft": row.data[0]}
+
+
+@router.post("/resolve-commercial-draft")
+def resolve_commercial_draft(
+    req: ResolveCommercialDraftRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """Resolve an existing commercial draft to one RFQ without losing extracted facts."""
+    _require_openclaw_key(x_openclaw_key)
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+
+    res = (
+        db.supabase.table("pending_commercial_drafts")
+        .select("*")
+        .eq("id", req.draft_id)
+        .eq("client_id", req.client_id)
+        .eq("supplier_id", req.supplier_id)
+        .eq("status", "awaiting_rfq_resolution")
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Pending commercial draft not found.")
+
+    draft = res.data[0]
+    candidates = draft.get("candidate_rfq_ids") or []
+    if candidates and req.rfq_id not in candidates:
+        raise HTTPException(status_code=409, detail="Selected RFQ was not one of the draft's remaining candidates.")
+
+    now_iso = db.datetime.now(db.timezone.utc).isoformat()
+    upd = (
+        db.supabase.table("pending_commercial_drafts")
+        .update({
+            "status": "resolved",
+            "resolved_rfq_id": req.rfq_id,
+            "resolved_at": now_iso,
+            "updated_at": now_iso,
+        })
+        .eq("id", req.draft_id)
+        .execute()
+    )
+    resolved = upd.data[0] if upd.data else {**draft, "status": "resolved", "resolved_rfq_id": req.rfq_id}
+    return {
+        "resolved": True,
+        "rfq_id": req.rfq_id,
+        "draft": resolved,
+        "extracted_facts": resolved.get("extracted_facts") or {},
+        "raw_message": resolved.get("raw_message"),
+        "instruction": (
+            "Continue from the preserved facts. Do not ask the supplier to repeat price, quantity, "
+            "delivery, or other terms already present in extracted_facts."
+        ),
     }
 
 
