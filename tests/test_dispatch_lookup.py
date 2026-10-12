@@ -6,9 +6,6 @@ os.environ.setdefault("SUPABASE_URL", "https://localhost.supabase.co")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "test-service-key")
 os.environ.setdefault("GROQ_API_KEY", "test-groq-key")
 import db
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-import main
 
 
 class DispatchAndIgnoreTests(unittest.TestCase):
