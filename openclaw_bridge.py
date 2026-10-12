@@ -627,22 +627,18 @@ def review_commercial_action(
                     outcome = "ESCALATE"
                     feedback = "The proposed delivery extension is outside explicit autonomous authority."
 
-    # Verify exact supplier-facing wording semantically, not by keyword lists.
-    # No outbound approval may be issued unless the text itself was checked.
+    approved_text = None
     if outcome == "APPROVE":
-        if not req.proposed_message:
-            outcome = "RETRY"
-            feedback = "Supply the exact proposed_message for semantic evaluation."
+        if action in {"counter", "counteroffer", "negotiate"} and rfq and set(proposal).issubset({"price", "quantity", "delivery_days"}):
+            price = float(proposal["price"])
+            approved_text = f"Thank you for your quote. Could you offer AED {price:g} per unit for this order?"
+        elif action in {"ask", "clarify", "request_info", "request_price"} and rfq and not proposal:
+            approved_text = "Thank you. Could you confirm your best unit price in AED and estimated delivery time?"
+        elif action in {"acknowledge", "acknowledgement"} and not proposal:
+            approved_text = "Thank you. We've received your quotation."
         else:
-            from semantic_commercial_evaluator import evaluate_commercial_message
-            semantic = evaluate_commercial_message(
-                proposed_message=req.proposed_message,
-                declared_action=action,
-                proposal=proposal,
-            )
-            if not semantic["safe"]:
-                outcome = "ESCALATE"
-                feedback = "Outgoing message requires review: " + semantic["reason"]
+            outcome = "REJECT"
+            feedback = "Structured action unsupported. Use validated counter, information request or acknowledgement."
 
     # Two model correction attempts maximum. After that, fail safe to human review.
     if outcome in {"ADJUST", "RETRY"} and req.attempt_number >= 2:
@@ -681,8 +677,8 @@ def review_commercial_action(
         "feedback": feedback,
         "adjusted_action": adjusted,
         "attempt_number": req.attempt_number,
-        "hard_guard_only": False,
-        "approved_message": req.proposed_message if outcome == "APPROVE" else None,
+        "hard_guard_only": True,
+        "approved_message": approved_text if outcome == "APPROVE" else None,
         "supplier_id": supplier.get("id"),
         "rfq_id": req.rfq_id,
     }
