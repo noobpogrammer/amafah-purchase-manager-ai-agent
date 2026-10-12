@@ -494,6 +494,21 @@ def review_commercial_action(
 
     action = (req.action_type or "").strip().lower()
     proposal = req.proposal or {}
+    if not isinstance(proposal, dict):
+        raise HTTPException(status_code=422, detail="proposal must be a JSON object")
+    # Reject malformed commercial JSON before evaluating numeric constraints.
+    if action in {"counter", "counteroffer", "negotiate"}:
+        required = {"price", "quantity", "delivery_days"}
+        if set(proposal) != required:
+            raise HTTPException(status_code=422, detail="Counter requires exactly price, quantity, delivery_days")
+        if (type(proposal["price"]) not in (int, float)
+            or type(proposal["quantity"]) is not int
+            or type(proposal["delivery_days"]) is not int):
+            raise HTTPException(status_code=422, detail="Invalid counter field types")
+        if (not __import__("math").isfinite(proposal["price"])
+            or proposal["price"] <= 0 or proposal["quantity"] <= 0
+            or proposal["delivery_days"] < 0):
+            raise HTTPException(status_code=422, detail="Invalid counter values")
     rfq = None
     active_session = None
     if req.rfq_id:
@@ -627,22 +642,34 @@ def review_commercial_action(
                     outcome = "ESCALATE"
                     feedback = "The proposed delivery extension is outside explicit autonomous authority."
 
-    # Verify exact supplier-facing wording semantically, not by keyword lists.
-    # No outbound approval may be issued unless the text itself was checked.
+    # Commercial evaluator checks typed action data only, never LLM prose.
+    # Hard boundaries above remain authoritative.
+    approved_text = None
     if outcome == "APPROVE":
-        if not req.proposed_message:
-            outcome = "RETRY"
-            feedback = "Supply the exact proposed_message for semantic evaluation."
+        if action in {"counter", "counteroffer", "negotiate"}:
+            if not rfq or set(proposal) != {"price", "quantity", "delivery_days"}:
+                outcome, feedback = "RETRY", "Counter requires RFQ plus exactly price, quantity, delivery_days."
+            elif (isinstance(proposal["price"], bool)
+                  or not isinstance(proposal["price"], (int, float))
+                  or not isinstance(proposal["quantity"], int)
+                  or isinstance(proposal["quantity"], bool)
+                  or not isinstance(proposal["delivery_days"], int)
+                  or isinstance(proposal["delivery_days"], bool)):
+                outcome, feedback = "RETRY", "Counter fields must be numeric price and integer quantity/delivery_days."
+            elif proposal["quantity"] <= 0 or proposal["delivery_days"] < 0:
+                outcome, feedback = "RETRY", "Invalid quantity or delivery_days."
+            else:
+                approved_text = (
+                    f"Thank you for your quotation. Could you offer AED "
+                    f"{float(proposal['price']):g} per unit for {proposal['quantity']} units "
+                    f"with delivery within {proposal['delivery_days']} day(s)?"
+                )
+        elif action in {"ask", "clarify", "request_info", "request_price"} and rfq and not proposal:
+            approved_text = "Thank you. Could you confirm your best unit price in AED and estimated delivery time?"
+        elif action in {"acknowledge", "acknowledgement"} and rfq and not proposal:
+            approved_text = "Thank you. We've received your quotation."
         else:
-            from semantic_commercial_evaluator import evaluate_commercial_message
-            semantic = evaluate_commercial_message(
-                proposed_message=req.proposed_message,
-                declared_action=action,
-                proposal=proposal,
-            )
-            if not semantic["safe"]:
-                outcome = "ESCALATE"
-                feedback = "Outgoing message requires review: " + semantic["reason"]
+            outcome, feedback = "REJECT", "Unsupported structured action or missing RFQ; no message authorized."
 
     # Two model correction attempts maximum. After that, fail safe to human review.
     if outcome in {"ADJUST", "RETRY"} and req.attempt_number >= 2:
@@ -681,8 +708,8 @@ def review_commercial_action(
         "feedback": feedback,
         "adjusted_action": adjusted,
         "attempt_number": req.attempt_number,
-        "hard_guard_only": False,
-        "approved_message": req.proposed_message if outcome == "APPROVE" else None,
+        "hard_guard_only": True,
+        "approved_message": approved_text if outcome == "APPROVE" else None,
         "supplier_id": supplier.get("id"),
         "rfq_id": req.rfq_id,
     }
@@ -1550,7 +1577,28 @@ def accept_negotiated_quote(
 ):
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
-    _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    # A separate acceptance endpoint must enforce the same buyer limits as
+    # counteroffers; reviewing a counter cannot authorize accepting a deal.
+    if not req.quote_id:
+        raise HTTPException(status_code=422, detail="Acceptance requires an exact persisted quote_id.")
+    quote_res = (
+        db.supabase.table("quotes").select("id,price,quantity,is_available")
+        .eq("id", req.quote_id).eq("rfq_id", req.rfq_id)
+        .eq("supplier_id", req.supplier_id).limit(1).execute()
+    )
+    quote = quote_res.data[0] if quote_res.data else None
+    if not quote or not quote.get("is_available") or quote.get("price") is None:
+        raise HTTPException(status_code=409, detail="Quote is not available for acceptance.")
+    price_cap = rfq.get("acceptable_price_max")
+    if price_cap is not None and float(quote["price"]) > float(price_cap):
+        raise HTTPException(status_code=409, detail="Quote exceeds buyer-approved maximum; human override required.")
+    if req.price is not None and float(req.price) != float(quote["price"]):
+        raise HTTPException(status_code=409, detail="Acceptance price differs from persisted quote.")
+    authorized_quantity = rfq.get("quantity")
+    if authorized_quantity is not None and quote.get("quantity") is not None:
+        if int(quote["quantity"]) != int(authorized_quantity):
+            raise HTTPException(status_code=409, detail="Quote quantity differs from RFQ; human approval required.")
 
     accepted = db.accept_recorded_quote(
         req.client_id,
