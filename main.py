@@ -1327,6 +1327,15 @@ async def lifespan(app: FastAPI):
 
     print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Starting RFQ deadline/reminder scheduler; WhatsApp delivery is OpenClaw-only.")
     scheduler.add_job(
+        flush_pending_initial_rfq_bundles,
+        "interval",
+        seconds=30,
+        max_instances=1,
+        coalesce=True,
+        id="flush_initial_rfq_bundles",
+        replace_existing=True,
+    )
+    scheduler.add_job(
         check_deadlines_and_reminders,
         "interval",
         minutes=15,
@@ -2778,6 +2787,122 @@ async def reset_password(payload: PasswordResetRequest, request: Request):
     return {"status": "password_updated"}
 
 
+
+def stage_initial_rfq_for_bundling(client_id: str, supplier_id: str, rfq_id: str) -> None:
+    """Queue a new RFQ for a 30-second supplier-level bundling window."""
+    link = (
+        db.supabase.table("rfq_suppliers").select("id")
+        .eq("rfq_id", rfq_id).eq("supplier_id", supplier_id).limit(1).execute()
+    )
+    if not link.data:
+        raise RuntimeError("Cannot queue RFQ: missing supplier relationship.")
+    due = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+    created = db.supabase.table("supplier_message_bundle_items").insert({
+        "client_id": client_id,
+        "supplier_id": supplier_id,
+        "rfq_id": rfq_id,
+        "rfq_supplier_id": link.data[0]["id"],
+        "kind": "initial_rfq",
+        "status": "pending",
+        "available_at": due,
+    }).execute()
+    if not created.data:
+        raise RuntimeError("Could not durably queue RFQ for supplier bundling.")
+
+
+async def flush_pending_initial_rfq_bundles():
+    """Claim due RFQ invitations with a DB row lock and send once per bundle.
+
+    Sending after an uncertain network failure is NEVER retried automatically:
+    the durable log and bundle remain marked failed/unknown for manual review.
+    """
+    cutoff = datetime.now(timezone.utc).isoformat()
+    try:
+        due = (
+            db.supabase.table("supplier_message_bundle_items")
+            .select("client_id,supplier_id")
+            .eq("kind", "initial_rfq")
+            .eq("status", "pending")
+            .is_("bundle_id", "null")
+            .lte("available_at", cutoff)
+            .limit(500)
+            .execute()
+        )
+    except Exception:
+        logger.exception("Could not fetch pending initial RFQ bundle queue.")
+        return
+
+    pairs = {(row["client_id"], row["supplier_id"]) for row in (due.data or [])}
+    for client_id, supplier_id in pairs:
+        if db.is_client_automation_paused(client_id):
+            continue
+        while True:
+            try:
+                claimed = db.supabase.rpc("claim_initial_supplier_bundle", {
+                    "p_client_id": client_id,
+                    "p_supplier_id": supplier_id,
+                    "p_limit": 8,
+                }).execute()
+                batch = claimed.data if claimed else None
+                if not batch or not batch.get("items"):
+                    break
+                bundle_id = batch["bundle_id"]
+                items = batch["items"]
+                supplier = db.get_supplier_by_id(supplier_id)
+                if not supplier or not supplier.get("phone_number") or db.is_client_automation_paused(client_id):
+                    raise RuntimeError("Supplier not reachable or client paused before dispatch")
+                plans = [BundleItem(
+                    rfq_id=str(item["rfq_id"]),
+                    product_name=item["product_name"],
+                    quantity=item.get("quantity"),
+                    specs=item.get("specs"),
+                    deadline_hours=item.get("deadline_hours"),
+                    required_delivery_days=item.get("required_delivery_days"),
+                ) for item in items]
+                msg = format_supplier_bundle(plans)
+                db.supabase.table("supplier_message_bundles").update({
+                    "message": msg,
+                }).eq("id", bundle_id).execute()
+                log_id = db.log_message(client_id, supplier_id, "outbound", msg, related_rfq_id=plans[0].rfq_id)
+                if not log_id:
+                    raise RuntimeError("Failed to durably log grouped RFQ invitation")
+                did_send = await enqueue_message(
+                    supplier["phone_number"], msg, supplier_id=supplier_id, message_log_id=log_id,
+                )
+                if not did_send:
+                    raise RuntimeError("Outbound not confirmed; do not automatically retry")
+                log = db.supabase.table("message_log").select("sent_at,external_message_id").eq("id", log_id).limit(1).execute()
+                sent_log = log.data[0] if log.data else {}
+                if not sent_log.get("sent_at"):
+                    raise RuntimeError("Sent invitation missing durable timestamp")
+                db.supabase.table("supplier_message_bundles").update({
+                    "status": "sent",
+                    "sent_at": sent_log["sent_at"],
+                    "external_message_id": sent_log.get("external_message_id"),
+                }).eq("id", bundle_id).execute()
+                db.supabase.table("supplier_message_bundle_items").update({
+                    "status": "sent",
+                }).eq("bundle_id", bundle_id).execute()
+                if sent_log.get("external_message_id"):
+                    for item in plans:
+                        db.update_rfq_supplier_sent_message_id(item.rfq_id, supplier_id, sent_log["external_message_id"])
+                await asyncio.sleep(random.uniform(OUTBOUND_MIN_DELAY, OUTBOUND_MAX_DELAY))
+            except Exception as exc:
+                logger.exception("Initial RFQ supplier bundle dispatch failed for %s: %s", supplier_id, exc)
+                if "bundle_id" in locals() and bundle_id:
+                    try:
+                        db.supabase.table("supplier_message_bundles").update({
+                            "status": "failed",
+                            "error_message": str(exc)[:300],
+                        }).eq("id", bundle_id).execute()
+                        db.supabase.table("supplier_message_bundle_items").update({
+                            "status": "failed",
+                        }).eq("bundle_id", bundle_id).execute()
+                    except Exception:
+                        logger.exception("Could not flag ambiguous supplier bundle delivery")
+                break
+
+
 @app.post("/rfq/create")
 async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_current_user)):
     """Create an RFQ and send it to category matches or explicitly selected suppliers."""
@@ -2819,26 +2944,15 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
             ),
         }
 
-    rfq_msg = build_rfq_invitation_message(
-        product_name=req.product_name,
-        specs=req.specs,
-        quantity=req.quantity,
-        deadline_hours=req.deadline_hours,
-        required_delivery_days=req.required_delivery_days,
-    )
-
     for supplier in matched_suppliers:
-        msg_log_id = db.log_message(client_id, supplier["id"], "outbound", rfq_msg, related_rfq_id=rfq["id"])
-        await enqueue_message(
-            supplier["phone_number"],
-            rfq_msg,
-            rfq_id=rfq["id"],
-            supplier_id=supplier["id"],
-            message_log_id=msg_log_id,
-        )
+        if db.is_client_automation_paused(client_id):
+            continue
+        if supplier.get("phone_number"):
+            stage_initial_rfq_for_bundling(client_id, supplier["id"], rfq["id"])
 
     return {
         "status": "success",
+        "delivery_status": "queued_for_bundling" if not db.is_client_automation_paused(client_id) else "automation_paused",
         "rfq_id": rfq["id"],
         "categories": req.categories,
         "targeting_mode": req.targeting_mode,
