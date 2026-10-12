@@ -169,7 +169,7 @@ export async function fetchRFQs() {
 
   const { data, error } = await supabase
     .from('rfqs')
-    .select('*, rfq_suppliers(id, status, supplier_id, suppliers(name)), quotes(id)')
+    .select('*, rfq_suppliers(id, status, commercial_state, pending_revision_quote_id, current_accepted_quote_id, supplier_id, suppliers(name)), quotes(id)')
     .eq('client_id', clientId)
     .order('created_at', { ascending: false });
   if (error) throw error;
@@ -205,12 +205,32 @@ export async function fetchRFQDetail(rfqId) {
     }
   });
 
+  // Include delivery recorded for multi-RFQ WhatsApp bundles. Only the first
+  // RFQ has related_rfq_id in legacy message_log; the bundle item table owns
+  // delivery correlation for every other RFQ included in that same message.
+  const { data: bundleItemData, error: bundleError } = await supabase
+    .from('supplier_message_bundle_items')
+    .select('rfq_id, supplier_id, kind, status, bundle_id, supplier_message_bundles(status, sent_at)')
+    .eq('rfq_id', rfqId)
+    .eq('kind', 'initial_rfq')
+    .order('created_at', { ascending: true });
+  if (bundleError) throw bundleError;
+  const initialBundleBySupplier = {};
+  (bundleItemData || []).forEach((item) => {
+    const linked = item.supplier_message_bundles;
+    if (item.supplier_id && item.status === 'sent' && linked?.status === 'sent' && linked?.sent_at
+        && !initialBundleBySupplier[item.supplier_id]) {
+      initialBundleBySupplier[item.supplier_id] = linked;
+    }
+  });
+
   const suppliers = (suppliersRes.data || []).map((item) => {
     const delivery = initialDeliveryBySupplier[item.supplier_id] || null;
+    const bundleDelivery = initialBundleBySupplier[item.supplier_id] || null;
     return {
       ...item,
-      delivery_status: delivery?.status || null,
-      delivery_sent_at: delivery?.sent_at || null,
+      delivery_status: bundleDelivery?.status || delivery?.status || null,
+      delivery_sent_at: bundleDelivery?.sent_at || delivery?.sent_at || null,
       delivery_error: delivery?.error_message || null,
       delivery_message_log_id: delivery?.id || null,
     };
@@ -231,6 +251,7 @@ export async function fetchRFQDetail(rfqId) {
   });
 
   const effectiveQuotes = [];
+  const supplierLifecycle = new Map(suppliers.map((supplier) => [supplier.supplier_id, supplier]));
   groupedQuotes.forEach((history) => {
     if (!history.length) return;
     const latest = { ...history[0] };
@@ -252,6 +273,13 @@ export async function fetchRFQDetail(rfqId) {
     }
 
     latest.revision_count = history.length;
+    const lifecycle = supplierLifecycle.get(latest.supplier_id);
+    latest.commercial_state = lifecycle?.commercial_state || 'unaccepted';
+    latest.is_pending_revision = latest.commercial_state === 'revision_pending'
+      && lifecycle?.pending_revision_quote_id === latest.id;
+    latest.is_current_accepted = latest.is_current_accepted === true
+      && latest.commercial_state === 'accepted'
+      && lifecycle?.current_accepted_quote_id === latest.id;
 
     if (latest.is_available !== false && latest.price !== null && latest.price !== undefined) {
       effectiveQuotes.push(latest);
