@@ -1842,6 +1842,7 @@ def accept_recorded_quote(
     price: float | None = None,
     quantity: int | None = None,
     accepted_by: str = "operator",
+    quote_id: str | None = None,
 ) -> dict | None:
     """Mark the latest matching persisted quote as accepted.
 
@@ -1852,6 +1853,21 @@ def accept_recorded_quote(
     rfq = get_rfq_by_id(rfq_id)
     if not rfq or rfq.get("status") != "active":
         return None
+
+    # A withdrawn accepted deal must NEVER be revived by a fuzzy latest-quote
+    # selection. The exact pending revised quote ID is mandatory.
+    current_link = (
+        supabase.table("rfq_suppliers")
+        .select("commercial_state,pending_revision_quote_id")
+        .eq("rfq_id", rfq_id).eq("supplier_id", supplier_id).limit(1).execute()
+    )
+    link = current_link.data[0] if current_link.data else None
+    if not link:
+        return None
+    if link.get("commercial_state") == "revision_pending":
+        if not quote_id or str(quote_id) != str(link.get("pending_revision_quote_id")):
+            logger.warning("Acceptance blocked: explicit pending revision quote ID required.")
+            return None
 
     after_deadline = not is_rfq_open(rfq)
     session = get_active_negotiation_session(client_id, rfq_id, supplier_id)
@@ -1866,6 +1882,8 @@ def accept_recorded_quote(
             .eq("supplier_id", supplier_id)
             .eq("is_available", True)
         )
+        if quote_id is not None:
+            q = q.eq("id", quote_id)
         if price is not None:
             q = q.eq("price", price)
         if quantity is not None:
@@ -1875,20 +1893,19 @@ def accept_recorded_quote(
             return None
 
         quote = res.data[0]
-        now_utc = datetime.now(timezone.utc).isoformat()
-        upd = (
-            supabase.table("quotes")
-            .update({
-                "is_accepted": True,
-                "accepted_at": now_utc,
-                "accepted_by": accepted_by,
-            })
-            .eq("id", quote["id"])
-            .execute()
-        )
-        accepted = upd.data[0] if upd.data else None
-        if not accepted:
+        # Database RPC changes historical and current acceptance together.
+        # Never flag an accepted row before the pointer and revision state commit.
+        result = supabase.rpc("select_current_supplier_quote", {
+            "p_client_id": client_id,
+            "p_supplier_id": supplier_id,
+            "p_rfq_id": rfq_id,
+            "p_quote_id": quote["id"],
+            "p_accepted_by": accepted_by,
+        }).execute()
+        if not result.data:
             return None
+        accepted = dict(quote)
+        accepted.update({"is_accepted": True, "is_current_accepted": True})
 
         if session and session.get("id"):
             complete_negotiation_session(
@@ -1905,6 +1922,21 @@ def accept_recorded_quote(
         return accepted
     except Exception as e:
         logger.error("accept_recorded_quote error: %s", e)
+        return None
+
+
+def mark_supplier_quote_revision(client_id: str, rfq_id: str, supplier_id: str, new_quote_id: str) -> dict | None:
+    """Invalidate the current accepted deal but preserve historical acceptance."""
+    try:
+        result = supabase.rpc("mark_supplier_quote_revision", {
+            "p_client_id": client_id,
+            "p_supplier_id": supplier_id,
+            "p_rfq_id": rfq_id,
+            "p_new_quote_id": new_quote_id,
+        }).execute()
+        return result.data
+    except Exception as exc:
+        logger.error("mark_supplier_quote_revision failed: %s", exc)
         return None
 
 
@@ -2883,6 +2915,28 @@ def get_initial_rfq_delivery_status(rfq_id: str, supplier_id: str) -> Optional[d
     if not rfq_id or not supplier_id:
         return None
     try:
+        bundle_items = (
+            supabase.table("supplier_message_bundle_items")
+            .select("bundle_id")
+            .eq("rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .eq("kind", "initial_rfq")
+            .eq("status", "sent")
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+        if bundle_items.data and bundle_items.data[0].get("bundle_id"):
+            linked = (
+                supabase.table("supplier_message_bundles")
+                .select("id,status,sent_at,created_at")
+                .eq("id", bundle_items.data[0]["bundle_id"])
+                .eq("status", "sent")
+                .limit(1)
+                .execute()
+            )
+            if linked.data:
+                return linked.data[0]
         res = (
             supabase.table("message_log")
             .select("id, status, sent_at, error_message, created_at")

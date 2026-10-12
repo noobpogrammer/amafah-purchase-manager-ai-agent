@@ -82,6 +82,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
   const quotes = reportData?.quotes || [];
   const quoteHistory = reportData?.quoteHistory || [];
   const ranking = reportData?.ranking;
+  const hasPendingRevision = quotes.some((q) => q.is_pending_revision);
 
   const getSupplierName = (supplierId) => {
     if (!supplierId) return null;
@@ -97,9 +98,9 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
 
   // Find best offer details from ranking
   const bestQuoteId = ranking?.best_quote_id || ranking?.ranking_json?.best_quote_id || null;
-  const winningQuote = bestQuoteId ? quotes.find((q) => q.id === bestQuoteId) : null;
+  const winningQuote = !hasPendingRevision && bestQuoteId ? quotes.find((q) => q.id === bestQuoteId) : null;
 
-  let bestOfferTitle = 'Best Offer';
+  let bestOfferTitle = hasPendingRevision ? 'Revision pending review' : 'Best Offer';
   let bestOfferSub = null;
 
   if (winningQuote) {
@@ -107,7 +108,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
     const varText = winningQuote.variant_label ? ` — ${winningQuote.variant_label}` : '';
     bestOfferTitle = `${suppName}${varText}`;
     bestOfferSub = `AED ${winningQuote.price} | Delivery: ${winningQuote.delivery_time || 'Not specified'}${winningQuote.quality_notes ? ` | Notes: ${winningQuote.quality_notes}` : ''}`;
-  } else if (ranking?.best_supplier_id) {
+  } else if (!hasPendingRevision && ranking?.best_supplier_id) {
     const matched = getSupplierName(ranking.best_supplier_id);
     if (matched) {
       bestOfferTitle = matched;
@@ -226,6 +227,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                   <tr>
                     <th>Supplier</th>
                     <th>Variant</th>
+                    <th>Deal Status</th>
                     <th>Quoted Price</th>
                     <th>Delivery Time</th>
                     <th>Quality / Warranty</th>
@@ -235,7 +237,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                 </thead>
                 <tbody>
                   {quotes.map((q) => {
-                    const isBest = bestQuoteId
+                    const isBest = !hasPendingRevision && bestQuoteId
                       ? q.id === bestQuoteId
                       : (ranking?.best_supplier_id === q.supplier_id && quotes.filter((x) => x.supplier_id === ranking.best_supplier_id).length === 1);
 
@@ -254,6 +256,15 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                             <span className="badge badge-category">{q.variant_label}</span>
                           ) : (
                             <span style={{ color: 'var(--text-muted)' }}>—</span>
+                          )}
+                        </td>
+                        <td>
+                          {q.is_pending_revision ? (
+                            <span className="badge badge-warning">Revision pending — previous accepted offer withdrawn</span>
+                          ) : q.is_current_accepted ? (
+                            <span className="badge badge-best">Currently accepted</span>
+                          ) : (
+                            <span style={{ color: 'var(--text-muted)' }}>Not accepted</span>
                           )}
                         </td>
                         <td>
@@ -307,6 +318,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                     <tr>
                       <th>Supplier</th>
                       <th>Quoted Price</th>
+                      <th>Acceptance History</th>
                       <th>Delivery Time</th>
                       <th>Raw WhatsApp Reply</th>
                     </tr>
@@ -316,6 +328,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                       <tr key={q.id}>
                         <td>{q.suppliers?.name || 'Supplier'}</td>
                         <td>AED {q.price}</td>
+                        <td>{q.is_current_accepted ? 'Currently accepted' : q.is_accepted ? 'Previously accepted (historical)' : 'Not accepted'}</td>
                         <td>{q.delivery_time || 'Not specified'}</td>
                         <td className="raw-msg-cell">
                           <span className="raw-msg-text">"{q.raw_message}"</span>

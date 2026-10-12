@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 
 import db
 import negotiation_engine
+import groq_client
+from supplier_message_planner import validate_multi_rfq_quotes, AmbiguousSupplierQuote
 
 
 router = APIRouter(prefix="/openclaw", tags=["openclaw"])
@@ -144,6 +146,7 @@ class AcceptNegotiatedQuoteRequest(BaseModel):
     rfq_id: str
     price: Optional[float] = Field(default=None, gt=0)
     quantity: Optional[int] = Field(default=None, gt=0)
+    quote_id: Optional[str] = None
     accepted_by: str = "openclaw"
 
 
@@ -578,6 +581,47 @@ def resolve_rfq_context(
             "reason": "Supplier has no open delivered RFQ candidates.",
         }
 
+    # Bundled outbound messages have one WhatsApp stanza for many RFQs.
+    # Never resolve a reply to the first associated RFQ just because message_log
+    # has one related_rfq_id for backwards compatibility.
+    if req.reply_to_message_id:
+        bundle_lookup = (
+            db.supabase.table("supplier_message_bundles")
+            .select("id")
+            .eq("client_id", req.client_id)
+            .eq("supplier_id", req.supplier_id)
+            .eq("external_message_id", req.reply_to_message_id)
+            .eq("status", "sent")
+            .limit(1)
+            .execute()
+        )
+        if bundle_lookup.data:
+            bundle_id = bundle_lookup.data[0]["id"]
+            bundle_items = (
+                db.supabase.table("supplier_message_bundle_items")
+                .select("rfq_id")
+                .eq("bundle_id", bundle_id)
+                .eq("client_id", req.client_id)
+                .eq("supplier_id", req.supplier_id)
+                .execute()
+            )
+            matched_ids = {row["rfq_id"] for row in (bundle_items.data or []) if row.get("rfq_id") in candidate_ids}
+            if len(matched_ids) == 1:
+                only_id = next(iter(matched_ids))
+                return {
+                    "status": "RESOLVED", "resolved_rfq_id": only_id,
+                    "confidence": "very_high",
+                    "reason": "Native WhatsApp reply matched a one-item bundle.",
+                    "candidates": [x for x in candidates if x["rfq_id"] == only_id],
+                }
+            return {
+                "status": "AMBIGUOUS", "resolved_rfq_id": None,
+                "confidence": "low",
+                "reason": "Reply references a multi-RFQ supplier bundle; resolve each quoted item explicitly.",
+                "candidates": [x for x in candidates if x["rfq_id"] in matched_ids],
+                "bundle_id": bundle_id,
+            }
+
     # 1) Native reply / stanza context is strongest when we have the external id.
     if req.reply_to_message_id:
         msg_res = (
@@ -711,7 +755,7 @@ def save_pending_commercial_draft(
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
 
     clean_ids = []
-    for rfq_id in req.candidate_rfq_ids[:3]:
+    for rfq_id in req.candidate_rfq_ids[:8]:
         rfq = db.get_rfq_by_id(rfq_id, client_id=req.client_id)
         if rfq:
             clean_ids.append(rfq_id)
@@ -741,6 +785,8 @@ def save_pending_commercial_draft(
             .execute()
         )
         if existing.data:
+            if existing.data[0].get("status") == "resolved":
+                return {"saved": True, "draft": existing.data[0], "already_resolved": True}
             row = (
                 db.supabase.table("pending_commercial_drafts")
                 .update(payload)
@@ -809,6 +855,149 @@ def resolve_commercial_draft(
     }
 
 
+
+class MultiItemSupplierQuoteRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    message: str
+    source_message_id: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
+
+
+@router.post("/parse-multi-item-quotes")
+def parse_multi_item_quotes(req: MultiItemSupplierQuoteRequest, x_openclaw_key: Optional[str] = Header(default=None)):
+    """Safely map several prices to authorized RFQs; no automatic persistence."""
+    _require_openclaw_key(x_openclaw_key)
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    links = [x for x in db.get_open_rfqs_for_supplier(req.supplier_id) if (x.get("rfqs") or {}).get("client_id") == req.client_id]
+    bundle_id = None
+    if req.reply_to_message_id:
+        found = (
+            db.supabase.table("supplier_message_bundles").select("id")
+            .eq("client_id", req.client_id).eq("supplier_id", req.supplier_id)
+            .eq("external_message_id", req.reply_to_message_id)
+            .eq("status", "sent").limit(1).execute()
+        )
+        if found.data:
+            bundle_id = found.data[0]["id"]
+            number_rows = (
+                db.supabase.table("supplier_message_bundle_items")
+                .select("rfq_id,item_position")
+                .eq("bundle_id", bundle_id)
+                .eq("client_id", req.client_id)
+                .eq("supplier_id", req.supplier_id)
+                .order("item_position").execute()
+            )
+            item_numbers = {str(row["rfq_id"]): row.get("item_position") for row in (number_rows.data or [])}
+            links = [
+                {**entry, "rfqs": {
+                    **entry["rfqs"],
+                    "item_number": item_numbers[str(entry["rfqs"]["id"])],
+                    "reference": str(entry["rfqs"]["id"])[:8],
+                }}
+                for entry in links if str(entry["rfqs"]["id"]) in item_numbers
+            ]
+    if len(links) < 2:
+        return {"status": "SINGLE_RFQ", "items": [], "bundle_id": bundle_id}
+    items = (groq_client.parse_multi_rfq_quotes(req.message, links) or {}).get("items") or []
+    if not items:
+        return {"status": "NO_ITEMS", "items": [], "bundle_id": bundle_id}
+    allowed_ids = [str(x["rfqs"]["id"]) for x in links]
+    safe_items = []
+    unresolved_items = []
+    for raw in items:
+        try:
+            valid = validate_multi_rfq_quotes([raw], allowed_ids)
+            item = valid[0]
+            safe_items.append({
+                **raw, "candidate_rfq_id": item.rfq_id,
+                "price": float(item.price),
+            })
+        except (AmbiguousSupplierQuote, ValueError, TypeError) as exc:
+            unresolved_items.append({
+                "product_reference": raw.get("product_reference"),
+                "price": raw.get("price"),
+                "quantity": raw.get("quantity"),
+                "delivery_time": raw.get("delivery_time"),
+                "reason": str(exc),
+            })
+    if unresolved_items:
+        return {
+            "status": "CLARIFICATION_REQUIRED",
+            "items": [],
+            "resolved_items": safe_items,
+            "unresolved_items": unresolved_items,
+            "bundle_id": bundle_id,
+            "candidate_rfqs": [
+                {"rfq_id": row["rfqs"]["id"], "product_name": row["rfqs"].get("product_name"),
+                 "item_number": row["rfqs"].get("item_number")}
+                for row in links
+            ],
+            "instruction": (
+                "Save the source message and all extracted facts in a pending commercial draft. "
+                "Ask one precise clarification for the unresolved line(s). Never repeat pricing "
+                "facts already captured. Record the batch only once every line is mapped."
+            ),
+        }
+    distinct_ids = {item["candidate_rfq_id"] for item in safe_items}
+    return {
+        "status": "MAPPED" if len(distinct_ids) >= 2 else "SINGLE_RFQ",
+        "items": safe_items,
+        "bundle_id": bundle_id,
+        "source_message_id": req.source_message_id,
+        "instruction": "Persist the entire mapped list atomically with record-multi-item-quotes before making commercial commitments.",
+    }
+
+
+
+@router.post("/process-multi-item-message")
+def process_multi_item_message(
+    req: MultiItemSupplierQuoteRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """One safe tool call: parse the COMPLETE message and atomically persist it.
+
+    If any item is unresolved, save all known facts for targeted clarification
+    and DO NOT persist a misleading partial commercial batch.
+    """
+    parsed = parse_multi_item_quotes(req, x_openclaw_key)
+    if parsed.get("status") == "CLARIFICATION_REQUIRED":
+        candidate_ids = [str(c["rfq_id"]) for c in parsed.get("candidate_rfqs") or []]
+        saved = save_pending_commercial_draft(
+            PendingCommercialDraftRequest(
+                client_id=req.client_id,
+                supplier_id=req.supplier_id,
+                raw_message=req.message,
+                candidate_rfq_ids=candidate_ids,
+                extracted_facts={
+                    "resolved_items": parsed.get("resolved_items") or [],
+                    "unresolved_items": parsed.get("unresolved_items") or [],
+                    "bundle_id": parsed.get("bundle_id"),
+                },
+                source_message_id=req.source_message_id,
+                reply_to_message_id=req.reply_to_message_id,
+                message_kind="multi_rfq_price_list",
+            ),
+            x_openclaw_key,
+        )
+        return {**parsed, "draft_id": (saved.get("draft") or {}).get("id")}
+    if parsed.get("status") != "MAPPED":
+        return parsed
+    if not req.source_message_id:
+        raise HTTPException(status_code=422, detail="Persist inbound message first and supply its internal message_log UUID.")
+    recorded = record_multi_item_quotes(
+        RecordMultiItemQuotesRequest(
+            client_id=req.client_id,
+            supplier_id=req.supplier_id,
+            source_message_id=req.source_message_id,
+            raw_message=req.message,
+            items=parsed["items"],
+        ),
+        x_openclaw_key,
+    )
+    return {"status": "MULTI_RFQ_RECORDED", "bundle_id": parsed.get("bundle_id"), "recording": recorded}
+
+
 @router.post("/supplier-context", dependencies=[])
 def supplier_context(
     req: SupplierContextRequest,
@@ -863,6 +1052,87 @@ def supplier_context(
         "conversation_history": history,
         "active_negotiation_session": active_session,
     }
+
+
+
+class RecordMultiItemQuotesRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    source_message_id: str
+    raw_message: str
+    items: list[dict] = Field(min_length=2)
+
+
+@router.post("/record-multi-item-quotes")
+def record_multi_item_quotes(req: RecordMultiItemQuotesRequest, x_openclaw_key: Optional[str] = Header(default=None)):
+    """Persist verified RFQ-specific variants; reject ambiguous batches before writes.
+
+    Caller must first parse and validate all items. Retried message/RFQ pairs
+    return existing rows; no supplier WhatsApp message is sent by this endpoint.
+    """
+    _require_openclaw_key(x_openclaw_key)
+    if db.is_client_automation_paused(req.client_id):
+        raise HTTPException(status_code=409, detail="Tenant is in human-only pause mode.")
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    links = [
+        x for x in db.get_open_rfqs_for_supplier(req.supplier_id)
+        if (x.get("rfqs") or {}).get("client_id") == req.client_id
+    ]
+    allowed_ids = [str(x["rfqs"]["id"]) for x in links]
+    try:
+        mapped = validate_multi_rfq_quotes(req.items, allowed_ids)
+    except AmbiguousSupplierQuote as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    grouped = {}
+    for original, item in zip(req.items, mapped):
+        grouped.setdefault(item.rfq_id, []).append({
+            "variant_label": item.variant_label,
+            "price": float(item.price),
+            "delivery_time": item.delivery_time,
+            "quantity": item.quantity,
+            "quality_notes": original.get("quality_notes"),
+            "is_available": True,
+        })
+    if len(grouped) < 2:
+        raise HTTPException(status_code=422, detail="At least two distinct mapped RFQs are required.")
+    # Ensure the source is a real inbound database message belonging to this tenant/supplier.
+    source = (
+        db.supabase.table("message_log").select("id")
+        .eq("id", req.source_message_id)
+        .eq("client_id", req.client_id)
+        .eq("supplier_id", req.supplier_id)
+        .eq("direction", "inbound").limit(1).execute()
+    )
+    if not source.data:
+        raise HTTPException(status_code=422, detail="Source message must be a persisted inbound message.")
+    # One transaction validates and writes ALL lines, with advisory locking
+    # on the persisted inbound source ID to make concurrent retries safe.
+    # Each item is authoritative only after the validation above passes.
+    payload = {
+        "p_client_id": req.client_id,
+        "p_supplier_id": req.supplier_id,
+        "p_source_message_id": req.source_message_id,
+        "p_raw_message": req.raw_message,
+        "p_items": [
+            {
+                "candidate_rfq_id": item.rfq_id,
+                "confidence": float(raw["confidence"]),
+                "price": float(item.price),
+                "quantity": item.quantity,
+                "variant_label": item.variant_label,
+                "delivery_time": item.delivery_time,
+                "quality_notes": raw.get("quality_notes"),
+            }
+            for raw, item in zip(req.items, mapped)
+        ],
+    }
+    try:
+        saved = db.supabase.rpc("record_multi_rfqs_atomic", payload).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail="Atomic multi-RFQ quote recording failed.") from exc
+    if not saved.data:
+        raise HTTPException(status_code=409, detail="No quote records persisted.")
+    return saved.data
 
 
 @router.post("/record-quote")
@@ -1072,6 +1342,28 @@ def log_message(req: LogMessageRequest, x_openclaw_key: Optional[str] = Header(d
     return {"logged": bool(row_id), "message_id": row_id}
 
 
+
+class SupplierRevisionRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    rfq_id: str
+    new_quote_id: str
+
+
+@router.post("/mark-quote-revision")
+def mark_quote_revision(req: SupplierRevisionRequest, x_openclaw_key: Optional[str] = Header(default=None)):
+    """Option B: historical accepted deal remains recorded but becomes invalid."""
+    _require_openclaw_key(x_openclaw_key)
+    if db.is_client_automation_paused(req.client_id):
+        raise HTTPException(status_code=409, detail="Client is paused; human action required.")
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    result = db.mark_supplier_quote_revision(req.client_id, req.rfq_id, req.supplier_id, req.new_quote_id)
+    if not result:
+        raise HTTPException(status_code=409, detail="Could not mark revision pending; check accepted and revised quotes.")
+    return result
+
+
 @router.post("/accept-negotiated-quote")
 def accept_negotiated_quote(
     req: AcceptNegotiatedQuoteRequest,
@@ -1088,6 +1380,7 @@ def accept_negotiated_quote(
         price=req.price,
         quantity=req.quantity,
         accepted_by=req.accepted_by,
+        quote_id=req.quote_id,
     )
     if not accepted:
         raise HTTPException(

@@ -1,0 +1,68 @@
+-- Debounced durable batching for individually created RFQs.
+create unique index if not exists uq_one_initial_bundle_item_per_supplier_rfq
+on public.supplier_message_bundle_items(rfq_supplier_id)
+where kind='initial_rfq';
+
+create index if not exists idx_initial_bundle_queue_due
+on public.supplier_message_bundle_items(client_id,supplier_id,available_at)
+where kind='initial_rfq' and status='pending' and bundle_id is null;
+
+create or replace function public.claim_initial_supplier_bundle(
+ p_client_id uuid, p_supplier_id uuid, p_limit integer default 8
+) returns jsonb
+language plpgsql security definer set search_path=''
+as $$
+declare
+ v_ids uuid[];
+ v_bundle uuid;
+ v_items jsonb;
+begin
+ if p_limit is null or p_limit<1 or p_limit>8 then
+   raise exception 'Batch size must be 1 through 8';
+ end if;
+ if not exists (select 1 from public.suppliers where id=p_supplier_id
+                and client_id=p_client_id and is_active=true) then
+   raise exception 'Supplier not owned by client or inactive';
+ end if;
+ if exists (select 1 from public.clients where id=p_client_id and automation_paused=true) then
+   return null;
+ end if;
+ select array_agg(id) into v_ids
+ from (
+   select bi.id from public.supplier_message_bundle_items bi
+   join public.rfqs r on r.id=bi.rfq_id
+   join public.rfq_suppliers rs on rs.id=bi.rfq_supplier_id
+   where bi.client_id=p_client_id and bi.supplier_id=p_supplier_id
+     and bi.kind='initial_rfq' and bi.status='pending' and bi.bundle_id is null
+     and bi.available_at<=now() and r.status='active'
+     and (r.due_by is null or r.due_by>now())
+     and rs.status='sent'
+     and rs.rfq_id=bi.rfq_id and rs.supplier_id=p_supplier_id
+   order by bi.available_at,bi.created_at,bi.id
+   limit p_limit for update of bi skip locked
+ ) claimable;
+
+ if v_ids is null or cardinality(v_ids)=0 then return null; end if;
+ insert into public.supplier_message_bundles(
+   client_id,supplier_id,kind,stage,status
+ ) values(p_client_id,p_supplier_id,'initial_rfq',null,'processing')
+ returning id into v_bundle;
+
+ update public.supplier_message_bundle_items
+ set bundle_id=v_bundle,status='processing',updated_at=now()
+ where id=any(v_ids);
+
+ select jsonb_agg(jsonb_build_object(
+    'id',bi.id,'rfq_id',bi.rfq_id,'rfq_supplier_id',bi.rfq_supplier_id,
+    'product_name',r.product_name,'specs',r.specs,'quantity',r.quantity,
+    'deadline_hours',r.deadline_hours,'required_delivery_days',r.required_delivery_days
+ ) order by bi.created_at,bi.id) into v_items
+ from public.supplier_message_bundle_items bi
+ join public.rfqs r on r.id=bi.rfq_id
+ where bi.id=any(v_ids);
+ return jsonb_build_object('bundle_id',v_bundle,'items',v_items);
+end $$;
+revoke all on function public.claim_initial_supplier_bundle(uuid,uuid,integer)
+ from public,anon,authenticated;
+grant execute on function public.claim_initial_supplier_bundle(uuid,uuid,integer)
+ to service_role;
