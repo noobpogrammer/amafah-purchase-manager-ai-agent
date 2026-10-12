@@ -1875,20 +1875,19 @@ def accept_recorded_quote(
             return None
 
         quote = res.data[0]
-        now_utc = datetime.now(timezone.utc).isoformat()
-        upd = (
-            supabase.table("quotes")
-            .update({
-                "is_accepted": True,
-                "accepted_at": now_utc,
-                "accepted_by": accepted_by,
-            })
-            .eq("id", quote["id"])
-            .execute()
-        )
-        accepted = upd.data[0] if upd.data else None
-        if not accepted:
+        # Database RPC changes historical and current acceptance together.
+        # Never flag an accepted row before the pointer and revision state commit.
+        result = supabase.rpc("select_current_supplier_quote", {
+            "p_client_id": client_id,
+            "p_supplier_id": supplier_id,
+            "p_rfq_id": rfq_id,
+            "p_quote_id": quote["id"],
+            "p_accepted_by": accepted_by,
+        }).execute()
+        if not result.data:
             return None
+        accepted = dict(quote)
+        accepted.update({"is_accepted": True, "is_current_accepted": True})
 
         if session and session.get("id"):
             complete_negotiation_session(
@@ -1905,6 +1904,21 @@ def accept_recorded_quote(
         return accepted
     except Exception as e:
         logger.error("accept_recorded_quote error: %s", e)
+        return None
+
+
+def mark_supplier_quote_revision(client_id: str, rfq_id: str, supplier_id: str, new_quote_id: str) -> dict | None:
+    """Invalidate the current accepted deal but preserve historical acceptance."""
+    try:
+        result = supabase.rpc("mark_supplier_quote_revision", {
+            "p_client_id": client_id,
+            "p_supplier_id": supplier_id,
+            "p_rfq_id": rfq_id,
+            "p_new_quote_id": new_quote_id,
+        }).execute()
+        return result.data
+    except Exception as exc:
+        logger.error("mark_supplier_quote_revision failed: %s", exc)
         return None
 
 
