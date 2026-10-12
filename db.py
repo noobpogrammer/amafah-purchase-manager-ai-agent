@@ -492,7 +492,8 @@ def get_open_rfqs_for_supplier(supplier_id: str):
 
 def record_quotes_batch(rfq_id: str, supplier_id: str, variants: list[dict],
                         raw_message: str = None, source_message_id: str = None,
-                        confidence: str = "high", quote_group_id: str = None) -> list[dict]:
+                        confidence: str = "high", quote_group_id: str = None,
+                        allow_post_deadline: bool = False) -> list[dict]:
     """
     Atomically records one or more quote variants for an open RFQ from a supplier message.
     1. Verifies RFQ exists and is open.
@@ -505,9 +506,16 @@ def record_quotes_batch(rfq_id: str, supplier_id: str, variants: list[dict],
         return []
 
     rfq_res = supabase.table("rfqs").select("*").eq("id", rfq_id).execute()
-    if not rfq_res.data or not is_rfq_open(rfq_res.data[0]):
+    rfq = rfq_res.data[0] if rfq_res.data else None
+    if not rfq or rfq.get("status") != "active":
         logger.warning(
-            "record_quotes_batch rejected for rfq %s from supplier %s: RFQ is not active or deadline passed",
+            "record_quotes_batch rejected for rfq %s from supplier %s: RFQ is not active",
+            rfq_id, supplier_id
+        )
+        return []
+    if not is_rfq_open(rfq) and not allow_post_deadline:
+        logger.warning(
+            "record_quotes_batch rejected for rfq %s from supplier %s: deadline passed without an in-flight negotiation",
             rfq_id, supplier_id
         )
         return []
@@ -1580,20 +1588,15 @@ def expire_negotiation_sessions_for_rfq(rfq_id: str) -> int:
 
 
 def get_active_negotiation_session(client_id: str, rfq_id: str, supplier_id: str) -> dict | None:
-    """Retrieves active negotiation session for a specific rfq and supplier, verifying RFQ is active and not expired."""
+    """Return the current negotiation session for an active RFQ.
+
+    An already-started negotiation is allowed to continue after the quote
+    deadline. The deadline blocks *new* negotiations, not an in-flight one.
+    """
     try:
         rfq = get_rfq_by_id(rfq_id)
-        if rfq and rfq.get("status") != "active":
-            expire_negotiation_sessions_for_rfq(rfq_id)
+        if not rfq or rfq.get("status") != "active":
             return None
-        if rfq and rfq.get("due_by"):
-            try:
-                due_dt = datetime.fromisoformat(str(rfq["due_by"]).replace("Z", "+00:00"))
-                if due_dt <= datetime.now(timezone.utc):
-                    expire_negotiation_sessions_for_rfq(rfq_id)
-                    return None
-            except Exception:
-                pass
 
         res = (
             supabase.table("negotiation_sessions")
@@ -1601,12 +1604,12 @@ def get_active_negotiation_session(client_id: str, rfq_id: str, supplier_id: str
             .eq("client_id", client_id)
             .eq("rfq_id", rfq_id)
             .eq("supplier_id", supplier_id)
-            .eq("status", "active")
+            .in_("status", ["active", "awaiting_human_review", "awaiting_authorization"])
             .order("updated_at", desc=True)
             .limit(1)
             .execute()
         )
-        if res.data and len(res.data) > 0:
+        if res.data:
             return res.data[0]
     except Exception as e:
         logger.error("get_active_negotiation_session error: %s", e)
@@ -1614,38 +1617,24 @@ def get_active_negotiation_session(client_id: str, rfq_id: str, supplier_id: str
 
 
 def get_active_negotiation_session_for_supplier(client_id: str, supplier_id: str) -> dict | None:
-    """Retrieves the most recently updated active negotiation session for a supplier across any open, unexpired RFQ."""
+    """Return the most recent in-flight negotiation session for a supplier.
+
+    Existing negotiations remain routable after due_by as long as the master
+    RFQ itself has not been closed.
+    """
     try:
         res = (
             supabase.table("negotiation_sessions")
             .select("*, rfqs(*)")
             .eq("client_id", client_id)
             .eq("supplier_id", supplier_id)
-            .eq("status", "active")
+            .in_("status", ["active", "awaiting_human_review", "awaiting_authorization"])
             .order("updated_at", desc=True)
             .execute()
         )
-        if res.data and len(res.data) > 0:
-            now_dt = datetime.now(timezone.utc)
-            for row in res.data:
-                rfq = row.get("rfqs")
-                rfq_id = row.get("rfq_id")
-                if not rfq or not isinstance(rfq, dict):
-                    rfq = get_rfq_by_id(rfq_id) if rfq_id else None
-                if not rfq or rfq.get("status") != "active":
-                    if rfq_id:
-                        expire_negotiation_sessions_for_rfq(rfq_id)
-                    continue
-                due_by = rfq.get("due_by")
-                if due_by:
-                    try:
-                        due_dt = datetime.fromisoformat(str(due_by).replace("Z", "+00:00"))
-                        if due_dt <= now_dt:
-                            if rfq_id:
-                                expire_negotiation_sessions_for_rfq(rfq_id)
-                            continue
-                    except Exception:
-                        pass
+        for row in (res.data or []):
+            rfq = row.get("rfqs")
+            if isinstance(rfq, dict) and rfq.get("status") == "active":
                 return row
     except Exception as e:
         logger.error("get_active_negotiation_session_for_supplier error: %s", e)
@@ -1743,12 +1732,26 @@ def resume_negotiation_session(
 
 
 def create_or_update_negotiation_session(client_id: str, rfq_id: str, supplier_id: str, **kwargs) -> dict | None:
-    """Creates a new active negotiation session or updates the existing active session.
-    Fails closed (returns None) if persistence fails.
+    """Create or update the supplier/RFQ in-flight negotiation session.
+
+    The session is commercial state, so it survives due_by until explicitly
+    completed/expired or until the RFQ itself is closed.
     """
     now_utc = datetime.now(timezone.utc).isoformat()
     try:
-        existing = get_active_negotiation_session(client_id, rfq_id, supplier_id)
+        existing_res = (
+            supabase.table("negotiation_sessions")
+            .select("*")
+            .eq("client_id", client_id)
+            .eq("rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .in_("status", ["active", "awaiting_human_review", "awaiting_authorization"])
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        existing = existing_res.data[0] if existing_res.data else None
+
         if existing:
             update_data = {**kwargs, "updated_at": now_utc}
             res = (
@@ -1757,21 +1760,120 @@ def create_or_update_negotiation_session(client_id: str, rfq_id: str, supplier_i
                 .eq("id", existing["id"])
                 .execute()
             )
-            return res.data[0] if (res.data and len(res.data) > 0) else None
-        else:
-            insert_data = {
-                "client_id": client_id,
-                "rfq_id": rfq_id,
-                "supplier_id": supplier_id,
-                "status": "active",
-                "created_at": now_utc,
-                "updated_at": now_utc,
-                **kwargs,
-            }
-            res = supabase.table("negotiation_sessions").insert(insert_data).execute()
-            return res.data[0] if (res.data and len(res.data) > 0) else None
+            return res.data[0] if res.data else None
+
+        insert_data = {
+            "client_id": client_id,
+            "rfq_id": rfq_id,
+            "supplier_id": supplier_id,
+            "status": "active",
+            "created_at": now_utc,
+            "updated_at": now_utc,
+            **kwargs,
+        }
+        res = supabase.table("negotiation_sessions").insert(insert_data).execute()
+        return res.data[0] if res.data else None
     except Exception as e:
         logger.error("create_or_update_negotiation_session error: %s", e)
+        return None
+
+
+def has_inflight_negotiation_for_rfq(rfq_id: str) -> bool:
+    """True when any supplier negotiation for the RFQ is still in progress."""
+    if not rfq_id:
+        return False
+    try:
+        res = (
+            supabase.table("negotiation_sessions")
+            .select("id")
+            .eq("rfq_id", rfq_id)
+            .in_("status", ["active", "awaiting_human_review", "awaiting_authorization"])
+            .limit(1)
+            .execute()
+        )
+        return bool(res.data)
+    except Exception as e:
+        logger.error("has_inflight_negotiation_for_rfq error: %s", e)
+        return False
+
+
+def can_record_post_deadline_quote(client_id: str, rfq_id: str, supplier_id: str) -> bool:
+    """Allow a quote after due_by only when that exact supplier/RFQ already has an in-flight negotiation."""
+    session = get_active_negotiation_session(client_id, rfq_id, supplier_id)
+    return bool(session)
+
+
+def accept_recorded_quote(
+    client_id: str,
+    rfq_id: str,
+    supplier_id: str,
+    *,
+    price: float | None = None,
+    quantity: int | None = None,
+    accepted_by: str = "operator",
+) -> dict | None:
+    """Mark the latest matching persisted quote as accepted.
+
+    Acceptance after the RFQ deadline is allowed only when the same supplier/RFQ
+    has an in-flight negotiation session. This prevents a brand-new late quote
+    from bypassing the deadline.
+    """
+    rfq = get_rfq_by_id(rfq_id)
+    if not rfq or rfq.get("status") != "active":
+        return None
+
+    after_deadline = not is_rfq_open(rfq)
+    session = get_active_negotiation_session(client_id, rfq_id, supplier_id)
+    if after_deadline and not session:
+        return None
+
+    try:
+        q = (
+            supabase.table("quotes")
+            .select("*")
+            .eq("rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .eq("is_available", True)
+        )
+        if price is not None:
+            q = q.eq("price", price)
+        if quantity is not None:
+            q = q.eq("quantity", quantity)
+        res = q.order("created_at", desc=True).limit(1).execute()
+        if not res.data:
+            return None
+
+        quote = res.data[0]
+        now_utc = datetime.now(timezone.utc).isoformat()
+        upd = (
+            supabase.table("quotes")
+            .update({
+                "is_accepted": True,
+                "accepted_at": now_utc,
+                "accepted_by": accepted_by,
+            })
+            .eq("id", quote["id"])
+            .execute()
+        )
+        accepted = upd.data[0] if upd.data else None
+        if not accepted:
+            return None
+
+        if session and session.get("id"):
+            complete_negotiation_session(
+                session["id"],
+                status="accepted",
+                latest_supplier_offer=float(quote["price"]) if quote.get("price") is not None else None,
+                last_quote_id=quote.get("id"),
+            )
+
+        supabase.table("rfq_suppliers").update({"status": "responded"}).eq(
+            "rfq_id", rfq_id
+        ).eq("supplier_id", supplier_id).execute()
+
+        return accepted
+    except Exception as e:
+        logger.error("accept_recorded_quote error: %s", e)
         return None
 
 
