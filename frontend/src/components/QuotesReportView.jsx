@@ -82,6 +82,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
   const quotes = reportData?.quotes || [];
   const quoteHistory = reportData?.quoteHistory || [];
   const ranking = reportData?.ranking;
+  const hasPendingRevision = quotes.some((q) => q.is_pending_revision);
 
   const getSupplierName = (supplierId) => {
     if (!supplierId) return null;
@@ -97,9 +98,9 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
 
   // Find best offer details from ranking
   const bestQuoteId = ranking?.best_quote_id || ranking?.ranking_json?.best_quote_id || null;
-  const winningQuote = bestQuoteId ? quotes.find((q) => q.id === bestQuoteId) : null;
+  const winningQuote = !hasPendingRevision && bestQuoteId ? quotes.find((q) => q.id === bestQuoteId) : null;
 
-  let bestOfferTitle = 'Best Offer';
+  let bestOfferTitle = hasPendingRevision ? 'Revision pending review' : 'Best Offer';
   let bestOfferSub = null;
 
   if (winningQuote) {
@@ -107,7 +108,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
     const varText = winningQuote.variant_label ? ` — ${winningQuote.variant_label}` : '';
     bestOfferTitle = `${suppName}${varText}`;
     bestOfferSub = `AED ${winningQuote.price} | Delivery: ${winningQuote.delivery_time || 'Not specified'}${winningQuote.quality_notes ? ` | Notes: ${winningQuote.quality_notes}` : ''}`;
-  } else if (ranking?.best_supplier_id) {
+  } else if (!hasPendingRevision && ranking?.best_supplier_id) {
     const matched = getSupplierName(ranking.best_supplier_id);
     if (matched) {
       bestOfferTitle = matched;
@@ -236,7 +237,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                 </thead>
                 <tbody>
                   {quotes.map((q) => {
-                    const isBest = bestQuoteId
+                    const isBest = !hasPendingRevision && bestQuoteId
                       ? q.id === bestQuoteId
                       : (ranking?.best_supplier_id === q.supplier_id && quotes.filter((x) => x.supplier_id === ranking.best_supplier_id).length === 1);
 
