@@ -53,11 +53,32 @@ def plan_supplier_bundles(items: Sequence[BundleItem], max_items: int = 8) -> li
 def format_supplier_bundle(items: Sequence[BundleItem], *, brand: str = "Everyware®️ (Al Noon Int’l Trading LLC)") -> str:
     if not items or len(items) > 8:
         raise ValueError("One supplier message must contain between 1 and 8 RFQs")
-    lines = [f"Hi! This is {brand}.", "", "Please quote the following items:"]
-    for index, item in enumerate(items, 1):
+    for item in items:
         if not item.rfq_id or not item.product_name.strip():
             raise ValueError("Missing RFQ reference or product name")
-        row = f"{index}. {item.product_name} (Ref: {item.rfq_id[:8]}) | Qty: {item.quantity if item.quantity is not None else 'N/A'}"
+
+    lines = [f"Hi! This is {brand}.", ""]
+    if len(items) == 1:
+        item = items[0]
+        lines.extend([
+            "We're requesting a quotation for the following item:",
+            "",
+            f"*Product:* {item.product_name.strip()}",
+        ])
+        if item.specs and item.specs.strip() not in {".", "-", "N/A"}:
+            lines.append(f"*Specifications:* {item.specs.strip()}")
+        if item.quantity is not None:
+            lines.append(f"*Quantity:* {item.quantity} units")
+        if item.deadline_hours is not None:
+            lines.append(f"*Quotation Deadline:* Within {item.deadline_hours} hour(s)")
+        if item.required_delivery_days is not None:
+            lines.append(f"*Required Delivery:* Within {item.required_delivery_days} day(s)")
+        lines.extend(["", "Please share your best price per unit (AED) and estimated delivery time.", "", "Thank you!"])
+        return "\n".join(lines)
+
+    lines.append("We're requesting quotations for the following items:")
+    for index, item in enumerate(items, 1):
+        row = f"{index}. {item.product_name.strip()} (Ref: {item.rfq_id[:8]}) | Qty: {item.quantity if item.quantity is not None else 'N/A'}"
         if item.specs and item.specs.strip() not in {".", "-", "N/A"}:
             row += f" | Specs: {item.specs.strip()}"
         if item.deadline_hours is not None:
@@ -65,7 +86,7 @@ def format_supplier_bundle(items: Sequence[BundleItem], *, brand: str = "Everywa
         if item.required_delivery_days is not None:
             row += f" | Delivery: {item.required_delivery_days} day(s)"
         lines.append(row)
-    lines += ["", "Please reply with each item number, final AED price per unit, and estimated delivery time.", "Thanks."]
+    lines.extend(["", "Please share your best price per unit (AED) and estimated delivery time for the items you can supply. You can reply naturally; there's no need to use item numbers.", "Thank you!"])
     return "\n".join(lines)
 
 
