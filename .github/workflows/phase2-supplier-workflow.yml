@@ -5,6 +5,7 @@ on:
       - 'main.py'
       - 'db.py'
       - 'openclaw_bridge.py'
+      - 'tests/test_activation_policy.py'
       - 'supplier_message_planner.py'
       - 'tests/test_supplier_message_planner.py'
       - 'supabase/migrations/*revision_pending.sql'
@@ -33,6 +34,13 @@ jobs:
           GROQ_API_KEY: phase2-ci-placeholder
           OPENCLAW_TOOL_API_KEY: phase2-test-tool-key
         run: python -m unittest discover -s tests -p 'test_phase2_bridge.py' -v
+      - name: Run Option C activation gate tests
+        env:
+          SUPABASE_URL: https://localhost.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: phase2-ci-placeholder
+          GROQ_API_KEY: phase2-ci-placeholder
+          OPENCLAW_TOOL_API_KEY: phase2-test-tool-key
+        run: python -m unittest discover -s tests -p 'test_activation_policy.py' -v
       - name: Set up Node for frontend build
         uses: actions/setup-node@v4
         with:
