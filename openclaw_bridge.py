@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 
 import db
 import negotiation_engine
+import groq_client
+from supplier_message_planner import validate_multi_rfq_quotes, AmbiguousSupplierQuote
 
 
 router = APIRouter(prefix="/openclaw", tags=["openclaw"])
@@ -848,6 +850,34 @@ def resolve_commercial_draft(
             "delivery, or other terms already present in extracted_facts."
         ),
     }
+
+
+
+class MultiItemSupplierQuoteRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    message: str
+    source_message_id: Optional[str] = None
+
+
+@router.post("/parse-multi-item-quotes")
+def parse_multi_item_quotes(req: MultiItemSupplierQuoteRequest, x_openclaw_key: Optional[str] = Header(default=None)):
+    """Safely map several prices to authorized RFQs; no automatic persistence."""
+    _require_openclaw_key(x_openclaw_key)
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    links = [x for x in db.get_open_rfqs_for_supplier(req.supplier_id) if (x.get("rfqs") or {}).get("client_id") == req.client_id]
+    if len(links) < 2:
+        return {"status": "SINGLE_RFQ", "items": []}
+    items = (groq_client.parse_multi_rfq_quotes(req.message, links) or {}).get("items") or []
+    if not items:
+        return {"status": "NO_ITEMS", "items": []}
+    try:
+        clean = validate_multi_rfq_quotes(items, [str(x["rfqs"]["id"]) for x in links])
+    except AmbiguousSupplierQuote as exc:
+        return {"status": "CLARIFICATION_REQUIRED", "items": [], "reason": str(exc)}
+    mapped = [{**raw, "candidate_rfq_id": result.rfq_id, "price": float(result.price)} for raw, result in zip(items, clean)]
+    return {"status": "MAPPED", "items": mapped, "source_message_id": req.source_message_id,
+            "instruction": "Record each distinct RFQ's validated price variants using record-quote before taking commercial action."}
 
 
 @router.post("/supplier-context", dependencies=[])
