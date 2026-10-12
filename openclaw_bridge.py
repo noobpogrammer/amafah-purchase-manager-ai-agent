@@ -900,14 +900,51 @@ def parse_multi_item_quotes(req: MultiItemSupplierQuoteRequest, x_openclaw_key: 
     items = (groq_client.parse_multi_rfq_quotes(req.message, links) or {}).get("items") or []
     if not items:
         return {"status": "NO_ITEMS", "items": [], "bundle_id": bundle_id}
-    try:
-        clean = validate_multi_rfq_quotes(items, [str(x["rfqs"]["id"]) for x in links])
-    except AmbiguousSupplierQuote as exc:
-        return {"status": "CLARIFICATION_REQUIRED", "items": [], "reason": str(exc)}
-    mapped = [{**raw, "candidate_rfq_id": result.rfq_id, "price": float(result.price)} for raw, result in zip(items, clean)]
-    return {"status": "MAPPED" if len({item["candidate_rfq_id"] for item in mapped}) >= 2 else "SINGLE_RFQ",
-            "items": mapped, "bundle_id": bundle_id, "source_message_id": req.source_message_id,
-            "instruction": "Record each distinct RFQ's validated price variants using record-quote before taking commercial action."}
+    allowed_ids = [str(x["rfqs"]["id"]) for x in links]
+    safe_items = []
+    unresolved_items = []
+    for raw in items:
+        try:
+            valid = validate_multi_rfq_quotes([raw], allowed_ids)
+            item = valid[0]
+            safe_items.append({
+                **raw, "candidate_rfq_id": item.rfq_id,
+                "price": float(item.price),
+            })
+        except (AmbiguousSupplierQuote, ValueError, TypeError) as exc:
+            unresolved_items.append({
+                "product_reference": raw.get("product_reference"),
+                "price": raw.get("price"),
+                "quantity": raw.get("quantity"),
+                "delivery_time": raw.get("delivery_time"),
+                "reason": str(exc),
+            })
+    if unresolved_items:
+        return {
+            "status": "CLARIFICATION_REQUIRED",
+            "items": [],
+            "resolved_items": safe_items,
+            "unresolved_items": unresolved_items,
+            "bundle_id": bundle_id,
+            "candidate_rfqs": [
+                {"rfq_id": row["rfqs"]["id"], "product_name": row["rfqs"].get("product_name"),
+                 "item_number": row["rfqs"].get("item_number")}
+                for row in links
+            ],
+            "instruction": (
+                "Save the source message and all extracted facts in a pending commercial draft. "
+                "Ask one precise clarification for the unresolved line(s). Never repeat pricing "
+                "facts already captured. Record the batch only once every line is mapped."
+            ),
+        }
+    distinct_ids = {item["candidate_rfq_id"] for item in safe_items}
+    return {
+        "status": "MAPPED" if len(distinct_ids) >= 2 else "SINGLE_RFQ",
+        "items": safe_items,
+        "bundle_id": bundle_id,
+        "source_message_id": req.source_message_id,
+        "instruction": "Persist the entire mapped list atomically with record-multi-item-quotes before making commercial commitments.",
+    }
 
 
 @router.post("/supplier-context", dependencies=[])
