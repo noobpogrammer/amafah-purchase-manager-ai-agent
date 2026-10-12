@@ -149,7 +149,8 @@ class AcceptNegotiatedQuoteRequest(BaseModel):
 
 class MessageDeliveryRequest(BaseModel):
     client_id: str
-    supplier_id: str
+    supplier_id: Optional[str] = None
+    phone_number: Optional[str] = None
     body: str
     success: bool
     external_message_id: Optional[str] = None
@@ -451,11 +452,11 @@ def message_delivery(
     x_openclaw_key: Optional[str] = Header(default=None),
 ):
     _require_openclaw_key(x_openclaw_key)
-    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    supplier = _get_supplier_for_client(req.client_id, req.supplier_id, req.phone_number)
 
     row = db.find_latest_message_by_body(
         client_id=req.client_id,
-        supplier_id=req.supplier_id,
+        supplier_id=supplier["id"],
         direction="outbound",
         body=req.body,
         related_rfq_id=req.related_rfq_id,
@@ -465,7 +466,7 @@ def message_delivery(
     else:
         row_id = db.log_message(
             client_id=req.client_id,
-            supplier_id=req.supplier_id,
+            supplier_id=supplier["id"],
             direction="outbound",
             body=req.body,
             related_rfq_id=req.related_rfq_id,
