@@ -1227,15 +1227,16 @@ async def check_deadlines_and_reminders():
                 )
                 if result.get("sent"):
                     client_id = rfq.get("client_id") or supplier.get("client_id")
-                    db.log_message(
+                    logged_id = db.log_message(
                         client_id,
                         supplier.get("id"),
                         "outbound",
                         result.get("message") or msg,
                         related_rfq_id=rfq.get("id"),
                         status="sent",
-                        external_message_id=result.get("message_id"),
                     )
+                    if logged_id and result.get("message_id"):
+                        db.mark_message_sent(logged_id, external_message_id=result.get("message_id"))
                 db.update_rfq_supplier_reminder(item["id"], 3)
             elif percentage >= 70 and reminder_count == 1:
                 print(f"[{now.isoformat()}] [Scheduler] Triggering 70% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
@@ -1250,15 +1251,16 @@ async def check_deadlines_and_reminders():
                 )
                 if result.get("sent"):
                     client_id = rfq.get("client_id") or supplier.get("client_id")
-                    db.log_message(
+                    logged_id = db.log_message(
                         client_id,
                         supplier.get("id"),
                         "outbound",
                         result.get("message") or msg,
                         related_rfq_id=rfq.get("id"),
                         status="sent",
-                        external_message_id=result.get("message_id"),
                     )
+                    if logged_id and result.get("message_id"):
+                        db.mark_message_sent(logged_id, external_message_id=result.get("message_id"))
                 db.update_rfq_supplier_reminder(item["id"], 2)
             elif percentage >= 50 and reminder_count == 0:
                 print(f"[{now.isoformat()}] [Scheduler] Triggering 50% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
@@ -1273,15 +1275,16 @@ async def check_deadlines_and_reminders():
                 )
                 if result.get("sent"):
                     client_id = rfq.get("client_id") or supplier.get("client_id")
-                    db.log_message(
+                    logged_id = db.log_message(
                         client_id,
                         supplier.get("id"),
                         "outbound",
                         result.get("message") or msg,
                         related_rfq_id=rfq.get("id"),
                         status="sent",
-                        external_message_id=result.get("message_id"),
                     )
+                    if logged_id and result.get("message_id"):
+                        db.mark_message_sent(logged_id, external_message_id=result.get("message_id"))
                 db.update_rfq_supplier_reminder(item["id"], 1)
         except Exception as item_err:
             tb = traceback.format_exc()
