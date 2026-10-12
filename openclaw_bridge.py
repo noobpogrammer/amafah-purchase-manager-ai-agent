@@ -578,6 +578,47 @@ def resolve_rfq_context(
             "reason": "Supplier has no open delivered RFQ candidates.",
         }
 
+    # Bundled outbound messages have one WhatsApp stanza for many RFQs.
+    # Never resolve a reply to the first associated RFQ just because message_log
+    # has one related_rfq_id for backwards compatibility.
+    if req.reply_to_message_id:
+        bundle_lookup = (
+            db.supabase.table("supplier_message_bundles")
+            .select("id")
+            .eq("client_id", req.client_id)
+            .eq("supplier_id", req.supplier_id)
+            .eq("external_message_id", req.reply_to_message_id)
+            .eq("status", "sent")
+            .limit(1)
+            .execute()
+        )
+        if bundle_lookup.data:
+            bundle_id = bundle_lookup.data[0]["id"]
+            bundle_items = (
+                db.supabase.table("supplier_message_bundle_items")
+                .select("rfq_id")
+                .eq("bundle_id", bundle_id)
+                .eq("client_id", req.client_id)
+                .eq("supplier_id", req.supplier_id)
+                .execute()
+            )
+            matched_ids = {row["rfq_id"] for row in (bundle_items.data or []) if row.get("rfq_id") in candidate_ids}
+            if len(matched_ids) == 1:
+                only_id = next(iter(matched_ids))
+                return {
+                    "status": "RESOLVED", "resolved_rfq_id": only_id,
+                    "confidence": "very_high",
+                    "reason": "Native WhatsApp reply matched a one-item bundle.",
+                    "candidates": [x for x in candidates if x["rfq_id"] == only_id],
+                }
+            return {
+                "status": "AMBIGUOUS", "resolved_rfq_id": None,
+                "confidence": "low",
+                "reason": "Reply references a multi-RFQ supplier bundle; resolve each quoted item explicitly.",
+                "candidates": [x for x in candidates if x["rfq_id"] in matched_ids],
+                "bundle_id": bundle_id,
+            }
+
     # 1) Native reply / stanza context is strongest when we have the external id.
     if req.reply_to_message_id:
         msg_res = (
