@@ -1220,6 +1220,28 @@ def log_message(req: LogMessageRequest, x_openclaw_key: Optional[str] = Header(d
     return {"logged": bool(row_id), "message_id": row_id}
 
 
+
+class SupplierRevisionRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    rfq_id: str
+    new_quote_id: str
+
+
+@router.post("/mark-quote-revision")
+def mark_quote_revision(req: SupplierRevisionRequest, x_openclaw_key: Optional[str] = Header(default=None)):
+    """Option B: historical accepted deal remains recorded but becomes invalid."""
+    _require_openclaw_key(x_openclaw_key)
+    if db.is_client_automation_paused(req.client_id):
+        raise HTTPException(status_code=409, detail="Client is paused; human action required.")
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    result = db.mark_supplier_quote_revision(req.client_id, req.rfq_id, req.supplier_id, req.new_quote_id)
+    if not result:
+        raise HTTPException(status_code=409, detail="Could not mark revision pending; check accepted and revised quotes.")
+    return result
+
+
 @router.post("/accept-negotiated-quote")
 def accept_negotiated_quote(
     req: AcceptNegotiatedQuoteRequest,
