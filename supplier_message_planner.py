@@ -74,7 +74,7 @@ def format_supplier_bundle(items: Sequence[BundleItem], *, brand: str = "Everywa
         if item.required_delivery_days is not None:
             lines.append(f"*Required Delivery:* Within {item.required_delivery_days} day(s)")
         lines.extend(["", "Please share your best price per unit (AED) and estimated delivery time.", "", "Thank you!"])
-        return "\\n".join(lines)
+        return "\n".join(lines)
 
     lines.append("We're requesting quotations for the following items:")
     for index, item in enumerate(items, 1):
@@ -87,7 +87,7 @@ def format_supplier_bundle(items: Sequence[BundleItem], *, brand: str = "Everywa
             row += f" | Delivery: {item.required_delivery_days} day(s)"
         lines.append(row)
     lines.extend(["", "Please share your best price per unit (AED) and estimated delivery time for the items you can supply. You can reply naturally; there's no need to use item numbers.", "Thank you!"])
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 def validate_multi_rfq_quotes(
