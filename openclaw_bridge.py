@@ -1577,7 +1577,28 @@ def accept_negotiated_quote(
 ):
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
-    _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    # A separate acceptance endpoint must enforce the same buyer limits as
+    # counteroffers; reviewing a counter cannot authorize accepting a deal.
+    if not req.quote_id:
+        raise HTTPException(status_code=422, detail="Acceptance requires an exact persisted quote_id.")
+    quote_res = (
+        db.supabase.table("quotes").select("id,price,quantity,is_available")
+        .eq("id", req.quote_id).eq("rfq_id", req.rfq_id)
+        .eq("supplier_id", req.supplier_id).limit(1).execute()
+    )
+    quote = quote_res.data[0] if quote_res.data else None
+    if not quote or not quote.get("is_available") or quote.get("price") is None:
+        raise HTTPException(status_code=409, detail="Quote is not available for acceptance.")
+    price_cap = rfq.get("acceptable_price_max")
+    if price_cap is not None and float(quote["price"]) > float(price_cap):
+        raise HTTPException(status_code=409, detail="Quote exceeds buyer-approved maximum; human override required.")
+    if req.price is not None and float(req.price) != float(quote["price"]):
+        raise HTTPException(status_code=409, detail="Acceptance price differs from persisted quote.")
+    authorized_quantity = rfq.get("quantity")
+    if authorized_quantity is not None and quote.get("quantity") is not None:
+        if int(quote["quantity"]) != int(authorized_quantity):
+            raise HTTPException(status_code=409, detail="Quote quantity differs from RFQ; human approval required.")
 
     accepted = db.accept_recorded_quote(
         req.client_id,
