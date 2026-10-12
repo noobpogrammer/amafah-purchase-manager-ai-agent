@@ -936,6 +936,83 @@ def supplier_context(
     }
 
 
+
+class RecordMultiItemQuotesRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    source_message_id: str
+    raw_message: str
+    items: list[dict] = Field(min_length=2)
+
+
+@router.post("/record-multi-item-quotes")
+def record_multi_item_quotes(req: RecordMultiItemQuotesRequest, x_openclaw_key: Optional[str] = Header(default=None)):
+    """Persist verified RFQ-specific variants; reject ambiguous batches before writes.
+
+    Caller must first parse and validate all items. Retried message/RFQ pairs
+    return existing rows; no supplier WhatsApp message is sent by this endpoint.
+    """
+    _require_openclaw_key(x_openclaw_key)
+    if db.is_client_automation_paused(req.client_id):
+        raise HTTPException(status_code=409, detail="Tenant is in human-only pause mode.")
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    links = [
+        x for x in db.get_open_rfqs_for_supplier(req.supplier_id)
+        if (x.get("rfqs") or {}).get("client_id") == req.client_id
+    ]
+    allowed_ids = [str(x["rfqs"]["id"]) for x in links]
+    try:
+        mapped = validate_multi_rfq_quotes(req.items, allowed_ids)
+    except AmbiguousSupplierQuote as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    grouped = {}
+    for original, item in zip(req.items, mapped):
+        grouped.setdefault(item.rfq_id, []).append({
+            "variant_label": item.variant_label,
+            "price": float(item.price),
+            "delivery_time": item.delivery_time,
+            "quantity": item.quantity,
+            "quality_notes": original.get("quality_notes"),
+            "is_available": True,
+        })
+    if len(grouped) < 2:
+        raise HTTPException(status_code=422, detail="At least two distinct mapped RFQs are required.")
+    # Ensure the source is a real inbound database message belonging to this tenant/supplier.
+    source = (
+        db.supabase.table("message_log").select("id")
+        .eq("id", req.source_message_id)
+        .eq("client_id", req.client_id)
+        .eq("supplier_id", req.supplier_id)
+        .eq("direction", "inbound").limit(1).execute()
+    )
+    if not source.data:
+        raise HTTPException(status_code=422, detail="Source message must be a persisted inbound message.")
+    outcomes = []
+    for rfq_id, variants in grouped.items():
+        existing = (
+            db.supabase.table("quotes").select("id,price,variant_label")
+            .eq("rfq_id", rfq_id).eq("supplier_id", req.supplier_id)
+            .eq("source_message_id", req.source_message_id).execute()
+        )
+        if existing.data:
+            outcomes.append({"rfq_id": rfq_id, "status": "already_recorded", "quotes": existing.data})
+            continue
+        rows = db.record_quotes_batch(
+            rfq_id=rfq_id,
+            supplier_id=req.supplier_id,
+            variants=variants,
+            raw_message=req.raw_message,
+            source_message_id=req.source_message_id,
+            confidence="high",
+            allow_post_deadline=db.can_record_post_deadline_quote(req.client_id, rfq_id, req.supplier_id),
+        )
+        if not rows:
+            # Partial writes are possible; caller retries using the same source ID.
+            raise HTTPException(status_code=409, detail={"error": "partial_batch_failure", "persisted_before_error": outcomes, "failed_rfq_id": rfq_id})
+        outcomes.append({"rfq_id": rfq_id, "status": "recorded", "quotes": rows})
+    return {"status": "recorded", "rfq_count": len(outcomes), "results": outcomes}
+
+
 @router.post("/record-quote")
 def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header(default=None)):
     _require_openclaw_key(x_openclaw_key)
