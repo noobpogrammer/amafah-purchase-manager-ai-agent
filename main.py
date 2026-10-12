@@ -1,7 +1,7 @@
 """
-Amafha — WhatsApp RFQ agent webhook.
-Evolution API posts incoming supplier messages here. This replaces the
-old n8n branching logic with a single agent decision + tool execution.
+Amafha — procurement backend and deterministic negotiation authority.
+OpenClaw owns supplier-facing WhatsApp transport and conversational orchestration.
+FastAPI owns procurement state, policy, persistence, scheduling, and operator APIs.
 """
 
 import asyncio
@@ -50,11 +50,6 @@ HUMAN_ACK_MSG = "Thanks! We'll review your response and get back to you shortly.
 MAX_NO_PROGRESS_ATTEMPTS = 2
 MAX_TOTAL_CLARIFICATION_TURNS = 5
 
-EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
-EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
-EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
-EVOLUTION_TYPING_DELAY_MS = int(os.getenv("EVOLUTION_TYPING_DELAY_MS", "1200"))
-
 OPENCLAW_BASE_URL = os.getenv("OPENCLAW_BASE_URL", "").rstrip("/")
 OPENCLAW_TOOL_API_KEY = os.getenv("OPENCLAW_TOOL_API_KEY", "").strip()
 
@@ -97,14 +92,6 @@ def sync_openclaw_allowlist(phone_number: str, action: str) -> dict:
 OUTBOUND_MIN_DELAY = float(os.getenv("OUTBOUND_MIN_DELAY", "3.0"))
 OUTBOUND_MAX_DELAY = float(os.getenv("OUTBOUND_MAX_DELAY", "8.0"))
 
-# Cutover guard: when false, the legacy FastAPI -> Evolution API sender is
-# completely disabled. OpenClaw owns supplier-facing WhatsApp during migration.
-LEGACY_EVOLUTION_OUTBOUND_ENABLED = os.getenv(
-    "LEGACY_EVOLUTION_OUTBOUND_ENABLED", "true"
-).strip().lower() in {"1", "true", "yes", "on"}
-
-outbound_queue: asyncio.Queue = asyncio.Queue()
-
 
 def send_via_openclaw_whatsapp(phone_number: str, message: str) -> dict:
     """Send a supplier-facing WhatsApp message through the OpenClaw wrapper."""
@@ -129,6 +116,38 @@ def send_via_openclaw_whatsapp(phone_number: str, message: str) -> dict:
     payload = response.json()
     if not payload.get("ok"):
         raise RuntimeError(payload.get("error") or "OpenClaw WhatsApp send failed")
+    return payload
+
+
+def send_operator_instruction_to_openclaw(
+    phone_number: str,
+    instruction: str,
+    *,
+    flag_id: str,
+    rfq_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> dict:
+    """Resume the supplier's existing OpenClaw WhatsApp session with trusted operator guidance."""
+    if not OPENCLAW_BASE_URL:
+        raise RuntimeError("OPENCLAW_BASE_URL is not configured")
+    if not OPENCLAW_TOOL_API_KEY:
+        raise RuntimeError("OPENCLAW_TOOL_API_KEY is not configured")
+    response = requests.post(
+        f"{OPENCLAW_BASE_URL}/internal/procurement/operator-instruction",
+        headers={"Content-Type": "application/json", "X-OpenClaw-Key": OPENCLAW_TOOL_API_KEY},
+        json={
+            "phone_number": phone_number,
+            "instruction": instruction,
+            "flag_id": flag_id,
+            "rfq_id": rfq_id,
+            "reason": reason,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error") or "OpenClaw operator instruction failed")
     return payload
 
 
@@ -402,127 +421,41 @@ async def enqueue_message(
     supplier_id: str = None,
     message_log_id: str = None,
 ):
-    """Send through OpenClaw during cutover, otherwise queue the legacy Evolution path."""
-    if not LEGACY_EVOLUTION_OUTBOUND_ENABLED:
-        if message_log_id:
-            try:
-                claimed = db.mark_message_sending(message_log_id)
-            except Exception as claim_err:
-                logger.warning("OpenClaw send claim failed for message %s: %s", message_log_id, claim_err)
-                claimed = False
-
-            if not claimed:
-                logger.warning(
-                    "[OpenClaw Outbound] Message %s was not claimable; skipping duplicate send.",
-                    message_log_id,
-                )
-                return False
-
+    """Send a durable supplier-facing WhatsApp message through OpenClaw."""
+    if message_log_id:
         try:
-            payload = await run_in_threadpool(send_via_openclaw_whatsapp, phone_number, message)
-            message_id = payload.get("message_id")
-
-            if message_log_id:
-                db.mark_message_sent(
-                    message_log_id,
-                    external_message_id=message_id,
-                )
-
-            if message_id and rfq_id and supplier_id:
-                db.update_rfq_supplier_sent_message_id(
-                    rfq_id,
-                    supplier_id,
-                    str(message_id),
-                )
-
-            logger.info(
-                "[OpenClaw Outbound] Sent WhatsApp message to %s (rfq=%s supplier=%s message_log=%s message_id=%s)",
-                phone_number,
-                rfq_id,
-                supplier_id,
-                message_log_id,
-                message_id,
-            )
-            return True
-
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
-            clean_msg = f"OpenClaw transport/timeout error: {type(net_err).__name__} - {str(net_err)}"
-            if message_log_id:
-                db.mark_message_unknown(message_log_id, clean_msg)
-            logger.error("[OpenClaw Outbound] Ambiguous send state to %s: %s", phone_number, net_err)
+            claimed = db.mark_message_sending(message_log_id)
+        except Exception as claim_err:
+            logger.warning("OpenClaw send claim failed for message %s: %s", message_log_id, claim_err)
+            claimed = False
+        if not claimed:
+            logger.warning("[OpenClaw Outbound] Message %s was not claimable; skipping duplicate send.", message_log_id)
             return False
-        except Exception as send_err:
-            clean_msg = f"OpenClaw send failed: {str(send_err)}"
-            if message_log_id:
-                db.mark_message_failed(message_log_id, clean_msg)
-            logger.exception("[OpenClaw Outbound] Failed to send to %s", phone_number)
-            return False
-
-    await outbound_queue.put((phone_number, message, rfq_id, supplier_id, message_log_id))
-    return True
-
-
-def extract_evolution_message_ids(resp: Any) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Extracts canonical WhatsApp message ID (e.g. key.id) and any alternate ID from Evolution API response.
-    Returns (canonical_id, alt_id).
-    """
-    if not resp or not isinstance(resp, dict):
-        return None, None
-
-    candidate_ids = []
-
-    # Check key.id inside resp, response, data, messages[0]
-    for container in [resp, resp.get("response"), resp.get("data")]:
-        if isinstance(container, dict):
-            key = container.get("key")
-            if isinstance(key, dict):
-                k_id = key.get("id") or key.get("stanzaId")
-                if k_id:
-                    candidate_ids.append(str(k_id))
-
-    messages = resp.get("messages")
-    if isinstance(messages, list) and messages and isinstance(messages[0], dict):
-        m_key = messages[0].get("key")
-        if isinstance(m_key, dict):
-            k_id = m_key.get("id")
-            if k_id:
-                candidate_ids.append(str(k_id))
-
-    # Check root fields
-    for field in ["messageId", "stanzaId", "keyId", "id"]:
-        val = resp.get(field)
-        if val and isinstance(val, (str, int)):
-            candidate_ids.append(str(val))
-
-    if not candidate_ids:
-        return None, None
-
-    # Deduplicate while preserving order
-    seen = set()
-    unique_ids = []
-    for cid in candidate_ids:
-        cid_str = cid.strip()
-        if cid_str and cid_str not in seen:
-            seen.add(cid_str)
-            unique_ids.append(cid_str)
-
-    if not unique_ids:
-        return None, None
-
-    canonical = unique_ids[0]
-    norm_canonical = db.normalize_message_id(canonical)
-
-    alt_id = None
-    if len(unique_ids) > 1:
-        alt_id = unique_ids[1]
-    elif norm_canonical and norm_canonical != canonical:
-        alt_id = canonical
-        canonical = norm_canonical
-    elif norm_canonical:
-        canonical = norm_canonical
-
-    return canonical, alt_id
+    try:
+        payload = await run_in_threadpool(send_via_openclaw_whatsapp, phone_number, message)
+        message_id = payload.get("message_id")
+        if message_log_id:
+            db.mark_message_sent(message_log_id, external_message_id=message_id)
+        # Audit/debug correlation only. OpenClaw/WhatsApp owns native reply threading.
+        if message_id and rfq_id and supplier_id:
+            db.update_rfq_supplier_sent_message_id(rfq_id, supplier_id, str(message_id))
+        logger.info(
+            "[OpenClaw Outbound] Sent WhatsApp message to %s (rfq=%s supplier=%s message_log=%s message_id=%s)",
+            phone_number, rfq_id, supplier_id, message_log_id, message_id,
+        )
+        return True
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+        clean_msg = f"OpenClaw transport/timeout error: {type(net_err).__name__} - {str(net_err)}"
+        if message_log_id:
+            db.mark_message_unknown(message_log_id, clean_msg)
+        logger.error("[OpenClaw Outbound] Ambiguous send state to %s: %s", phone_number, net_err)
+        return False
+    except Exception as send_err:
+        clean_msg = f"OpenClaw send failed: {str(send_err)}"
+        if message_log_id:
+            db.mark_message_failed(message_log_id, clean_msg)
+        logger.exception("[OpenClaw Outbound] Failed to send to %s", phone_number)
+        return False
 
 
 def extract_inbound_quoted_info(data: dict) -> Tuple[Optional[str], Optional[str], str]:
@@ -585,7 +518,7 @@ def extract_inbound_quoted_info(data: dict) -> Tuple[Optional[str], Optional[str
                 or q_msg.get("text")
             )
 
-    # Direct quoted object (some Evolution / Baileys webhook versions)
+    # Direct quoted object (some legacy WhatsApp transport / Baileys webhook versions)
     if not quoted_stanza_id:
         quoted = data.get("quoted")
         if isinstance(quoted, dict):
@@ -611,131 +544,6 @@ def extract_inbound_quoted_info(data: dict) -> Tuple[Optional[str], Optional[str
         quoted_text = str(quoted_text)
 
     return quoted_stanza_id, quoted_text, message_type
-
-
-async def outbound_worker():
-    """Background worker that processes outbound WhatsApp messages one by one with randomized delay."""
-    while True:
-        try:
-            item = await outbound_queue.get()
-            if len(item) == 5:
-                phone_number, message, rfq_id, supplier_id, message_log_id = item
-            elif len(item) == 4:
-                phone_number, message, rfq_id, supplier_id = item
-                message_log_id = None
-            else:
-                phone_number, message = item[:2]
-                rfq_id, supplier_id, message_log_id = None, None, None
-
-            # Pause fail-safe: even a message queued just before the pause must not
-            # leave the system after the tenant has entered human-only mode.
-            if message_log_id:
-                try:
-                    queued_client_id = db.get_message_client_id(message_log_id)
-                    if queued_client_id and db.is_client_automation_paused(queued_client_id):
-                        print(f"[Outbound Worker] Skipping queued message {message_log_id}: client automation is paused.")
-                        outbound_queue.task_done()
-                        continue
-                except Exception as pause_err:
-                    print(f"[Outbound Worker] Pause check error for message {message_log_id}: {pause_err}")
-
-            # 1. Atomically claim message (queued -> sending) immediately before send attempt
-            if message_log_id:
-                try:
-                    claimed = db.mark_message_sending(message_log_id)
-                except Exception as claim_err:
-                    print(f"[Outbound Worker] Claim check error for message {message_log_id}: {claim_err}")
-                    claimed = False
-
-                if not claimed:
-                    print(f"[Outbound Worker] Skipping message {message_log_id} to {phone_number}: acquisition failed (not in 'queued' state or claim error).")
-                    outbound_queue.task_done()
-                    continue
-
-            try:
-                resp = await run_in_threadpool(send_whatsapp_message, phone_number, message)
-                
-                # Extract Evolution message IDs safely (canonical and alternate)
-                canonical_id, alt_id = extract_evolution_message_ids(resp)
-
-                # 2. Transition to 'sent'
-                if message_log_id:
-                    if alt_id:
-                        db.mark_message_sent(
-                            message_log_id,
-                            evolution_message_id=canonical_id,
-                            external_message_id=canonical_id,
-                            external_alt_message_id=alt_id,
-                        )
-                    else:
-                        db.mark_message_sent(message_log_id, evolution_message_id=canonical_id)
-
-                # Correlation persistence: update rfq_suppliers.sent_message_id and sent_message_alt_id
-                if canonical_id and rfq_id and supplier_id:
-                    if alt_id:
-                        db.update_rfq_supplier_sent_message_id(
-                            rfq_id,
-                            supplier_id,
-                            canonical_id,
-                            sent_message_alt_id=alt_id,
-                        )
-                    else:
-                        db.update_rfq_supplier_sent_message_id(rfq_id, supplier_id, canonical_id)
-
-
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
-                # Ambiguous transport error: cannot determine if Evolution accepted or dropped it
-                clean_msg = f"Transport/timeout error: {type(net_err).__name__} - {str(net_err)}"
-                if message_log_id:
-                    db.mark_message_unknown(message_log_id, clean_msg)
-                print(f"[Outbound Worker] Ambiguous transport error to {phone_number} (marked 'unknown'): {net_err}")
-            except requests.exceptions.HTTPError as http_err:
-                # Definite API rejection (HTTP 4xx/5xx)
-                clean_msg = f"HTTP error {http_err.response.status_code if http_err.response is not None else ''}: {str(http_err)}"
-                if message_log_id:
-                    db.mark_message_failed(message_log_id, clean_msg)
-                print(f"[Outbound Worker] Definite HTTP failure sending to {phone_number} (marked 'failed'): {http_err}")
-            except Exception as e:
-                # Other failure (e.g. missing config, JSON decode error, or runtime issue)
-                clean_msg = f"Send failure: {str(e)}"
-                if message_log_id:
-                    db.mark_message_failed(message_log_id, clean_msg)
-                print(f"[Outbound Worker] Error sending WhatsApp message to {phone_number} (marked 'failed'): {e}")
-            finally:
-                outbound_queue.task_done()
-
-
-            # Random jittered delay between outbound messages
-            delay = random.uniform(OUTBOUND_MIN_DELAY, OUTBOUND_MAX_DELAY)
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"[Outbound Worker] Unexpected error in worker loop: {e}")
-
-
-def send_whatsapp_message(phone_number: str, message: str) -> dict:
-    """Send a text message through the configured Evolution API instance."""
-    if not EVOLUTION_API_URL or not EVOLUTION_API_KEY or not EVOLUTION_INSTANCE:
-        raise RuntimeError("Evolution API configuration is missing")
-
-    url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE}"
-    headers = {
-        "Content-Type": "application/json",
-        "apikey": EVOLUTION_API_KEY,
-    }
-    payload = {
-        "number": phone_number,
-        "text": message,
-        "delay": EVOLUTION_TYPING_DELAY_MS,
-    }
-
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-    response.raise_for_status()
-    try:
-        return response.json()
-    except Exception:
-        return {"status": "ok", "raw": response.text}
 
 
 def normalize_phone(remote_jid: str) -> str:
@@ -1321,7 +1129,7 @@ async def check_deadlines_and_reminders():
                 continue
 
             # Delivery guardrail: rfq_suppliers.status='sent' only means the supplier
-            # was matched/queued. It does NOT prove Evolution/WhatsApp accepted the
+            # was matched/queued. It does NOT prove WhatsApp accepted the
             # initial RFQ. Reminders are allowed only after the persistent outbound
             # message lifecycle confirms status='sent'.
             delivery = db.get_initial_rfq_delivery_status(rfq.get("id"), supplier.get("id"))
@@ -1401,9 +1209,8 @@ REQUIRED_ENV_VARS = [
     "GROQ_API_KEY",
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
-    "EVOLUTION_API_URL",
-    "EVOLUTION_API_KEY",
-    "EVOLUTION_INSTANCE",
+    "OPENCLAW_BASE_URL",
+    "OPENCLAW_TOOL_API_KEY",
 ]
 
 
@@ -1414,13 +1221,9 @@ async def lifespan(app: FastAPI):
         await run_in_threadpool(db.purge_procurement_history)
         print(f"[{datetime.now(timezone.utc).isoformat()}] [Cleanup] Legacy procurement history purged.")
 
-    # Startup validation: verify all required backend env vars exist and are non-empty
     missing = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
     if missing:
-        raise RuntimeError(
-            f"Backend configuration error: Missing required environment variable(s): {', '.join(missing)}. "
-            f"Please check your root .env file."
-        )
+        raise RuntimeError(f"Backend configuration error: Missing required environment variable(s): {', '.join(missing)}.")
 
     try:
         sync_result = await run_in_threadpool(sync_existing_suppliers_to_openclaw, DEMO_CLIENT_ID)
@@ -1428,68 +1231,42 @@ async def lifespan(app: FastAPI):
     except Exception as sync_err:
         print(f"[{datetime.now(timezone.utc).isoformat()}] [OpenClaw Sync ERROR] Existing supplier backfill failed: {sync_err}")
 
-    worker_task = None
-    scheduler_started = False
+    try:
+        queued_msgs = db.get_queued_outbound_messages()
+        recovered_count = 0
+        for qm in queued_msgs:
+            msg_id = qm.get("id")
+            body = qm.get("body")
+            rfq_id = qm.get("related_rfq_id")
+            supplier_id = qm.get("supplier_id")
+            phone = None
+            if qm.get("suppliers") and isinstance(qm.get("suppliers"), dict):
+                phone = qm.get("suppliers").get("phone_number")
+            elif supplier_id:
+                supplier = db.get_supplier_by_id(supplier_id)
+                if supplier:
+                    phone = supplier.get("phone_number")
+            if phone and body:
+                await enqueue_message(phone, body, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_id)
+                recovered_count += 1
+        if recovered_count:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Recovered {recovered_count} queued OpenClaw outbound message(s).")
+    except Exception as rec_err:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan ERROR] Failed queued-message recovery: {rec_err}")
 
-    if LEGACY_EVOLUTION_OUTBOUND_ENABLED:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Legacy Evolution outbound ENABLED; starting worker and scheduler.")
-        worker_task = asyncio.create_task(outbound_worker())
-
-        # Startup recovery: re-enqueue persistent messages with status = 'queued'
-        try:
-            queued_msgs = db.get_queued_outbound_messages()
-            recovered_count = 0
-            for qm in queued_msgs:
-                msg_id = qm.get("id")
-                body = qm.get("body")
-                rfq_id = qm.get("related_rfq_id")
-                supplier_id = qm.get("supplier_id")
-                phone = None
-                if qm.get("suppliers") and isinstance(qm.get("suppliers"), dict):
-                    phone = qm.get("suppliers").get("phone_number")
-                elif supplier_id:
-                    s = db.get_supplier_by_id(supplier_id)
-                    if s:
-                        phone = s.get("phone_number")
-                if phone and body:
-                    await enqueue_message(phone, body, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_id)
-                    recovered_count += 1
-            if recovered_count > 0:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Recovered and re-enqueued {recovered_count} queued outbound message(s).")
-        except Exception as rec_err:
-            print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan ERROR] Failed to recover queued outbound messages: {rec_err}")
-
-        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Registering check_deadlines_and_reminders job on AsyncIOScheduler (interval: 15m, next_run: now)...")
-        scheduler.add_job(
-            check_deadlines_and_reminders,
-            "interval",
-            minutes=15,
-            next_run_time=datetime.now(timezone.utc),
-            id="check_deadlines_and_reminders",
-            replace_existing=True,
-        )
-        scheduler.start()
-        scheduler_started = True
-        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] AsyncIOScheduler started successfully.")
-    else:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Legacy Evolution outbound DISABLED; no outbound worker, queued-message recovery, or reminder scheduler started.")
-
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Starting RFQ deadline/reminder scheduler; WhatsApp delivery is OpenClaw-only.")
+    scheduler.add_job(
+        check_deadlines_and_reminders,
+        "interval",
+        minutes=15,
+        next_run_time=datetime.now(timezone.utc),
+        id="check_deadlines_and_reminders",
+        replace_existing=True,
+    )
+    scheduler.start()
     yield
-
-    if scheduler_started:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Shutting down legacy scheduler...")
-        scheduler.shutdown()
-
-    if worker_task is not None:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Shutting down legacy outbound worker...")
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
-
-    if scheduler_started or worker_task is not None:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Legacy Evolution outbound components shut down cleanly.")
+    print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Shutting down RFQ scheduler...")
+    scheduler.shutdown()
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -2872,625 +2649,6 @@ async def execute_validated_action(
         raise
 
 
-@app.post("/webhook/whatsapp")
-async def whatsapp_webhook(request: Request):
-    payload = {}
-    try:
-        payload = await request.json()
-        # Change 1 — Webhook event filtering: ignore non-upsert events
-        event_type = payload.get("event")
-        if event_type and event_type != "messages.upsert":
-            return {"status": "ignored", "reason": f"non-upsert event: {event_type}"}
-    except Exception as parse_err:
-        print(f"[Webhook Debug Error] Could not parse request body as JSON: {parse_err}")
-
-    try:
-        # Evolution API payload shape
-        data = payload.get("data", {})
-
-        if isinstance(data, list):
-            if not data:
-                return {"status": "ignored", "reason": "empty batched event"}
-            data = data[0]
-
-        key_data = data.get("key", {})
-
-        # Ignore outgoing messages sent by ourselves
-        if key_data.get("fromMe", False):
-            return {"status": "ignored", "reason": "outgoing message (fromMe)"}
-
-        msg_key_id = key_data.get("id")
-
-        raw_remote_jid = str(key_data.get("remoteJid") or "")
-        remote_jid_alt = str(
-            key_data.get("remoteJidAlt")
-            or key_data.get("participantAlt")
-            or ""
-        )
-
-        # Group chats are unrelated to supplier RFQ conversations. Ignoring them
-        # here prevents group JIDs (e.g. 1203...@g.us) from being treated as
-        # supplier phone numbers and flooding webhook_errors.
-        if raw_remote_jid.endswith("@g.us"):
-            return {"status": "ignored", "reason": "group chat message"}
-
-        # Newer WhatsApp/Evolution payloads may use an opaque LID as remoteJid
-        # and expose the actual phone JID in remoteJidAlt. Prefer the phone JID
-        # for supplier matching, falling back to participantAlt when available.
-        sender_jid = raw_remote_jid
-        if raw_remote_jid.endswith("@lid"):
-            sender_jid = remote_jid_alt or raw_remote_jid
-        elif not sender_jid and remote_jid_alt:
-            sender_jid = remote_jid_alt
-
-        sender_phone = normalize_phone(sender_jid)
-        message_text = (
-            data.get("message", {}).get("conversation", "")
-            or data.get("message", {}).get("extendedTextMessage", {}).get("text", "")
-        )
-        quoted_stanza_id, quoted_text, message_type = extract_inbound_quoted_info(data)
-
-        if not sender_phone or not message_text:
-            return {"status": "ignored", "reason": "no message content"}
-
-        # Resolve tenant/client unambiguously by Evolution API instance name
-        instance_name = (
-            payload.get("instance")
-            or payload.get("instanceName")
-            or (data.get("instance") if isinstance(data, dict) else None)
-            or (data.get("instanceName") if isinstance(data, dict) else None)
-            or EVOLUTION_INSTANCE
-        )
-
-        client = db.get_client_by_instance(instance_name) if instance_name else None
-        if not client:
-            err_msg = f"Unknown or unconfigured instance '{instance_name}' in webhook payload."
-            db.log_webhook_error(
-                error_message=err_msg,
-                traceback_str=f"Instance '{instance_name}' does not match any client in database. Raw payload: {payload}",
-                raw_payload=payload,
-            )
-            print(f"[Webhook] {err_msg}")
-            return {"status": "ignored", "reason": f"unknown instance: {instance_name}"}
-
-        client_id = client["id"]
-
-        # Phase 7.1: Durable Webhook Idempotency Claim (atomic at database level)
-        if msg_key_id:
-            claimed = db.claim_webhook_message(client_id, msg_key_id)
-            if not claimed:
-                print(f"[Webhook] Duplicate message '{msg_key_id}' for client '{client_id}' already processed. Ignoring.")
-                return {"status": "ignored", "reason": f"already processed message id: {msg_key_id}"}
-
-        # Look up supplier scoped strictly to this client
-        supplier = db.get_supplier_by_phone(client_id, sender_phone)
-        if not supplier:
-            err_msg = f"Unknown supplier: sender_phone='{sender_phone}' (raw remoteJid='{raw_remote_jid}', resolved senderJid='{sender_jid}') not found for client '{client.get('name')}' (id={client_id}, instance='{instance_name}')."
-            db.log_webhook_error(
-                error_message=err_msg,
-                traceback_str=f"Unmatched incoming WhatsApp message from sender_phone='{sender_phone}' for client {client_id}. Message: {message_text[:500]}",
-                raw_payload=payload,
-            )
-            print(f"[Webhook] {err_msg}")
-            if msg_key_id:
-                db.complete_webhook_message(client_id, msg_key_id)
-            return {"status": "ignored", "reason": "unknown supplier"}
-
-        # Task 2: Log safely, without secrets, phone numbers, or auth tokens
-        print(f"[Webhook] Inbound msg_id='{msg_key_id}' type='{message_type}' quoted_stanzaId='{quoted_stanza_id or 'none'}'")
-
-        inbound_log_id = db.log_message(client_id, supplier["id"], "inbound", message_text)
-        decision_id = None
-
-        # Client-level automation pause: preserve the supplier message and route it
-        # to humans without calling any LLM, mutating quotes, negotiating, clarifying,
-        # or sending an automatic WhatsApp response.
-        if client.get("automation_paused"):
-            paused_rfq_id = None
-            if quoted_stanza_id:
-                try:
-                    paused_match = db.get_rfq_supplier_by_sent_message_id(supplier["id"], quoted_stanza_id)
-                    paused_rfq = paused_match.get("rfqs", paused_match) if isinstance(paused_match, dict) else None
-                    paused_rfq_id = paused_rfq.get("id") if isinstance(paused_rfq, dict) else None
-                except Exception as pause_match_err:
-                    logger.warning("Paused-mode stanza correlation failed: %s", pause_match_err)
-
-            if paused_rfq_id:
-                db.update_message_related_rfq(inbound_log_id, paused_rfq_id)
-
-            db.flag_for_human_review(
-                client_id=client_id,
-                supplier_id=supplier["id"],
-                rfq_id=paused_rfq_id,
-                reason="Automation is paused for this client. New supplier message requires human handling only.",
-                category="automation_paused_human_only",
-                raw_message=message_text,
-                metadata={
-                    "type": "automation_paused_human_only",
-                    "source_message_id": inbound_log_id,
-                    "quoted_stanza_id": quoted_stanza_id,
-                    "pause_reason": client.get("automation_pause_reason"),
-                },
-            )
-            if msg_key_id:
-                db.complete_webhook_message(client_id, msg_key_id)
-            return {
-                "status": "paused_human_only",
-                "rfq_id": paused_rfq_id,
-                "reason": "client automation paused",
-            }
-
-        # 1. Deterministic Quoted / Stanza Match
-        matched_rfq_supplier = None
-        match_source = None
-        matched_rfq_id = None
-
-        if quoted_stanza_id:
-            matched_rfq_supplier = db.get_rfq_supplier_by_sent_message_id(supplier["id"], quoted_stanza_id)
-            if not matched_rfq_supplier:
-                print(f"[Webhook] Quoted stanzaId '{quoted_stanza_id}' present on msg '{msg_key_id}' but does not match any open RFQ for supplier {supplier['id']}. Failing closed without cross-RFQ fallback.")
-                if msg_key_id:
-                    db.complete_webhook_message(client_id, msg_key_id)
-                return {"status": "ignored", "reason": "quoted_stanza_id already responded or closed"}
-            match_source = "exact_stanza"
-            matched_rfq = matched_rfq_supplier.get("rfqs", matched_rfq_supplier)
-            matched_rfq_id = matched_rfq.get("id") if isinstance(matched_rfq, dict) else None
-            db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
-            print(f"[Webhook] Quoted stanzaId '{quoted_stanza_id}' resolved to RFQ '{matched_rfq_id}'")
-
-        elif quoted_text:
-            matched_rfq_supplier = db.get_rfq_supplier_by_quoted_text(supplier["id"], quoted_text)
-            if matched_rfq_supplier:
-                match_source = "quoted_text"
-                matched_rfq = matched_rfq_supplier.get("rfqs", matched_rfq_supplier)
-                matched_rfq_id = matched_rfq.get("id") if isinstance(matched_rfq, dict) else None
-                db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
-
-        # 2. Check Pending Clarification
-        pending = db.get_pending_clarification_for_supplier(supplier["id"])
-        if pending and not isinstance(pending, dict):
-            pending = None
-
-        # 3. Retrieve Open RFQs & Conversation History for Candidate Evaluation
-        all_open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"]) or []
-        if matched_rfq_supplier and not any(
-            (e.get("rfqs", {}).get("id") or e.get("id")) == (matched_rfq_supplier.get("rfqs", {}).get("id") or matched_rfq_supplier.get("id"))
-            for e in all_open_rfqs
-        ):
-            all_open_rfqs.append(matched_rfq_supplier)
-
-        all_rfq_ids = [
-            (e.get("rfqs", e).get("id") if isinstance(e.get("rfqs", e), dict) else None)
-            for e in all_open_rfqs
-        ]
-        all_rfq_ids = [r for r in all_rfq_ids if r]
-
-        prior_quotes = []
-        if all_rfq_ids:
-            try:
-                prior_quotes = db.get_supplier_prior_quotes(supplier["id"], all_rfq_ids)
-            except Exception as e:
-                logger.warning(f"Error loading prior quotes: {e}")
-
-        try:
-            conv_history = db.get_supplier_conversation_history(client_id, supplier["id"], limit=10, exclude_message_id=inbound_log_id)
-        except Exception as e:
-            logger.warning(f"Error loading conversation history: {e}")
-            conv_history = []
-
-        # Classify open RFQs into Unanswered (Awaiting Initial Response) vs Responded (Open for Revisions)
-        unanswered_rfqs = []
-        responded_rfqs = []
-        for entry in all_open_rfqs:
-            r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
-            r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
-            status = entry.get("status") if isinstance(entry, dict) else None
-            has_quote = any(str(q.get("rfq_id")) == r_id for q in prior_quotes)
-            if status == "sent" and not has_quote:
-                unanswered_rfqs.append(entry)
-            else:
-                responded_rfqs.append(entry)
-
-        # Check Active Negotiation Session
-        active_session = db.get_active_negotiation_session_for_supplier(client_id, supplier["id"])
-        session_entry = None
-        if active_session:
-            session_rfq_id = str(active_session.get("rfq_id"))
-            session_entry = next(
-                (e for e in all_open_rfqs if str(e.get("rfqs", e).get("id")) == session_rfq_id),
-                None,
-            )
-
-        # 4. Route candidate RFQs by strict priority
-        # 1. Exact quoted stanza match (always wins, deterministic)
-        # 2. Explicit RFQ ID / product reference
-        # 3. Active pending clarification
-        # 4. Problem 1 Fix: Active session + Unanswered RFQ + Generic Standalone Message -> Pending Clarification
-        # 5. Single unanswered RFQ / Single open RFQ -> Route automatically
-        # 6. Active session continuity (when no unanswered RFQs exist)
-
-        # Deterministic pre-LLM gate: casual WhatsApp chatter must not spend model tokens.
-        msg_lower = (message_text or "").lower()
-        if not should_invoke_commercial_parser(
-            message_text,
-            matched_rfq_supplier=matched_rfq_supplier,
-            pending=pending,
-            active_session=active_session,
-            open_rfqs=all_open_rfqs,
-        ):
-            if msg_key_id:
-                db.complete_webhook_message(client_id, msg_key_id)
-            return {
-                "status": "ignored_non_procurement",
-                "reason": "No active procurement context or deterministic commercial signal",
-            }
-
-        # Structured commercial parsing uses the utility model only after the deterministic gate.
-        commercial_parse = None
-        try:
-            commercial_parse = groq_client.parse_commercial_message(
-                message_text,
-                candidate_rfqs=all_open_rfqs,
-            )
-        except Exception as parse_err:
-            logger.warning(f"Error in parse_commercial_message: {parse_err}")
-
-        explicit_prod = commercial_parse.get("explicit_product_reference") if commercial_parse else None
-
-        # Multi-RFQ batch ingestion: suppliers often answer several RFQs in one
-        # WhatsApp price list. Let the AI fact parser map each line to an active
-        # candidate RFQ, then validate every mutation against hard DB/policy
-        # invariants before recording. This must run before single-RFQ session
-        # continuity so one active negotiation cannot swallow the whole batch.
-        if len(all_open_rfqs) >= 2 and "\n" in (message_text or ""):
-            try:
-                multi_parse = groq_client.parse_multi_rfq_quotes(
-                    message_text,
-                    candidate_rfqs=all_open_rfqs,
-                )
-                multi_result = await process_multi_rfq_quote_batch(
-                    parsed_items=(multi_parse or {}).get("items") or [],
-                    all_open_rfqs=all_open_rfqs,
-                    supplier=supplier,
-                    client_id=client_id,
-                    raw_message=message_text,
-                    inbound_log_id=inbound_log_id,
-                    pending_clarification=pending,
-                )
-                if multi_result:
-                    if msg_key_id:
-                        db.complete_webhook_message(client_id, msg_key_id)
-                    return multi_result
-            except Exception as multi_err:
-                logger.warning("Multi-RFQ quote ingestion failed; continuing normal flow: %s", multi_err)
-
-        if matched_rfq_supplier:
-            # Priority 1: Exact WhatsApp Stanza Match always wins & locks
-            open_rfqs = [matched_rfq_supplier]
-        else:
-            # Check for Priority 2: Explicit RFQ ID or Product Reference
-            explicit_candidates = []
-            for entry in all_open_rfqs:
-                r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
-                r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
-                r_prod = (r_obj.get("product_name") or "").strip().lower() if isinstance(r_obj, dict) else ""
-                r_specs = (r_obj.get("specs") or "").strip().lower() if isinstance(r_obj, dict) else ""
-
-                if r_id and (r_id.lower() in msg_lower or f"rfq {r_id.lower()}" in msg_lower):
-                    explicit_candidates.append(entry)
-                    continue
-
-                if r_prod and (r_prod in msg_lower or (explicit_prod and explicit_prod.lower() in r_prod)):
-                    explicit_candidates.append(entry)
-                    continue
-
-                if r_specs and len(r_specs) > 3 and r_specs in msg_lower:
-                    explicit_candidates.append(entry)
-
-            # Deduplicate explicit candidates by RFQ ID
-            unique_explicit = []
-            seen_explicit_ids = set()
-            for cand in explicit_candidates:
-                cand_rfq_id = str(cand.get("rfqs", cand).get("id"))
-                if cand_rfq_id not in seen_explicit_ids:
-                    seen_explicit_ids.add(cand_rfq_id)
-                    unique_explicit.append(cand)
-
-            if len(unique_explicit) == 1:
-                # Priority 2: Explicit RFQ ID / product reference identified
-                open_rfqs = [unique_explicit[0]]
-                matched_rfq_id = str(unique_explicit[0].get("rfqs", unique_explicit[0]).get("id"))
-                match_source = "explicit_product"
-                db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
-            elif pending:
-                # Priority 3: Active Pending Clarification strictly limits candidates to pending_rfq_ids
-                candidate_ids = pending.get("pending_rfq_ids", [])
-                pending_entries = db.get_rfqs_by_ids(candidate_ids) if candidate_ids else []
-
-                matching_pending = []
-                for entry in pending_entries:
-                    r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
-                    r_id = str(r_obj.get("id")) if isinstance(r_obj, dict) else None
-                    r_prod = (r_obj.get("product_name") or "").strip().lower() if isinstance(r_obj, dict) else ""
-                    if (r_id and r_id.lower() in msg_lower) or (r_prod and (r_prod in msg_lower or (explicit_prod and explicit_prod.lower() in r_prod))):
-                        matching_pending.append(entry)
-
-                if len(matching_pending) == 1:
-                    open_rfqs = [matching_pending[0]]
-                    matched_rfq_id = str(matching_pending[0].get("rfqs", matching_pending[0]).get("id"))
-                    match_source = "clarification_resolution"
-                    db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
-                else:
-                    open_rfqs = pending_entries
-            else:
-                # Priority 4+: state-aware routing intent narrows candidates but never
-                # selects an RFQ by itself. Exact stanza/product/pending clarification
-                # above always win.
-                routing_result = select_state_aware_routing_candidates(
-                    routing_intent=(commercial_parse or {}).get("routing_intent") or "UNKNOWN",
-                    all_open_rfqs=all_open_rfqs,
-                    unanswered_rfqs=unanswered_rfqs,
-                    responded_rfqs=responded_rfqs,
-                    session_entry=session_entry,
-                    active_session=active_session,
-                    conversation_history=conv_history,
-                    incoming_message_text=message_text,
-                )
-                open_rfqs = routing_result["candidates"]
-                matched_rfq_id = routing_result.get("matched_rfq_id")
-                match_source = routing_result.get("match_source")
-                if matched_rfq_id:
-                    db.update_message_related_rfq(inbound_log_id, matched_rfq_id)
-
-        if not open_rfqs and not matched_rfq_supplier and not pending:
-            if msg_key_id:
-                db.complete_webhook_message(client_id, msg_key_id)
-            return {
-                "status": "no_open_rfq",
-                "note": "message received but no active RFQ to match",
-            }
-
-        # 5. Fetch Negotiation Attempts and Competitive Context for Active Candidates
-        candidate_rfq_ids = []
-        for e in open_rfqs:
-            rfq_obj = e.get("rfqs", e) if isinstance(e, dict) else e
-            if isinstance(rfq_obj, dict) and rfq_obj.get("id"):
-                candidate_rfq_ids.append(rfq_obj["id"])
-
-        negotiation_attempts = {}
-        for r_id in candidate_rfq_ids:
-            try:
-                negotiation_attempts[r_id] = db.get_negotiation_attempts(r_id, supplier["id"])
-            except Exception as e:
-                logger.warning(f"Error loading negotiation attempts for RFQ {r_id}: {e}")
-                negotiation_attempts[r_id] = 0
-
-        competitive_context = {}
-        for r_id in candidate_rfq_ids:
-            try:
-                comp_ctx = db.get_competitive_pricing_context(r_id, supplier["id"])
-                if isinstance(comp_ctx, dict) and comp_ctx.get("has_competition"):
-                    competitive_context[r_id] = f"Best competing quote is AED {comp_ctx['best_competing_price']} (from {comp_ctx['competing_quotes_count']} other supplier(s))"
-            except Exception as e:
-                logger.warning(f"Error loading competitive context for RFQ {r_id}: {e}")
-
-        # 6. Build Single Unified AgentContext
-        context = AgentContext(
-            client_id=client_id,
-            supplier_id=supplier["id"],
-            supplier_name=supplier.get("name"),
-            supplier_phone=supplier.get("phone_number"),
-            input_origin="supplier",
-            matched_rfq_id=matched_rfq_id,
-            match_source=match_source,
-            open_rfqs=open_rfqs,
-            pending_clarification=pending,
-            prior_quotes=prior_quotes,
-            negotiation_attempts=negotiation_attempts,
-            active_negotiation_session=active_session,
-            competitive_context=competitive_context,
-            conversation_history=conv_history,
-            source_message_id=inbound_log_id,
-        )
-
-        # 7. Unified Reasoning Execution
-        try:
-            decision = groq_client.reason_about_procurement_message(message_text, context, input_origin="supplier")
-        except Exception as groq_err:
-            tb_str = traceback.format_exc()
-            print(f"\n=== GROQ ERROR (reason_about_procurement_message) ===\n{tb_str}\n======================================================\n")
-            db.log_webhook_error(f"Groq reason_about_procurement_message error: {groq_err}", tb_str, payload)
-            reason = f"Groq AI service error during message reasoning: {str(groq_err)}"
-            db.flag_for_human_review(
-                client_id=client_id,
-                supplier_id=supplier["id"],
-                rfq_id=matched_rfq_id,
-                reason=reason,
-                category="other",
-                raw_message=message_text,
-            )
-            if pending:
-                db.abandon_pending_clarification(pending["id"])
-            msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
-            await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
-            if msg_key_id:
-                db.complete_webhook_message(client_id, msg_key_id)
-            return {"status": "escalated_due_to_groq_error", "reason": reason}
-
-        decision_tool = decision.get("tool_name", "")
-        decision_args = dict(decision.get("arguments", {}))
-        if decision_tool in ("record_quote", "negotiate_price") and not decision_args.get("rfq_id") and matched_rfq_id:
-            decision_args["rfq_id"] = matched_rfq_id
-
-        proposal = ActionProposal(
-            tool_name=decision_tool,
-            arguments=decision_args,
-            raw_message=message_text,
-        )
-
-        # Record Agent Decision (provisional pending validator verdict)
-        target_rfq_for_decision = proposal.arguments.get("rfq_id") or matched_rfq_id
-        decision_record = db.record_agent_decision(
-            client_id=client_id,
-            origin="supplier",
-            tool_name=proposal.tool_name,
-            arguments=proposal.arguments,
-            validation_status="approved",
-            validation_reason=None,
-            execution_status="pending",
-            rfq_id=target_rfq_for_decision,
-            supplier_id=supplier["id"],
-            inbound_message_id=inbound_log_id,
-        )
-        decision_id = decision_record.get("id") if decision_record else None
-
-        # 8. Policy Validator Execution (with Deterministic Stanza Lock & Semantic Clarification Context)
-        validation = validate_action(
-            proposal,
-            client_id=client_id,
-            supplier_id=supplier["id"],
-            context_rfqs=open_rfqs,
-            matched_rfq_id=context.matched_rfq_id,
-            pending_clarification=context.pending_clarification,
-            input_origin="supplier",
-            source_message_id=inbound_log_id,
-        )
-
-        if not validation.is_valid:
-            print(f"[Policy Validator] Rejected action '{proposal.tool_name}': {validation.reason}")
-            if decision_id:
-                db.update_agent_decision(
-                    decision_id,
-                    validation_status="rejected",
-                    validation_reason=validation.reason,
-                    execution_status="not_executed",
-                )
-
-            # One controlled validator-guided repair attempt for recoverable
-            # sequencing/prerequisite failures. The Policy Validator remains
-            # authoritative: the model only proposes a corrected next tool call.
-            recoverable_policy_rejection = (
-                isinstance(validation.reason, str)
-                and (
-                    validation.reason.startswith("Negotiation blocked:")
-                    or (
-                        proposal.tool_name == "negotiate_price"
-                        and "does not match trusted effective quote price" in validation.reason
-                    )
-                )
-                and matched_rfq_id
-            )
-
-            if recoverable_policy_rejection:
-                try:
-                    repaired = groq_client.reason_with_validator_feedback(
-                        message_text=message_text,
-                        context=context,
-                        rejected_tool_name=proposal.tool_name,
-                        rejected_arguments=proposal.arguments,
-                        validator_reason=validation.reason,
-                        input_origin="supplier",
-                    )
-                    repaired_tool = repaired.get("tool_name", "")
-                    repaired_args = dict(repaired.get("arguments", {}))
-                    if repaired_tool in ("record_quote", "negotiate_price") and not repaired_args.get("rfq_id"):
-                        repaired_args["rfq_id"] = matched_rfq_id
-
-                    repaired_proposal = ActionProposal(
-                        tool_name=repaired_tool,
-                        arguments=repaired_args,
-                        raw_message=message_text,
-                    )
-                    repaired_validation = validate_action(
-                        repaired_proposal,
-                        client_id=client_id,
-                        supplier_id=supplier["id"],
-                        context_rfqs=open_rfqs,
-                        matched_rfq_id=context.matched_rfq_id,
-                        pending_clarification=context.pending_clarification,
-                        input_origin="supplier",
-                        source_message_id=inbound_log_id,
-                    )
-
-                    repaired_decision = db.record_agent_decision(
-                        client_id=client_id,
-                        origin="supplier",
-                        tool_name=repaired_proposal.tool_name,
-                        arguments=repaired_proposal.arguments,
-                        validation_status="approved" if repaired_validation.is_valid else "rejected",
-                        validation_reason=(
-                            "Validator-guided one-shot repair."
-                            if repaired_validation.is_valid
-                            else repaired_validation.reason
-                        ),
-                        execution_status="pending" if repaired_validation.is_valid else "not_executed",
-                        rfq_id=repaired_proposal.arguments.get("rfq_id") or matched_rfq_id,
-                        supplier_id=supplier["id"],
-                        inbound_message_id=inbound_log_id,
-                    )
-                    repaired_decision_id = repaired_decision.get("id") if repaired_decision else None
-
-                    if repaired_validation.is_valid:
-                        exec_res = await execute_validated_action(
-                            repaired_validation,
-                            context,
-                            message_text,
-                            supplier,
-                            client_id,
-                            decision_id=repaired_decision_id,
-                        )
-                        if msg_key_id:
-                            db.complete_webhook_message(client_id, msg_key_id)
-                        return exec_res
-
-                    logger.warning(
-                        "Validator-guided repair rejected for RFQ %s: %s",
-                        matched_rfq_id,
-                        repaired_validation.reason,
-                    )
-                except Exception as repair_err:
-                    logger.warning(
-                        "Validator-guided repair failed for RFQ %s: %s",
-                        matched_rfq_id,
-                        repair_err,
-                    )
-
-            db.flag_for_human_review(
-                client_id=client_id,
-                supplier_id=supplier["id"],
-                rfq_id=proposal.arguments.get("rfq_id") or matched_rfq_id,
-                reason=f"Policy Validator rejection: {validation.reason}",
-                category="other",
-                raw_message=message_text,
-            )
-            if pending:
-                db.abandon_pending_clarification(pending["id"])
-            if matched_rfq_id:
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG, related_rfq_id=matched_rfq_id)
-                await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, rfq_id=matched_rfq_id, supplier_id=supplier["id"], message_log_id=msg_log_id)
-            else:
-                msg_log_id = db.log_message(client_id, supplier["id"], "outbound", HUMAN_ACK_MSG)
-                await enqueue_message(supplier["phone_number"], HUMAN_ACK_MSG, message_log_id=msg_log_id)
-            if msg_key_id:
-                db.complete_webhook_message(client_id, msg_key_id)
-            return {"status": "rejected_by_policy", "reason": validation.reason}
-
-        # 9. Consolidated Deterministic Execution
-        exec_res = await execute_validated_action(validation, context, message_text, supplier, client_id, decision_id=decision_id)
-        if msg_key_id:
-            db.complete_webhook_message(client_id, msg_key_id)
-        return exec_res
-
-    except Exception as e:
-        tb_str = traceback.format_exc()
-        print(f"\n=== WEBHOOK ERROR ===\n{tb_str}\n=====================\n")
-        db.log_webhook_error(str(e), tb_str, payload)
-        if "client_id" in locals() and client_id and "msg_key_id" in locals() and msg_key_id:
-            db.fail_webhook_message(client_id, msg_key_id, str(e))
-        if "decision_id" in locals() and decision_id:
-            db.update_agent_decision(decision_id, execution_status="failed", execution_error=str(e))
-        return {"status": "error_logged", "note": "internal error, logged for review"}
-
 
 @app.post("/auth/reset-password")
 async def reset_password(payload: PasswordResetRequest, request: Request):
@@ -3918,25 +3076,11 @@ async def final_quote_decision_endpoint(
 
 @app.post("/flags/{flag_id}/respond")
 async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, current_user=Depends(get_current_user)):
-    """
-    Phase 9: Operator Instruction Reasoning Pipeline.
-    1. Authenticates user and verifies tenant flag ownership.
-    2. If send_to_supplier is False, performs administrative resolve without messaging.
-    3. If send_to_supplier is True:
-       - Atomically claims pending flag (pending -> processing).
-       - Derives trusted tenant, supplier, and locked RFQ from flag.
-       - Assembles full AgentContext(input_origin="operator").
-       - Invokes reason_about_procurement_message(payload.response, context).
-       - Validates proposal with Policy Validator (enforcing stanza/operator RFQ lock).
-       - Executes validated action and durable message persistence.
-       - Marks flag as resolved (processing -> resolved).
-       - On reasoning/validation/execution failure, safely releases claim (processing -> pending).
-    """
+    """Apply trusted human guidance to the same supplier OpenClaw WhatsApp session."""
     client_id = current_user.get("client_id")
     if not client_id:
         raise HTTPException(status_code=401, detail="Authentication missing client_id")
 
-    # If operator requested administrative resolution without sending to supplier
     if not payload.send_to_supplier:
         updated = db.resolve_flag_with_response(flag_id, payload.response, client_id=client_id)
         if not updated:
@@ -3945,186 +3089,39 @@ async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, cu
                 raise HTTPException(status_code=404, detail="Flagged item not found")
         return {"status": "resolved", "flag_id": flag_id, "sent_to_supplier": False}
 
-    # Atomic claim: pending -> processing
     flag = db.claim_flag_for_operator_action(flag_id, client_id)
     if not flag:
         existing = db.get_flag_by_id(flag_id, client_id=client_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Flagged item not found")
-        return JSONResponse(
-            status_code=409,
-            content={"status": "conflict", "detail": f"Flag is already {existing.get('status')}"},
-        )
+        return JSONResponse(status_code=409, content={"status": "conflict", "detail": f"Flag is already {existing.get('status')}"})
 
-    supplier = flag.get("suppliers")
-    if not supplier:
+    supplier = flag.get("suppliers") or db.get_supplier_by_id(flag.get("supplier_id"))
+    phone = supplier.get("phone_number") if supplier else None
+    if not supplier or not phone:
         db.release_flag_claim(flag_id, client_id)
-        raise HTTPException(status_code=400, detail="Supplier not associated with flag")
-
-    rfq_id = flag.get("rfq_id")
+        raise HTTPException(status_code=400, detail="Supplier phone is unavailable for this flag")
 
     try:
-        # Load supplier open RFQs and context
-        open_rfqs = db.get_open_rfqs_for_supplier(supplier["id"]) or []
-        open_rfq_ids = []
-        for e in open_rfqs:
-            rfq_obj = e.get("rfqs", e) if isinstance(e, dict) else e
-            if isinstance(rfq_obj, dict) and rfq_obj.get("id"):
-                open_rfq_ids.append(rfq_obj["id"])
-
-        prior_quotes = []
-        if open_rfq_ids:
-            try:
-                prior_quotes = db.get_supplier_prior_quotes(supplier["id"], open_rfq_ids)
-            except Exception as e:
-                logger.warning(f"Error loading prior quotes: {e}")
-
-        negotiation_attempts = {}
-        for r_id in open_rfq_ids:
-            try:
-                negotiation_attempts[r_id] = db.get_negotiation_attempts(r_id, supplier["id"])
-            except Exception as e:
-                logger.warning(f"Error loading negotiation attempts for RFQ {r_id}: {e}")
-                negotiation_attempts[r_id] = 0
-
-        competitive_context = {}
-        for r_id in open_rfq_ids:
-            try:
-                comp_ctx = db.get_competitive_pricing_context(r_id, supplier["id"])
-                if isinstance(comp_ctx, dict) and comp_ctx.get("has_competition"):
-                    competitive_context[r_id] = f"Best competing quote is AED {comp_ctx['best_competing_price']} (from {comp_ctx['competing_quotes_count']} other supplier(s))"
-            except Exception as e:
-                logger.warning(f"Error loading competitive context for RFQ {r_id}: {e}")
-
-        # Fetch pending clarification if any
-        pending_clarification = None
-        try:
-            pending_clarification = db.get_pending_clarification_for_supplier(supplier["id"])
-        except Exception as e:
-            logger.warning(f"Error loading pending clarification: {e}")
-
-        # Fetch conversation history
-        conv_history = []
-        try:
-            conv_history = db.get_supplier_conversation_history(client_id, supplier["id"], limit=10)
-        except Exception as e:
-            logger.warning(f"Error loading conversation history: {e}")
-
-        # Build single unified AgentContext with input_origin="operator" and operator flag lock
-        operator_active_session = None
-        if rfq_id:
-            try:
-                candidate_session = db.get_active_negotiation_session_for_supplier(client_id, supplier["id"])
-                if candidate_session and str(candidate_session.get("rfq_id")) == str(rfq_id):
-                    operator_active_session = candidate_session
-            except Exception as session_err:
-                logger.warning("Could not load operator negotiation session: %s", session_err)
-
-        context = AgentContext(
-            client_id=client_id,
-            supplier_id=supplier["id"],
-            supplier_name=supplier.get("name"),
-            supplier_phone=supplier.get("phone_number"),
-            input_origin="operator",
-            matched_rfq_id=rfq_id,
-            match_source="operator_flag" if rfq_id else None,
-            open_rfqs=open_rfqs,
-            pending_clarification=pending_clarification,
-            prior_quotes=prior_quotes,
-            negotiation_attempts=negotiation_attempts,
-            active_negotiation_session=operator_active_session,
-            competitive_context=competitive_context,
-            conversation_history=conv_history,
-            review_flag_id=flag.get("id"),
-            review_reason=flag.get("reason"),
-            review_category=flag.get("category"),
-            review_raw_message=flag.get("raw_message"),
-        )
-
-        # Unified LLM reasoning
-        proposal_dict = groq_client.reason_about_procurement_message(
+        result = await run_in_threadpool(
+            send_operator_instruction_to_openclaw,
+            phone,
             payload.response,
-            context,
-            input_origin="operator",
-        )
-        action_proposal = ActionProposal(
-            tool_name=proposal_dict.get("tool_name", ""),
-            arguments=proposal_dict.get("arguments", {}),
-        )
-
-        # Policy Validator with operator RFQ lock & clarification context
-        validation = validate_action(
-            proposal=action_proposal,
-            client_id=client_id,
-            supplier_id=supplier["id"],
-            context_rfqs=context.open_rfqs,
-            matched_rfq_id=rfq_id,
-            pending_clarification=context.pending_clarification,
-            input_origin="operator",
-        )
-
-        # Record Agent Decision for operator flow
-        target_rfq_for_op = action_proposal.arguments.get("rfq_id") or rfq_id
-        decision_record = db.record_agent_decision(
-            client_id=client_id,
-            origin="operator",
-            tool_name=action_proposal.tool_name,
-            arguments=action_proposal.arguments,
-            validation_status="approved",
-            validation_reason=None,
-            execution_status="pending",
-            rfq_id=target_rfq_for_op,
-            supplier_id=supplier["id"],
             flag_id=flag_id,
+            rfq_id=flag.get("rfq_id"),
+            reason=flag.get("reason"),
         )
-        decision_id = decision_record.get("id") if decision_record else None
-
-        if not validation.is_valid:
-            logger.warning(f"[POLICY REJECTION] Operator instruction failed policy: {validation.reason}")
-            if decision_id:
-                db.update_agent_decision(
-                    decision_id,
-                    validation_status="rejected",
-                    validation_reason=validation.reason,
-                    execution_status="not_executed",
-                )
-            db.release_flag_claim(flag_id, client_id)
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "status": "rejected_by_policy",
-                    "reason": validation.reason,
-                    "proposal": action_proposal.model_dump(),
-                },
-            )
-
-        # Execute validated action
-        exec_result = await execute_validated_action(
-            validation=validation,
-            context=context,
-            raw_message=payload.response,
-            supplier=supplier,
-            client_id=client_id,
-            decision_id=decision_id,
-        )
-
-        # Complete flag transition to resolved
         db.complete_flag_operator_action(flag_id, client_id, payload.response)
-
         return {
             "status": "resolved",
             "flag_id": flag_id,
-            "action": validation.action,
-            "result": exec_result,
             "sent_to_supplier": True,
+            "openclaw": {"session_key": result.get("session_key"), "phone_number": result.get("phone_number")},
         }
-
-    except Exception as e:
-        logger.error(f"Error processing operator action for flag {flag_id}: {e}", exc_info=True)
+    except Exception as exc:
+        logger.exception("OpenClaw operator instruction failed for flag %s", flag_id)
         db.release_flag_claim(flag_id, client_id)
-        if "decision_id" in locals() and decision_id:
-            db.update_agent_decision(decision_id, execution_status="failed", execution_error=str(e))
-        raise HTTPException(status_code=500, detail=f"Failed to process operator instruction: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Failed to continue supplier session in OpenClaw: {exc}")
 
 
 class NegotiationAuthorizationRequest(BaseModel):
