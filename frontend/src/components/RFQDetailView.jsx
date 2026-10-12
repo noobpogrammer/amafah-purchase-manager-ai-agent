@@ -611,6 +611,16 @@ export default function RFQDetailView({
                                       {q.variant_label}
                                     </span>
                                   )}
+                                  {q.is_pending_revision && (
+                                    <span className="badge badge-warning" style={{ marginLeft: '0.4rem' }}>
+                                      Revision pending
+                                    </span>
+                                  )}
+                                  {q.is_current_accepted && (
+                                    <span className="badge badge-best" style={{ marginLeft: '0.4rem' }}>
+                                      Currently accepted
+                                    </span>
+                                  )}
                                   {isBest && (
                                     <span className="badge badge-best" style={{ marginLeft: '0.4rem' }}>
                                       <CheckCircle size={12} /> Best Offer
