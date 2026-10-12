@@ -2883,6 +2883,28 @@ def get_initial_rfq_delivery_status(rfq_id: str, supplier_id: str) -> Optional[d
     if not rfq_id or not supplier_id:
         return None
     try:
+        bundle_items = (
+            supabase.table("supplier_message_bundle_items")
+            .select("bundle_id")
+            .eq("rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .eq("kind", "initial_rfq")
+            .eq("status", "sent")
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+        if bundle_items.data and bundle_items.data[0].get("bundle_id"):
+            linked = (
+                supabase.table("supplier_message_bundles")
+                .select("id,status,sent_at,created_at")
+                .eq("id", bundle_items.data[0]["bundle_id"])
+                .eq("status", "sent")
+                .limit(1)
+                .execute()
+            )
+            if linked.data:
+                return linked.data[0]
         res = (
             supabase.table("message_log")
             .select("id, status, sent_at, error_message, created_at")
