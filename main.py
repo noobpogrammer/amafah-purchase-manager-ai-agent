@@ -1149,154 +1149,109 @@ async def check_deadlines_and_reminders():
         db.log_webhook_error(str(proc_err), tb, {"job": "check_deadlines_and_reminders", "stage": "fetch_processing_rfqs"})
 
     # =========================================================================
-    # Section C: Supplier Reminders (strictly for active, open RFQs with percentage < 100)
+    # Section C: Grouped supplier reminders
     # =========================================================================
+    # Collect every due, unanswered item first; consolidate by supplier, then
+    # chunk each outbound reminder into <=8 numbered lines.
     try:
         active_items = db.get_active_rfq_suppliers_with_deadlines()
-        print(f"[{now.isoformat()}] [Scheduler] Found {len(active_items)} active rfq_supplier items pending responses.")
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[{now.isoformat()}] [Scheduler ERROR] Failed to fetch active RFQ suppliers: {e}\n{tb}")
-        db.log_webhook_error(str(e), tb, {"job": "check_deadlines_and_reminders", "stage": "fetch_active_items"})
+    except Exception as exc:
+        db.log_webhook_error(str(exc), traceback.format_exc(), {"job": "grouped_reminders", "stage": "fetch"})
         return
 
+    grouped_reminders = {}
     for item in active_items:
-        item_id = item.get("id")
         try:
             rfq = item.get("rfqs") or {}
             supplier = item.get("suppliers") or {}
-            if db.is_client_automation_paused(rfq.get("client_id")):
+            client_id = rfq.get("client_id")
+            supplier_id = supplier.get("id")
+            if not client_id or not supplier_id or db.is_client_automation_paused(client_id) or not db.is_rfq_open(rfq):
                 continue
-            # 1. Strictly verify RFQ is active and open (deadline has not elapsed)
-            if not db.is_rfq_open(rfq):
+            if not supplier.get("phone_number"):
                 continue
-
-            # Delivery guardrail: rfq_suppliers.status='sent' only means the supplier
-            # was matched/queued. It does NOT prove WhatsApp accepted the
-            # initial RFQ. Reminders are allowed only after the persistent outbound
-            # message lifecycle confirms status='sent'.
-            delivery = db.get_initial_rfq_delivery_status(rfq.get("id"), supplier.get("id"))
-            if not delivery or delivery.get("status") != "sent":
-                delivery_state = delivery.get("status") if delivery else "missing"
-                print(
-                    f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: "
-                    f"initial WhatsApp RFQ delivery is '{delivery_state}', not confirmed sent."
+            # A negotiation or quote in progress must never be nudged as though
+            # the supplier has ignored the RFQ.
+            if db.get_active_negotiation_session(client_id, rfq.get("id"), supplier_id):
+                continue
+            delivered = db.get_initial_rfq_delivery_status(rfq.get("id"), supplier_id)
+            if not delivered or delivered.get("status") != "sent" or not delivered.get("sent_at"):
+                continue
+            sent_at = datetime.fromisoformat(delivered["sent_at"].replace("Z", "+00:00"))
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
+            percentage = (now - sent_at).total_seconds() * 100 / (max(1, rfq.get("deadline_hours") or 24) * 3600)
+            count = item.get("reminder_count") or 0
+            stage = "90%" if count == 2 and 90 <= percentage < 100 else (
+                "70%" if count == 1 and 70 <= percentage < 100 else (
+                    "50%" if count == 0 and 50 <= percentage < 100 else None
                 )
-                continue
-
-            sent_at_str = delivery.get("sent_at")
-            if not sent_at_str:
-                print(
-                    f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: "
-                    "confirmed delivery row is missing sent_at timestamp."
-                )
-                continue
-
-            try:
-                sent_at = datetime.fromisoformat(sent_at_str.replace("Z", "+00:00"))
-                if sent_at.tzinfo is None:
-                    sent_at = sent_at.replace(tzinfo=timezone.utc)
-            except Exception as parse_err:
-                print(f"[{now.isoformat()}] [Scheduler] Skipping item {item_id}: invalid sent_at format '{sent_at_str}': {parse_err}")
-                continue
-
-            deadline_hours = rfq.get("deadline_hours") or 24
-            total_seconds = deadline_hours * 3600
-            elapsed_seconds = (now - sent_at).total_seconds()
-            if total_seconds <= 0:
-                continue
-
-            percentage = (elapsed_seconds / total_seconds) * 100
-            if percentage >= 100:
-                # Never trigger reminders for RFQs that have reached or exceeded deadline
-                continue
-
-            reminder_count = item.get("reminder_count") or 0
-            phone = supplier.get("phone_number")
-            prod = rfq.get("product_name") or "RFQ Item"
-
-            print(
-                f"[{now.isoformat()}] [Scheduler] Checking item {item_id}: RFQ '{prod}' (id: {rfq.get('id')}), "
-                f"supplier '{supplier.get('name')}', sent_at: {sent_at.isoformat()}, elapsed: {elapsed_seconds:.0f}s/{total_seconds:.0f}s ({percentage:.1f}%), reminders_sent: {reminder_count}"
             )
-
-            # Reminder thresholds for pending suppliers (50%, 70%, 90%)
-            if percentage >= 90 and reminder_count == 2:
-                print(f"[{now.isoformat()}] [Scheduler] Triggering 90% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
-                msg = f"Final reminder — closing the RFQ for '{prod}' soon! Please reply with your quote if available."
-                result = await run_in_threadpool(
-                    send_scheduled_reminder_via_openclaw,
-                    phone,
-                    rfq_id=str(rfq.get("id")),
-                    product_name=prod,
-                    reminder_stage="90%",
-                    suggested_message=msg,
-                )
-                if result.get("sent"):
-                    client_id = rfq.get("client_id") or supplier.get("client_id")
-                    logged_id = db.log_message(
-                        client_id,
-                        supplier.get("id"),
-                        "outbound",
-                        result.get("message") or msg,
-                        related_rfq_id=rfq.get("id"),
-                        status="sent",
-                    )
-                    if logged_id and result.get("message_id"):
-                        db.mark_message_sent(logged_id, external_message_id=result.get("message_id"))
-                db.update_rfq_supplier_reminder(item["id"], 3)
-            elif percentage >= 70 and reminder_count == 1:
-                print(f"[{now.isoformat()}] [Scheduler] Triggering 70% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
-                msg = f"Reminder regarding RFQ for '{prod}'. Please send your quote when ready."
-                result = await run_in_threadpool(
-                    send_scheduled_reminder_via_openclaw,
-                    phone,
-                    rfq_id=str(rfq.get("id")),
-                    product_name=prod,
-                    reminder_stage="70%",
-                    suggested_message=msg,
-                )
-                if result.get("sent"):
-                    client_id = rfq.get("client_id") or supplier.get("client_id")
-                    logged_id = db.log_message(
-                        client_id,
-                        supplier.get("id"),
-                        "outbound",
-                        result.get("message") or msg,
-                        related_rfq_id=rfq.get("id"),
-                        status="sent",
-                    )
-                    if logged_id and result.get("message_id"):
-                        db.mark_message_sent(logged_id, external_message_id=result.get("message_id"))
-                db.update_rfq_supplier_reminder(item["id"], 2)
-            elif percentage >= 50 and reminder_count == 0:
-                print(f"[{now.isoformat()}] [Scheduler] Triggering 50% reminder for RFQ '{prod}' to {phone} (item {item_id}).")
-                msg = f"Hi! Just checking in on the RFQ for '{prod}'."
-                result = await run_in_threadpool(
-                    send_scheduled_reminder_via_openclaw,
-                    phone,
-                    rfq_id=str(rfq.get("id")),
-                    product_name=prod,
-                    reminder_stage="50%",
-                    suggested_message=msg,
-                )
-                if result.get("sent"):
-                    client_id = rfq.get("client_id") or supplier.get("client_id")
-                    logged_id = db.log_message(
-                        client_id,
-                        supplier.get("id"),
-                        "outbound",
-                        result.get("message") or msg,
-                        related_rfq_id=rfq.get("id"),
-                        status="sent",
-                    )
-                    if logged_id and result.get("message_id"):
-                        db.mark_message_sent(logged_id, external_message_id=result.get("message_id"))
-                db.update_rfq_supplier_reminder(item["id"], 1)
+            if stage is None:
+                continue
+            grouped_reminders.setdefault((client_id, supplier_id), {"supplier": supplier, "items": []})["items"].append({
+                "link": item, "rfq": rfq, "stage": stage,
+                "plan": BundleItem(rfq_id=str(rfq["id"]), product_name=rfq.get("product_name") or "RFQ Item", quantity=rfq.get("quantity")),
+            })
         except Exception as item_err:
-            tb = traceback.format_exc()
-            print(f"[{now.isoformat()}] [Scheduler ERROR] Failed processing item {item_id}: {item_err}\n{tb}")
-            db.log_webhook_error(str(item_err), tb, {"job": "check_deadlines_and_reminders", "item_id": item_id})
+            db.log_webhook_error(str(item_err), traceback.format_exc(), {"job": "grouped_reminders", "item_id": item.get("id")})
+
+    for (client_id, supplier_id), group in grouped_reminders.items():
+        items = group["items"]
+        index = {entry["plan"].rfq_id: entry for entry in items}
+        for batch in plan_supplier_bundles([entry["plan"] for entry in items]):
+            entries = [index[item.rfq_id] for item in batch]
+            # Stable event key makes a previously logged attempt fail closed:
+            # no unacknowledged WhatsApp send is automatically repeated.
+            stage_key = ",".join(sorted(str(e["link"]["id"]) + ":" + str(e["link"].get("reminder_count") or 0) for e in entries))
+            import hashlib
+            event_key = "reminder_bundle:" + hashlib.sha256((str(client_id) + str(supplier_id) + stage_key).encode()).hexdigest()
+            try:
+                if db.is_client_automation_paused(client_id):
+                    continue
+                if db.get_message_by_event_key(event_key):
+                    continue
+                products = [f"{i}. {item.product_name}" for i, item in enumerate(batch, 1)]
+                msg = "Hi! A quick follow-up from Everyware®️ on the outstanding quotes below:\n" + "\n".join(products)
+                msg += "\n\nPlease send your AED price per unit and estimated delivery for each item number. Thanks."
+                bundle = db.supabase.table("supplier_message_bundles").insert({
+                    "client_id": client_id, "supplier_id": supplier_id, "kind": "reminder",
+                    "stage": "mixed", "status": "pending", "message": msg,
+                }).execute()
+                if not bundle.data:
+                    raise RuntimeError("Could not persist reminder bundle")
+                bundle_id = bundle.data[0]["id"]
+                link_rows = [{
+                    "bundle_id": bundle_id, "client_id": client_id, "supplier_id": supplier_id,
+                    "rfq_id": e["rfq"]["id"], "rfq_supplier_id": e["link"]["id"],
+                    "kind": "reminder", "stage": e["stage"], "status": "pending",
+                } for e in entries]
+                persisted = db.supabase.table("supplier_message_bundle_items").insert(link_rows).execute()
+                if len(persisted.data or []) != len(link_rows):
+                    raise RuntimeError("Incomplete reminder-bundle item links")
+                message_id = db.log_message(client_id, supplier_id, "outbound", msg, related_rfq_id=batch[0].rfq_id, event_key=event_key)
+                if not message_id:
+                    raise RuntimeError("Could not persist idempotent reminder message")
+                db.supabase.table("supplier_message_bundles").update({"status": "processing"}).eq("id", bundle_id).execute()
+                if not await enqueue_message(group["supplier"]["phone_number"], msg, supplier_id=supplier_id, message_log_id=message_id):
+                    db.supabase.table("supplier_message_bundles").update({
+                        "status": "failed", "error_message": "Outbound not confirmed, no automatic retry"
+                    }).eq("id", bundle_id).execute()
+                    continue
+                logged = db.supabase.table("message_log").select("sent_at,external_message_id").eq("id", message_id).limit(1).execute()
+                delivery = logged.data[0] if logged.data else {}
+                if not delivery.get("sent_at"):
+                    raise RuntimeError("Delivered reminder missing durable sent_at")
+                db.supabase.table("supplier_message_bundles").update({
+                    "status": "sent", "sent_at": delivery["sent_at"],
+                    "external_message_id": delivery.get("external_message_id")
+                }).eq("id", bundle_id).execute()
+                db.supabase.table("supplier_message_bundle_items").update({"status": "sent"}).eq("bundle_id", bundle_id).execute()
+                for e in entries:
+                    db.update_rfq_supplier_reminder(e["link"]["id"], (e["link"].get("reminder_count") or 0) + 1)
+            except Exception as reminder_err:
+                logger.exception("Grouped reminder failed for supplier %s: %s", supplier_id, reminder_err)
+                db.log_webhook_error(str(reminder_err), traceback.format_exc(), {"job": "grouped_reminders", "supplier_id": supplier_id})
 
 
 REQUIRED_ENV_VARS = [
