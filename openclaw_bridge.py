@@ -157,6 +157,310 @@ class MessageDeliveryRequest(BaseModel):
     related_rfq_id: Optional[str] = None
     error: Optional[str] = None
 
+class ActivationGateRequest(BaseModel):
+    client_id: str
+    supplier_id: Optional[str] = None
+    phone_number: Optional[str] = None
+    message: str = ""
+
+
+class CommercialActionReviewRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    rfq_id: Optional[str] = None
+    quote_id: Optional[str] = None
+    action_type: str
+    attempt_number: int = Field(default=1, ge=1, le=2)
+    proposal: dict = Field(default_factory=dict)
+    assessment: dict = Field(default_factory=dict)
+    session_key: Optional[str] = None
+
+
+class NegotiationContextRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    rfq_id: str
+
+
+@router.post("/activation-gate")
+def activation_gate(
+    req: ActivationGateRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """Return authoritative procurement state for a supplier before the agent is allowed to engage."""
+    _require_openclaw_key(x_openclaw_key)
+    supplier = _get_supplier_for_client(req.client_id, req.supplier_id, req.phone_number)
+
+    open_links = db.get_open_rfqs_for_supplier(supplier["id"])
+    active_session = db.get_active_negotiation_session_for_supplier(req.client_id, supplier["id"])
+    pending_clarification = db.get_pending_clarification_for_supplier(supplier["id"])
+    pending_flags_res = (
+        db.supabase.table("flagged_for_review")
+        .select("id,rfq_id,category,reason,status,created_at")
+        .eq("client_id", req.client_id)
+        .eq("supplier_id", supplier["id"])
+        .eq("status", "pending")
+        .order("created_at", desc=True)
+        .limit(5)
+        .execute()
+    )
+    pending_flags = pending_flags_res.data or []
+
+    has_procurement_state = bool(
+        open_links
+        or active_session
+        or pending_clarification
+        or pending_flags
+    )
+
+    return {
+        "supplier": {
+            "id": supplier.get("id"),
+            "name": supplier.get("name"),
+            "phone_number": supplier.get("phone_number"),
+        },
+        "has_procurement_state": has_procurement_state,
+        "active_rfq_count": len(open_links),
+        "active_negotiation": bool(active_session),
+        "pending_clarification": bool(pending_clarification),
+        "pending_human_attention": bool(pending_flags),
+        "active_rfqs": [
+            {
+                "rfq_id": (row.get("rfqs") or {}).get("id"),
+                "product_name": (row.get("rfqs") or {}).get("product_name"),
+                "supplier_status": row.get("status"),
+                "due_by": (row.get("rfqs") or {}).get("due_by"),
+            }
+            for row in open_links
+        ],
+        "pending_flags": pending_flags,
+        "message": req.message,
+    }
+
+
+@router.post("/negotiation-context")
+def negotiation_context(
+    req: NegotiationContextRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """Return hard commercial facts; OpenClaw chooses the negotiation strategy and counter."""
+    _require_openclaw_key(x_openclaw_key)
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+
+    quotes_res = (
+        db.supabase.table("quotes")
+        .select("id,price,quantity,delivery_time,is_available,is_accepted,created_at,raw_message")
+        .eq("rfq_id", req.rfq_id)
+        .eq("supplier_id", req.supplier_id)
+        .order("created_at")
+        .execute()
+    )
+    active_session = db.get_active_negotiation_session(req.client_id, req.rfq_id, req.supplier_id)
+    constraints = db.get_rfq_negotiation_constraints(req.client_id, req.rfq_id)
+
+    return {
+        "rfq": {
+            "id": rfq.get("id"),
+            "product_name": rfq.get("product_name"),
+            "specs": rfq.get("specs"),
+            "quantity": rfq.get("quantity"),
+            "acceptable_price_min": rfq.get("acceptable_price_min"),
+            "acceptable_price_max": rfq.get("acceptable_price_max"),
+            "required_delivery_days": rfq.get("required_delivery_days"),
+            "quantity_flexible": rfq.get("quantity_flexible"),
+            "quantity_max": rfq.get("quantity_max"),
+            "delivery_flexible": rfq.get("delivery_flexible"),
+            "max_delivery_days": rfq.get("max_delivery_days"),
+            "status": rfq.get("status"),
+            "due_by": rfq.get("due_by"),
+        },
+        "quotes": quotes_res.data or [],
+        "active_negotiation_session": active_session,
+        "constraints": constraints,
+        "max_attempts": 10,
+        "guidance": {
+            "openclaw_chooses_counter": True,
+            "backend_enforces_only_hard_authority": True,
+            "do_not_reveal_internal_limits": True,
+        },
+    }
+
+
+@router.post("/review-commercial-action")
+def review_commercial_action(
+    req: CommercialActionReviewRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """Minimal hard guard for Phase 2 LLM-led commercial decisions.
+
+    The backend does not choose negotiation strategy. It only enforces authority,
+    persisted state, tenant/RFQ linkage, stale/finalized state, and explicit bounds.
+    """
+    _require_openclaw_key(x_openclaw_key)
+    supplier = _get_supplier_for_client(req.client_id, req.supplier_id, None)
+
+    action = (req.action_type or "").strip().lower()
+    proposal = req.proposal or {}
+    rfq = None
+    if req.rfq_id:
+        rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+        if rfq.get("status") != "active":
+            outcome = "REJECT"
+            feedback = f"RFQ is {rfq.get('status')}; no new commercial action is allowed."
+            adjusted = None
+        else:
+            outcome = "APPROVE"
+            feedback = "Commercial action is within current authority."
+            adjusted = None
+    else:
+        outcome = "APPROVE"
+        feedback = "No RFQ-scoped hard-boundary violation detected."
+        adjusted = None
+
+    # Acceptance must always reference a persisted quote.
+    if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"}:
+        if not req.quote_id:
+            outcome = "RETRY"
+            feedback = "Acceptance requires the exact persisted quote_id. Persist/select the quote first, then retry."
+        else:
+            qres = (
+                db.supabase.table("quotes")
+                .select("*")
+                .eq("id", req.quote_id)
+                .eq("supplier_id", req.supplier_id)
+                .limit(1)
+                .execute()
+            )
+            quote = qres.data[0] if qres.data else None
+            if not quote or (req.rfq_id and quote.get("rfq_id") != req.rfq_id):
+                outcome = "RETRY"
+                feedback = "The proposed acceptance does not reference a persisted quote for this supplier/RFQ."
+            elif rfq and rfq.get("acceptable_price_max") is not None and quote.get("price") is not None:
+                if float(quote["price"]) > float(rfq["acceptable_price_max"]):
+                    outcome = "ESCALATE"
+                    feedback = "The persisted quote exceeds the explicit buyer maximum; human authorization is required before acceptance."
+
+    # Counter proposals: OpenClaw chooses the amount. Clamp only explicit hard authority.
+    if outcome == "APPROVE" and action in {"counter", "counteroffer", "negotiate"} and rfq:
+        proposed_price = proposal.get("price")
+        if proposed_price is None:
+            outcome = "RETRY"
+            feedback = "A counter action requires proposal.price."
+        else:
+            try:
+                proposed_price = float(proposed_price)
+            except (TypeError, ValueError):
+                outcome = "RETRY"
+                feedback = "proposal.price must be numeric."
+            else:
+                if proposed_price <= 0:
+                    outcome = "RETRY"
+                    feedback = "Counter price must be greater than zero."
+                else:
+                    hard_max = rfq.get("acceptable_price_max")
+                    if hard_max is not None and proposed_price > float(hard_max):
+                        outcome = "ADJUST"
+                        adjusted = {**proposal, "price": float(hard_max)}
+                        feedback = (
+                            f"The negotiation direction may continue, but AED {proposed_price:g} exceeds "
+                            f"the explicit buyer maximum. The highest authorized price is AED {float(hard_max):g}. "
+                            "Reconsider the strategy using that boundary."
+                        )
+
+                    latest_quote_res = (
+                        db.supabase.table("quotes")
+                        .select("id,price,quantity,delivery_time,created_at")
+                        .eq("rfq_id", req.rfq_id)
+                        .eq("supplier_id", req.supplier_id)
+                        .eq("is_available", True)
+                        .order("created_at", desc=True)
+                        .limit(1)
+                        .execute()
+                    )
+                    latest_quote = latest_quote_res.data[0] if latest_quote_res.data else None
+                    if outcome == "APPROVE" and latest_quote and latest_quote.get("price") is not None:
+                        if proposed_price > float(latest_quote["price"]):
+                            outcome = "RETRY"
+                            feedback = (
+                                "The proposed buyer counter is above the supplier's latest persisted price. "
+                                "Do not negotiate upward against the buyer. Choose another strategy or price."
+                            )
+
+    # Quantity changes require explicit flexibility/authorization.
+    if outcome == "APPROVE" and rfq and proposal.get("quantity") is not None:
+        try:
+            q = int(proposal["quantity"])
+            requested_q = int(rfq.get("quantity")) if rfq.get("quantity") is not None else None
+        except (TypeError, ValueError):
+            outcome = "RETRY"
+            feedback = "proposal.quantity must be an integer."
+        else:
+            if requested_q is not None and q != requested_q:
+                allowed = bool(rfq.get("quantity_flexible"))
+                qmax = rfq.get("quantity_max")
+                if not allowed or (qmax is not None and q > int(qmax)):
+                    outcome = "ESCALATE"
+                    feedback = "The proposed quantity differs from the RFQ and is outside explicit autonomous authority."
+
+    # Delivery extensions require explicit flexibility/authorization.
+    if outcome == "APPROVE" and rfq and proposal.get("delivery_days") is not None:
+        try:
+            days = int(proposal["delivery_days"])
+            required = int(rfq.get("required_delivery_days")) if rfq.get("required_delivery_days") is not None else None
+        except (TypeError, ValueError):
+            outcome = "RETRY"
+            feedback = "proposal.delivery_days must be an integer."
+        else:
+            if required is not None and days > required:
+                allowed = bool(rfq.get("delivery_flexible"))
+                max_days = rfq.get("max_delivery_days")
+                if not allowed or (max_days is not None and days > int(max_days)):
+                    outcome = "ESCALATE"
+                    feedback = "The proposed delivery extension is outside explicit autonomous authority."
+
+    # Two model correction attempts maximum. After that, fail safe to human review.
+    if outcome in {"ADJUST", "RETRY"} and req.attempt_number >= 2:
+        outcome = "ESCALATE"
+        feedback = (
+            "Two proposal attempts have not produced an authorized commercial action. "
+            "Do not keep looping; use a brief context-appropriate holding response only if needed and request human attention."
+        )
+        adjusted = None
+
+    try:
+        db.supabase.table("commercial_action_intents").insert({
+            "client_id": req.client_id,
+            "supplier_id": req.supplier_id,
+            "rfq_id": req.rfq_id,
+            "quote_id": req.quote_id,
+            "session_key": req.session_key,
+            "action_type": action or "unknown",
+            "attempt_number": req.attempt_number,
+            "proposal": proposal,
+            "guard_snapshot": {
+                "assessment": req.assessment,
+                "rfq_status": rfq.get("status") if rfq else None,
+                "acceptable_price_max": rfq.get("acceptable_price_max") if rfq else None,
+            },
+            "outcome": outcome,
+            "feedback": feedback,
+            "adjusted_action": adjusted,
+        }).execute()
+    except Exception:
+        # Decision logging must not turn an otherwise-safe decision into an outage.
+        pass
+
+    return {
+        "outcome": outcome,
+        "feedback": feedback,
+        "adjusted_action": adjusted,
+        "attempt_number": req.attempt_number,
+        "hard_guard_only": True,
+        "supplier_id": supplier.get("id"),
+        "rfq_id": req.rfq_id,
+    }
+
 
 @router.post("/supplier-context", dependencies=[])
 def supplier_context(
