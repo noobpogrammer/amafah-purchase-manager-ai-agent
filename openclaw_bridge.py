@@ -302,6 +302,32 @@ def activation_gate(
     else:
         decision, reason = "IGNORE", "no_clear_procurement_intent"
 
+    if decision == "HUMAN_REVIEW":
+        # Persist once per pending exact supplier request; no AI reply is authorized.
+        # Failure is surfaced instead of silently claiming that a review was created.
+        existing = (
+            db.supabase.table("flagged_for_review")
+            .select("id")
+            .eq("client_id", req.client_id)
+            .eq("supplier_id", supplier["id"])
+            .eq("category", "procurement_without_rfq")
+            .eq("raw_message", message)
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        )
+        if not (existing.data or []):
+            db.supabase.table("flagged_for_review").insert({
+                "client_id": req.client_id,
+                "supplier_id": supplier["id"],
+                "rfq_id": None,
+                "category": "procurement_without_rfq",
+                "reason": "Procurement inquiry without authorized matching RFQ; human review required",
+                "raw_message": message,
+                "status": "pending",
+                "metadata": {"source": "openclaw_activation_gate", "engagement_reason": reason},
+            }).execute()
+
     return {
         "supplier": {
             "id": supplier.get("id"),
