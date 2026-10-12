@@ -409,6 +409,76 @@ def negotiation_context(
     }
 
 
+class SystemOutboundAuthorizationRequest(BaseModel):
+    client_id: str
+    phone_number: str
+    message: str
+
+
+@router.post("/authorize-system-outbound")
+def authorize_system_outbound(
+    req: SystemOutboundAuthorizationRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """Authorize exact, in-flight buyer-issued RFQ invitations.
+
+    This is deliberately independent of agent session keys and message keywords.
+    An agent cannot authorize arbitrary replies by naming an RFQ: the outbound
+    text must match an already claimed bundle persisted by the backend.
+    """
+    _require_openclaw_key(x_openclaw_key)
+    if not req.message or len(req.message) > 10000:
+        return {"authorized": False, "reason": "invalid_message"}
+    if db.is_client_automation_paused(req.client_id):
+        return {"authorized": False, "reason": "automation_paused"}
+    phone = re.sub(r"\\D", "", req.phone_number or "")
+    if not phone:
+        return {"authorized": False, "reason": "invalid_recipient"}
+    matches = (
+        db.supabase.table("supplier_message_bundles")
+        .select("id,supplier_id,client_id")
+        .eq("client_id", req.client_id)
+        .eq("kind", "initial_rfq")
+        .eq("status", "processing")
+        .eq("message", req.message)
+        .limit(5)
+        .execute()
+    )
+    for bundle in matches.data or []:
+        supplier = db.get_supplier_by_id(bundle["supplier_id"], client_id=req.client_id)
+        if not supplier:
+            continue
+        if re.sub(r"\\D", "", supplier.get("phone_number") or "") != phone:
+            continue
+        items = (
+            db.supabase.table("supplier_message_bundle_items")
+            .select("rfq_id")
+            .eq("bundle_id", bundle["id"])
+            .eq("status", "processing")
+            .limit(8)
+            .execute()
+        )
+        if not items.data:
+            continue
+        valid = True
+        for item in items.data:
+            rfq_rows = (
+                db.supabase.table("rfqs")
+                .select("status,due_by")
+                .eq("id", item["rfq_id"])
+                .eq("client_id", req.client_id)
+                .limit(1)
+                .execute()
+            )
+            rfq = rfq_rows.data[0] if rfq_rows.data else None
+            if not rfq or not db.is_rfq_open(rfq):
+                valid = False
+                break
+        if valid:
+            return {"authorized": True, "purpose": "initial_rfq", "bundle_id": bundle["id"]}
+    return {"authorized": False, "reason": "no_exact_inflight_authorization"}
+
+
 @router.post("/review-commercial-action")
 def review_commercial_action(
     req: CommercialActionReviewRequest,
