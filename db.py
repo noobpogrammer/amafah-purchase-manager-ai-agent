@@ -1842,6 +1842,7 @@ def accept_recorded_quote(
     price: float | None = None,
     quantity: int | None = None,
     accepted_by: str = "operator",
+    quote_id: str | None = None,
 ) -> dict | None:
     """Mark the latest matching persisted quote as accepted.
 
@@ -1852,6 +1853,21 @@ def accept_recorded_quote(
     rfq = get_rfq_by_id(rfq_id)
     if not rfq or rfq.get("status") != "active":
         return None
+
+    # A withdrawn accepted deal must NEVER be revived by a fuzzy latest-quote
+    # selection. The exact pending revised quote ID is mandatory.
+    current_link = (
+        supabase.table("rfq_suppliers")
+        .select("commercial_state,pending_revision_quote_id")
+        .eq("rfq_id", rfq_id).eq("supplier_id", supplier_id).limit(1).execute()
+    )
+    link = current_link.data[0] if current_link.data else None
+    if not link:
+        return None
+    if link.get("commercial_state") == "revision_pending":
+        if not quote_id or str(quote_id) != str(link.get("pending_revision_quote_id")):
+            logger.warning("Acceptance blocked: explicit pending revision quote ID required.")
+            return None
 
     after_deadline = not is_rfq_open(rfq)
     session = get_active_negotiation_session(client_id, rfq_id, supplier_id)
@@ -1866,6 +1882,8 @@ def accept_recorded_quote(
             .eq("supplier_id", supplier_id)
             .eq("is_available", True)
         )
+        if quote_id is not None:
+            q = q.eq("id", quote_id)
         if price is not None:
             q = q.eq("price", price)
         if quantity is not None:
