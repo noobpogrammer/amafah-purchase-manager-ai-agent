@@ -988,30 +988,34 @@ def record_multi_item_quotes(req: RecordMultiItemQuotesRequest, x_openclaw_key: 
     )
     if not source.data:
         raise HTTPException(status_code=422, detail="Source message must be a persisted inbound message.")
-    outcomes = []
-    for rfq_id, variants in grouped.items():
-        existing = (
-            db.supabase.table("quotes").select("id,price,variant_label")
-            .eq("rfq_id", rfq_id).eq("supplier_id", req.supplier_id)
-            .eq("source_message_id", req.source_message_id).execute()
-        )
-        if existing.data:
-            outcomes.append({"rfq_id": rfq_id, "status": "already_recorded", "quotes": existing.data})
-            continue
-        rows = db.record_quotes_batch(
-            rfq_id=rfq_id,
-            supplier_id=req.supplier_id,
-            variants=variants,
-            raw_message=req.raw_message,
-            source_message_id=req.source_message_id,
-            confidence="high",
-            allow_post_deadline=db.can_record_post_deadline_quote(req.client_id, rfq_id, req.supplier_id),
-        )
-        if not rows:
-            # Partial writes are possible; caller retries using the same source ID.
-            raise HTTPException(status_code=409, detail={"error": "partial_batch_failure", "persisted_before_error": outcomes, "failed_rfq_id": rfq_id})
-        outcomes.append({"rfq_id": rfq_id, "status": "recorded", "quotes": rows})
-    return {"status": "recorded", "rfq_count": len(outcomes), "results": outcomes}
+    # One transaction validates and writes ALL lines, with advisory locking
+    # on the persisted inbound source ID to make concurrent retries safe.
+    # Each item is authoritative only after the validation above passes.
+    payload = {
+        "p_client_id": req.client_id,
+        "p_supplier_id": req.supplier_id,
+        "p_source_message_id": req.source_message_id,
+        "p_raw_message": req.raw_message,
+        "p_items": [
+            {
+                "candidate_rfq_id": item.rfq_id,
+                "confidence": float(raw["confidence"]),
+                "price": float(item.price),
+                "quantity": item.quantity,
+                "variant_label": item.variant_label,
+                "delivery_time": item.delivery_time,
+                "quality_notes": raw.get("quality_notes"),
+            }
+            for raw, item in zip(req.items, mapped)
+        ],
+    }
+    try:
+        saved = db.supabase.rpc("record_multi_rfqs_atomic", payload).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail="Atomic multi-RFQ quote recording failed.") from exc
+    if not saved.data:
+        raise HTTPException(status_code=409, detail="No quote records persisted.")
+    return saved.data
 
 
 @router.post("/record-quote")
