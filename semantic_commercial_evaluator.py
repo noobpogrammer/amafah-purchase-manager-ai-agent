@@ -56,5 +56,5 @@ def evaluate_commercial_message(*, proposed_message: str, declared_action: str, 
             safe = False
         return {"safe": safe, "intent": intent, "reason": str(result.get("reason", ""))[:300]}
     except Exception as exc:
-        log.warning("Semantic review unavailable (%s); refusing semantic approval", type(exc).__name__)
+        log.warning("Semantic review unavailable (%s, status=%s, code=%s); refusing semantic approval", type(exc).__name__, getattr(exc, "status_code", None), getattr(exc, "code", None))
         return {"safe": False, "intent": "OTHER", "reason": "Semantic evaluator unavailable or inconclusive."}
