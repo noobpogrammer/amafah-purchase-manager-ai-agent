@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException
@@ -244,6 +245,63 @@ def activation_gate(
         or pending_flags
     )
 
+    # Option C: a greeting or personal conversation cannot activate procurement.
+    # The model may interpret commercial details *after* this deterministic gate,
+    # but it must not override a DENY. Fail closed for ambiguous text.
+    message = (req.message or "").strip()
+    normalized = " ".join(message.casefold().split())
+    greetings = re.compile(
+        r"^(?:hi+|hey+|hello+|good (?:morning|afternoon|evening|night)|"
+        r"assalam[ -]?ualaikum|salam|salaam|aoa|namaste|kem cho|kem chho|"
+        r"su chale|what's up|whats up)[!.? ]*$",
+        re.IGNORECASE,
+    )
+    personal = re.compile(
+        r"(?:how (?:is|are) (?:your |the )?(?:family|wife|husband|kids|parents)|"
+        r"what are you doing|what're you doing|"
+        r"tame(?:in)? su kari rahya|tame su karo cho|"
+        r"su kari rahya|kya kar rahe|ghar (?:par|pe)|"
+        r"how is your health|how was your weekend)",
+        re.IGNORECASE,
+    )
+    # Commercial intent alone does not grant RFQ-specific authority:
+    # the supplier must also have matching live procurement state.
+    commercial = re.compile(
+        r"(?:\b(?:rfq|quotation|quote|quoted|price|pricing|rate|"
+        r"discount|counteroffer|invoice|purchase order|delivery|dispatch|"
+        r"shipment|stock|available|availability|quantity|qty|"
+        r"per unit|per piece|aed|final offer)\b|"
+        r"(?:دَر|قیمت|کوٹیشن|ڈلیوری|سپلائی)|"
+        r"(?:ભાવ|કિંમત|કોટેશન|ડિલિવરી))",
+        re.IGNORECASE,
+    )
+    product_names = [
+        str((link.get("rfqs") or {}).get("product_name") or "").casefold().strip()
+        for link in open_links
+    ]
+    product_mentioned = any(
+        name and len(name) >= 4 and name in normalized for name in product_names
+    )
+    is_greeting = bool(greetings.fullmatch(normalized))
+    is_personal = bool(personal.search(normalized))
+    is_commercial = bool(commercial.search(normalized) or product_mentioned)
+
+    paused = db.is_client_automation_paused(req.client_id)
+    if paused:
+        decision, reason = "IGNORE", "client_automation_paused"
+    elif not normalized:
+        decision, reason = "IGNORE", "empty_message"
+    elif is_greeting:
+        decision, reason = "IGNORE", "greeting_wait_for_second_message"
+    elif is_personal and not is_commercial:
+        decision, reason = "IGNORE", "personal_conversation"
+    elif is_commercial and has_procurement_state:
+        decision, reason = "ENGAGE", "explicit_procurement_intent_with_context"
+    elif is_commercial:
+        decision, reason = "HUMAN_REVIEW", "procurement_intent_without_active_context"
+    else:
+        decision, reason = "IGNORE", "no_clear_procurement_intent"
+
     return {
         "supplier": {
             "id": supplier.get("id"),
@@ -251,6 +309,10 @@ def activation_gate(
             "phone_number": supplier.get("phone_number"),
         },
         "has_procurement_state": has_procurement_state,
+        "engagement_decision": decision,
+        "engagement_reason": reason,
+        "allow_autonomous_reply": decision == "ENGAGE",
+        "automation_paused": paused,
         "active_rfq_count": len(open_links),
         "active_negotiation": bool(active_session),
         "pending_clarification": bool(pending_clarification),
