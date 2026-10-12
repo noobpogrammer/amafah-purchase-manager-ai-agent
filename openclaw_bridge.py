@@ -295,7 +295,9 @@ def activation_gate(
         decision, reason = "IGNORE", "greeting_wait_for_second_message"
     elif is_personal and not is_commercial:
         decision, reason = "IGNORE", "personal_conversation"
-    elif is_commercial and has_procurement_state:
+    elif is_commercial and (open_links or active_session or pending_clarification):
+        # Human-review flags alone never authorize procurement replies. A repeated
+        # out-of-context inquiry must stay silent after its review row is created.
         decision, reason = "ENGAGE", "explicit_procurement_intent_with_context"
     elif is_commercial:
         decision, reason = "HUMAN_REVIEW", "procurement_intent_without_active_context"
