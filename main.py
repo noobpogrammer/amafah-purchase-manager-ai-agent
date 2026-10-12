@@ -2850,7 +2850,7 @@ async def flush_pending_initial_rfq_bundles():
                     break
                 bundle_id = batch["bundle_id"]
                 items = batch["items"]
-                supplier = db.get_supplier_by_id(supplier_id)
+                supplier = db.get_supplier_by_id(supplier_id, client_id=client_id)
                 if not supplier or not supplier.get("phone_number") or db.is_client_automation_paused(client_id):
                     raise RuntimeError("Supplier not reachable or client paused before dispatch")
                 plans = [BundleItem(
