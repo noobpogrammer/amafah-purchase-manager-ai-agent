@@ -303,11 +303,21 @@ def review_commercial_action(
     action = (req.action_type or "").strip().lower()
     proposal = req.proposal or {}
     rfq = None
+    active_session = None
     if req.rfq_id:
         rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+        active_session = db.get_active_negotiation_session(
+            req.client_id,
+            req.rfq_id,
+            req.supplier_id,
+        )
         if rfq.get("status") != "active":
             outcome = "REJECT"
             feedback = f"RFQ is {rfq.get('status')}; no new commercial action is allowed."
+            adjusted = None
+        elif not db.is_rfq_open(rfq) and not active_session:
+            outcome = "REJECT"
+            feedback = "The RFQ deadline has passed and there is no existing in-flight negotiation to continue."
             adjusted = None
         else:
             outcome = "APPROVE"
@@ -379,7 +389,13 @@ def review_commercial_action(
                         .execute()
                     )
                     latest_quote = latest_quote_res.data[0] if latest_quote_res.data else None
-                    if outcome == "APPROVE" and latest_quote and latest_quote.get("price") is not None:
+                    if outcome == "APPROVE" and not latest_quote:
+                        outcome = "RETRY"
+                        feedback = (
+                            "No persisted supplier quote exists for this RFQ. "
+                            "Persist the supplier's current offer first, then propose the counter again."
+                        )
+                    elif outcome == "APPROVE" and latest_quote.get("price") is not None:
                         if proposed_price > float(latest_quote["price"]):
                             outcome = "RETRY"
                             feedback = (
