@@ -35,6 +35,7 @@ import guardrails
 from policy_validator import ActionProposal, validate_action, ActionCategory, ValidationResult, MAX_NEGOTIATION_ATTEMPTS
 import negotiation_engine
 from openclaw_bridge import router as openclaw_router
+from supplier_message_planner import BundleItem, plan_supplier_bundles, format_supplier_bundle
 
 logger = logging.getLogger(__name__)
 
@@ -2890,6 +2891,90 @@ async def create_rfq_endpoint(req: RFQCreateRequest, current_user=Depends(get_cu
         "suppliers": [{"id": s["id"], "name": s["name"], "phone": s["phone_number"]} for s in matched_suppliers],
     }
 
+
+async def send_bulk_rfq_bundles(client_id: str, supplier_items: dict) -> dict:
+    """Persist grouped bulk invitations before sending through OpenClaw.
+
+    Every RFQ is linked to a durable bundle item. A bundle is marked sent only
+    after the single WhatsApp send succeeds; failed sends never become delivered.
+    """
+    sent_count = 0
+    failures = []
+    for supplier_id, details in supplier_items.items():
+        supplier = details["supplier"]
+        phone = supplier.get("phone_number")
+        if not phone:
+            failures.append({"supplier_id": supplier_id, "reason": "missing_phone"})
+            continue
+        entries = details["items"]
+        for batch in plan_supplier_bundles([entry["item"] for entry in entries], max_items=8):
+            selected = {item.rfq_id for item in batch}
+            grouped_entries = [entry for entry in entries if entry["item"].rfq_id in selected]
+            message = format_supplier_bundle(batch)
+            # A permanently recorded bundle must precede the network send.
+            created = db.supabase.table("supplier_message_bundles").insert({
+                "client_id": client_id,
+                "supplier_id": supplier_id,
+                "kind": "initial_rfq",
+                "status": "pending",
+                "message": message,
+            }).execute()
+            if not created.data:
+                raise RuntimeError("Could not persist supplier message bundle; refusing WhatsApp send.")
+            bundle_id = created.data[0]["id"]
+            try:
+                linked_items = []
+                for entry in grouped_entries:
+                    item = entry["item"]
+                    link = db.supabase.table("rfq_suppliers").select("id").eq("rfq_id", item.rfq_id).eq("supplier_id", supplier_id).limit(1).execute()
+                    if not link.data:
+                        raise RuntimeError("RFQ/supplier link missing; refusing WhatsApp send.")
+                    linked_items.append({
+                        "bundle_id": bundle_id,
+                        "client_id": client_id,
+                        "supplier_id": supplier_id,
+                        "rfq_id": item.rfq_id,
+                        "rfq_supplier_id": link.data[0]["id"],
+                        "kind": "initial_rfq",
+                        "status": "pending",
+                    })
+                inserted = db.supabase.table("supplier_message_bundle_items").insert(linked_items).execute()
+                if len(inserted.data or []) != len(linked_items):
+                    raise RuntimeError("Incomplete bundle item persistence; refusing WhatsApp send.")
+                log_id = db.log_message(client_id, supplier_id, "outbound", message, related_rfq_id=batch[0].rfq_id)
+                if not log_id:
+                    raise RuntimeError("Failed to record outbound bundle message.")
+                db.supabase.table("supplier_message_bundles").update({"status": "processing"}).eq("id", bundle_id).execute()
+                sent = await enqueue_message(phone, message, supplier_id=supplier_id, message_log_id=log_id)
+                if not sent:
+                    # Delivery may be UNKNOWN after transport timeout; never retry automatically.
+                    db.supabase.table("supplier_message_bundles").update({"status": "failed", "error_message": "Outbound not confirmed; check message log before retry."}).eq("id", bundle_id).execute()
+                    failures.append({"supplier_id": supplier_id, "bundle_id": bundle_id, "reason": "send_not_confirmed"})
+                    continue
+                delivery = db.supabase.table("message_log").select("external_message_id,sent_at").eq("id", log_id).limit(1).execute()
+                outbound = delivery.data[0] if delivery.data else {}
+                if not outbound.get("sent_at"):
+                    raise RuntimeError("Sent message lacks durable delivery timestamp.")
+                db.supabase.table("supplier_message_bundles").update({
+                    "status": "sent",
+                    "external_message_id": outbound.get("external_message_id"),
+                    "sent_at": outbound["sent_at"],
+                }).eq("id", bundle_id).execute()
+                db.supabase.table("supplier_message_bundle_items").update({"status": "sent"}).eq("bundle_id", bundle_id).execute()
+                if outbound.get("external_message_id"):
+                    for item in batch:
+                        db.update_rfq_supplier_sent_message_id(item.rfq_id, supplier_id, outbound["external_message_id"])
+                sent_count += 1
+            except Exception as exc:
+                logger.exception("Supplier bundle %s failed safely", bundle_id)
+                db.supabase.table("supplier_message_bundles").update({
+                    "status": "failed",
+                    "error_message": str(exc)[:300],
+                }).eq("id", bundle_id).execute()
+                failures.append({"supplier_id": supplier_id, "bundle_id": bundle_id, "reason": "processing_error"})
+    return {"sent_bundles": sent_count, "failed_bundles": failures}
+
+
 @app.post("/rfq/bulk-create")
 async def bulk_create_rfq_endpoint(
     request: Request,
@@ -2942,6 +3027,7 @@ async def bulk_create_rfq_endpoint(
     created_rfqs = []
     failed_rows = []
     matched_summary = []
+    suppliers_for_bulk_bundles = {}
     default_deadline = deadline_hours if deadline_hours and deadline_hours > 0 else 24
 
     for idx, row in enumerate(rows):
@@ -3048,18 +3134,16 @@ async def bulk_create_rfq_endpoint(
         rfq, matched_suppliers = db.create_rfq_and_match_suppliers(**create_kwargs)
 
         if matched_suppliers:
-            rfq_msg = build_rfq_invitation_message(
-                product_name=final_product_name,
-                specs=final_specs,
-                quantity=final_quantity,
-                deadline_hours=final_deadline,
-                required_delivery_days=None,
-            )
             for supplier in matched_suppliers:
-                phone = supplier.get("phone_number")
-                if phone:
-                    msg_log_id = db.log_message(tenant_client_id, supplier["id"], "outbound", rfq_msg, related_rfq_id=rfq["id"])
-                    await enqueue_message(phone, rfq_msg, rfq_id=rfq["id"], supplier_id=supplier["id"], message_log_id=msg_log_id)
+                if supplier.get("phone_number"):
+                    group = suppliers_for_bulk_bundles.setdefault(supplier["id"], {"supplier": supplier, "items": []})
+                    group["items"].append({"item": BundleItem(
+                        rfq_id=str(rfq["id"]),
+                        product_name=final_product_name,
+                        quantity=final_quantity,
+                        specs=final_specs,
+                        deadline_hours=final_deadline,
+                    )})
 
         created_rfqs.append({
             "rfq_id": rfq["id"],
@@ -3070,8 +3154,11 @@ async def bulk_create_rfq_endpoint(
         })
         matched_summary.append({"rfq_id": rfq["id"], "matched_suppliers_count": len(matched_suppliers)})
 
+    bundle_result = await send_bulk_rfq_bundles(tenant_client_id, suppliers_for_bulk_bundles)
+
     return {
-        "status": "success",
+        "status": "success" if not bundle_result["failed_bundles"] else "partial_delivery",
+        "bundle_delivery": bundle_result,
         "created_count": len(created_rfqs),
         "rows_processed": len(rows),
         "rfqs": created_rfqs,
