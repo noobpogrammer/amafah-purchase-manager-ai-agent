@@ -1223,9 +1223,10 @@ async def check_deadlines_and_reminders():
                 bundle_id = bundle.data[0]["id"]
                 link_rows = [{
                     "bundle_id": bundle_id, "client_id": client_id, "supplier_id": supplier_id,
+                    "item_position": position,
                     "rfq_id": e["rfq"]["id"], "rfq_supplier_id": e["link"]["id"],
                     "kind": "reminder", "stage": e["stage"], "status": "pending",
-                } for e in entries]
+                } for position, e in enumerate(entries, 1)]
                 persisted = db.supabase.table("supplier_message_bundle_items").insert(link_rows).execute()
                 if len(persisted.data or []) != len(link_rows):
                     raise RuntimeError("Incomplete reminder-bundle item links")
@@ -2837,6 +2838,7 @@ async def flush_pending_initial_rfq_bundles():
         if db.is_client_automation_paused(client_id):
             continue
         while True:
+            bundle_id = None
             try:
                 claimed = db.supabase.rpc("claim_initial_supplier_bundle", {
                     "p_client_id": client_id,
@@ -2889,7 +2891,7 @@ async def flush_pending_initial_rfq_bundles():
                 await asyncio.sleep(random.uniform(OUTBOUND_MIN_DELAY, OUTBOUND_MAX_DELAY))
             except Exception as exc:
                 logger.exception("Initial RFQ supplier bundle dispatch failed for %s: %s", supplier_id, exc)
-                if "bundle_id" in locals() and bundle_id:
+                if bundle_id:
                     try:
                         db.supabase.table("supplier_message_bundles").update({
                             "status": "failed",
@@ -2996,7 +2998,7 @@ async def send_bulk_rfq_bundles(client_id: str, supplier_items: dict) -> dict:
             bundle_id = created.data[0]["id"]
             try:
                 linked_items = []
-                for entry in grouped_entries:
+                for item_index, entry in enumerate(grouped_entries, 1):
                     item = entry["item"]
                     link = db.supabase.table("rfq_suppliers").select("id").eq("rfq_id", item.rfq_id).eq("supplier_id", supplier_id).limit(1).execute()
                     if not link.data:
@@ -3007,6 +3009,7 @@ async def send_bulk_rfq_bundles(client_id: str, supplier_items: dict) -> dict:
                         "supplier_id": supplier_id,
                         "rfq_id": item.rfq_id,
                         "rfq_supplier_id": link.data[0]["id"],
+                        "item_position": item_index,
                         "kind": "initial_rfq",
                         "status": "pending",
                     })
