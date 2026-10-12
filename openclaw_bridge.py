@@ -494,6 +494,8 @@ def review_commercial_action(
 
     action = (req.action_type or "").strip().lower()
     proposal = req.proposal or {}
+    if not isinstance(proposal, dict):
+        raise HTTPException(status_code=422, detail="proposal must be a JSON object")
     rfq = None
     active_session = None
     if req.rfq_id:
@@ -627,18 +629,34 @@ def review_commercial_action(
                     outcome = "ESCALATE"
                     feedback = "The proposed delivery extension is outside explicit autonomous authority."
 
+    # Commercial evaluator checks typed action data only, never LLM prose.
+    # Hard boundaries above remain authoritative.
     approved_text = None
     if outcome == "APPROVE":
-        if action in {"counter", "counteroffer", "negotiate"} and rfq and set(proposal).issubset({"price", "quantity", "delivery_days"}):
-            price = float(proposal["price"])
-            approved_text = f"Thank you for your quote. Could you offer AED {price:g} per unit for this order?"
+        if action in {"counter", "counteroffer", "negotiate"}:
+            if not rfq or set(proposal) != {"price", "quantity", "delivery_days"}:
+                outcome, feedback = "RETRY", "Counter requires RFQ plus exactly price, quantity, delivery_days."
+            elif (isinstance(proposal["price"], bool)
+                  or not isinstance(proposal["price"], (int, float))
+                  or not isinstance(proposal["quantity"], int)
+                  or isinstance(proposal["quantity"], bool)
+                  or not isinstance(proposal["delivery_days"], int)
+                  or isinstance(proposal["delivery_days"], bool)):
+                outcome, feedback = "RETRY", "Counter fields must be numeric price and integer quantity/delivery_days."
+            elif proposal["quantity"] <= 0 or proposal["delivery_days"] < 0:
+                outcome, feedback = "RETRY", "Invalid quantity or delivery_days."
+            else:
+                approved_text = (
+                    f"Thank you for your quotation. Could you offer AED "
+                    f"{float(proposal['price']):g} per unit for {proposal['quantity']} units "
+                    f"with delivery within {proposal['delivery_days']} day(s)?"
+                )
         elif action in {"ask", "clarify", "request_info", "request_price"} and rfq and not proposal:
             approved_text = "Thank you. Could you confirm your best unit price in AED and estimated delivery time?"
-        elif action in {"acknowledge", "acknowledgement"} and not proposal:
+        elif action in {"acknowledge", "acknowledgement"} and rfq and not proposal:
             approved_text = "Thank you. We've received your quotation."
         else:
-            outcome = "REJECT"
-            feedback = "Structured action unsupported. Use validated counter, information request or acknowledgement."
+            outcome, feedback = "REJECT", "Unsupported structured action or missing RFQ; no message authorized."
 
     # Two model correction attempts maximum. After that, fail safe to human review.
     if outcome in {"ADJUST", "RETRY"} and req.attempt_number >= 2:
