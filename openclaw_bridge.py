@@ -267,10 +267,10 @@ def activation_gate(
     # Commercial intent alone does not grant RFQ-specific authority:
     # the supplier must also have matching live procurement state.
     commercial = re.compile(
-        r"(?:\\b(?:rfq|quotation|quote|quoted|price|pricing|rate|"
+        r"(?:\b(?:rfq|quotation|quote|quoted|price|pricing|rate|"
         r"discount|counteroffer|invoice|purchase order|delivery|dispatch|"
         r"shipment|stock|available|availability|quantity|qty|"
-        r"per unit|per piece|aed|final offer)\\b|"
+        r"per unit|per piece|aed|final offer)\b|"
         r"(?:دَر|قیمت|کوٹیشن|ڈلیوری|سپلائی)|"
         r"(?:ભાવ|કિંમત|કોટેશન|ડિલિવરી))",
         re.IGNORECASE,
