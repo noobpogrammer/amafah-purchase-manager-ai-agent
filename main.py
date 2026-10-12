@@ -1106,6 +1106,12 @@ async def check_deadlines_and_reminders():
         if db.is_client_automation_paused(rfq.get("client_id")):
             print(f"[{now.isoformat()}] [Scheduler] Skipping finalization for RFQ '{prod}' ({rfq_id}): client automation paused.")
             continue
+        if db.has_inflight_negotiation_for_rfq(rfq_id):
+            print(
+                f"[{now.isoformat()}] [Scheduler] Deferring finalization for RFQ '{prod}' ({rfq_id}): "
+                "at least one supplier negotiation is still in flight."
+            )
+            continue
         try:
             claimed = db.claim_rfq_for_finalization(rfq_id)
             if claimed:
