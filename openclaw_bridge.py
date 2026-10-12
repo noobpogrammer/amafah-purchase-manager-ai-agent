@@ -169,6 +169,7 @@ class ActivationGateRequest(BaseModel):
 
 
 class CommercialActionReviewRequest(BaseModel):
+    proposed_message: Optional[str] = None
     client_id: str
     supplier_id: str
     rfq_id: Optional[str] = None
@@ -556,6 +557,23 @@ def review_commercial_action(
                     outcome = "ESCALATE"
                     feedback = "The proposed delivery extension is outside explicit autonomous authority."
 
+    # Verify exact supplier-facing wording semantically, not by keyword lists.
+    # No outbound approval may be issued unless the text itself was checked.
+    if outcome == "APPROVE":
+        if not req.proposed_message:
+            outcome = "RETRY"
+            feedback = "Supply the exact proposed_message for semantic evaluation."
+        else:
+            from semantic_commercial_evaluator import evaluate_commercial_message
+            semantic = evaluate_commercial_message(
+                proposed_message=req.proposed_message,
+                declared_action=action,
+                proposal=proposal,
+            )
+            if not semantic["safe"]:
+                outcome = "ESCALATE"
+                feedback = "Outgoing message requires review: " + semantic["reason"]
+
     # Two model correction attempts maximum. After that, fail safe to human review.
     if outcome in {"ADJUST", "RETRY"} and req.attempt_number >= 2:
         outcome = "ESCALATE"
@@ -593,7 +611,8 @@ def review_commercial_action(
         "feedback": feedback,
         "adjusted_action": adjusted,
         "attempt_number": req.attempt_number,
-        "hard_guard_only": True,
+        "hard_guard_only": False,
+        "approved_message": req.proposed_message if outcome == "APPROVE" else None,
         "supplier_id": supplier.get("id"),
         "rfq_id": req.rfq_id,
     }
