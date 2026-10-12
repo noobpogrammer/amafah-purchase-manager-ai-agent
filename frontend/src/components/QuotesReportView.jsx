@@ -226,6 +226,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                   <tr>
                     <th>Supplier</th>
                     <th>Variant</th>
+                    <th>Deal Status</th>
                     <th>Quoted Price</th>
                     <th>Delivery Time</th>
                     <th>Quality / Warranty</th>
@@ -254,6 +255,15 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                             <span className="badge badge-category">{q.variant_label}</span>
                           ) : (
                             <span style={{ color: 'var(--text-muted)' }}>—</span>
+                          )}
+                        </td>
+                        <td>
+                          {q.is_pending_revision ? (
+                            <span className="badge badge-warning">Revision pending — previous accepted offer withdrawn</span>
+                          ) : q.is_current_accepted ? (
+                            <span className="badge badge-best">Currently accepted</span>
+                          ) : (
+                            <span style={{ color: 'var(--text-muted)' }}>Not accepted</span>
                           )}
                         </td>
                         <td>
@@ -307,6 +317,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                     <tr>
                       <th>Supplier</th>
                       <th>Quoted Price</th>
+                      <th>Acceptance History</th>
                       <th>Delivery Time</th>
                       <th>Raw WhatsApp Reply</th>
                     </tr>
@@ -316,6 +327,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                       <tr key={q.id}>
                         <td>{q.suppliers?.name || 'Supplier'}</td>
                         <td>AED {q.price}</td>
+                        <td>{q.is_current_accepted ? 'Currently accepted' : q.is_accepted ? 'Previously accepted (historical)' : 'Not accepted'}</td>
                         <td>{q.delivery_time || 'Not specified'}</td>
                         <td className="raw-msg-cell">
                           <span className="raw-msg-text">"{q.raw_message}"</span>
