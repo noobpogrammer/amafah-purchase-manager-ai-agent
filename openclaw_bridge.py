@@ -146,6 +146,7 @@ class AcceptNegotiatedQuoteRequest(BaseModel):
     rfq_id: str
     price: Optional[float] = Field(default=None, gt=0)
     quantity: Optional[int] = Field(default=None, gt=0)
+    quote_id: Optional[str] = None
     accepted_by: str = "openclaw"
 
 
@@ -1258,6 +1259,7 @@ def accept_negotiated_quote(
         price=req.price,
         quantity=req.quantity,
         accepted_by=req.accepted_by,
+        quote_id=req.quote_id,
     )
     if not accepted:
         raise HTTPException(
