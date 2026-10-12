@@ -859,6 +859,7 @@ class MultiItemSupplierQuoteRequest(BaseModel):
     supplier_id: str
     message: str
     source_message_id: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
 
 
 @router.post("/parse-multi-item-quotes")
@@ -867,17 +868,45 @@ def parse_multi_item_quotes(req: MultiItemSupplierQuoteRequest, x_openclaw_key: 
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     links = [x for x in db.get_open_rfqs_for_supplier(req.supplier_id) if (x.get("rfqs") or {}).get("client_id") == req.client_id]
+    bundle_id = None
+    if req.reply_to_message_id:
+        found = (
+            db.supabase.table("supplier_message_bundles").select("id")
+            .eq("client_id", req.client_id).eq("supplier_id", req.supplier_id)
+            .eq("external_message_id", req.reply_to_message_id)
+            .eq("status", "sent").limit(1).execute()
+        )
+        if found.data:
+            bundle_id = found.data[0]["id"]
+            number_rows = (
+                db.supabase.table("supplier_message_bundle_items")
+                .select("rfq_id,item_position")
+                .eq("bundle_id", bundle_id)
+                .eq("client_id", req.client_id)
+                .eq("supplier_id", req.supplier_id)
+                .order("item_position").execute()
+            )
+            item_numbers = {str(row["rfq_id"]): row.get("item_position") for row in (number_rows.data or [])}
+            links = [
+                {**entry, "rfqs": {
+                    **entry["rfqs"],
+                    "item_number": item_numbers[str(entry["rfqs"]["id"])],
+                    "reference": str(entry["rfqs"]["id"])[:8],
+                }}
+                for entry in links if str(entry["rfqs"]["id"]) in item_numbers
+            ]
     if len(links) < 2:
-        return {"status": "SINGLE_RFQ", "items": []}
+        return {"status": "SINGLE_RFQ", "items": [], "bundle_id": bundle_id}
     items = (groq_client.parse_multi_rfq_quotes(req.message, links) or {}).get("items") or []
     if not items:
-        return {"status": "NO_ITEMS", "items": []}
+        return {"status": "NO_ITEMS", "items": [], "bundle_id": bundle_id}
     try:
         clean = validate_multi_rfq_quotes(items, [str(x["rfqs"]["id"]) for x in links])
     except AmbiguousSupplierQuote as exc:
         return {"status": "CLARIFICATION_REQUIRED", "items": [], "reason": str(exc)}
     mapped = [{**raw, "candidate_rfq_id": result.rfq_id, "price": float(result.price)} for raw, result in zip(items, clean)]
-    return {"status": "MAPPED", "items": mapped, "source_message_id": req.source_message_id,
+    return {"status": "MAPPED" if len({item["candidate_rfq_id"] for item in mapped}) >= 2 else "SINGLE_RFQ",
+            "items": mapped, "bundle_id": bundle_id, "source_message_id": req.source_message_id,
             "instruction": "Record each distinct RFQ's validated price variants using record-quote before taking commercial action."}
 
 
