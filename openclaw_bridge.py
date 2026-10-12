@@ -496,6 +496,19 @@ def review_commercial_action(
     proposal = req.proposal or {}
     if not isinstance(proposal, dict):
         raise HTTPException(status_code=422, detail="proposal must be a JSON object")
+    # Reject malformed commercial JSON before evaluating numeric constraints.
+    if action in {"counter", "counteroffer", "negotiate"}:
+        required = {"price", "quantity", "delivery_days"}
+        if set(proposal) != required:
+            raise HTTPException(status_code=422, detail="Counter requires exactly price, quantity, delivery_days")
+        if (type(proposal["price"]) not in (int, float)
+            or type(proposal["quantity"]) is not int
+            or type(proposal["delivery_days"]) is not int):
+            raise HTTPException(status_code=422, detail="Invalid counter field types")
+        if (not __import__("math").isfinite(proposal["price"])
+            or proposal["price"] <= 0 or proposal["quantity"] <= 0
+            or proposal["delivery_days"] < 0):
+            raise HTTPException(status_code=422, detail="Invalid counter values")
     rfq = None
     active_session = None
     if req.rfq_id:
