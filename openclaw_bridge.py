@@ -295,12 +295,40 @@ def activation_gate(
         decision, reason = "IGNORE", "greeting_wait_for_second_message"
     elif is_personal and not is_commercial:
         decision, reason = "IGNORE", "personal_conversation"
-    elif is_commercial and has_procurement_state:
+    elif is_commercial and (open_links or active_session or pending_clarification):
+        # Human-review flags alone never authorize procurement replies. A repeated
+        # out-of-context inquiry must stay silent after its review row is created.
         decision, reason = "ENGAGE", "explicit_procurement_intent_with_context"
     elif is_commercial:
         decision, reason = "HUMAN_REVIEW", "procurement_intent_without_active_context"
     else:
         decision, reason = "IGNORE", "no_clear_procurement_intent"
+
+    if decision == "HUMAN_REVIEW":
+        # Persist once per pending exact supplier request; no AI reply is authorized.
+        # Failure is surfaced instead of silently claiming that a review was created.
+        existing = (
+            db.supabase.table("flagged_for_review")
+            .select("id")
+            .eq("client_id", req.client_id)
+            .eq("supplier_id", supplier["id"])
+            .eq("category", "procurement_without_rfq")
+            .eq("raw_message", message)
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        )
+        if not (existing.data or []):
+            db.supabase.table("flagged_for_review").insert({
+                "client_id": req.client_id,
+                "supplier_id": supplier["id"],
+                "rfq_id": None,
+                "category": "procurement_without_rfq",
+                "reason": "Procurement inquiry without authorized matching RFQ; human review required",
+                "raw_message": message,
+                "status": "pending",
+                "metadata": {"source": "openclaw_activation_gate", "engagement_reason": reason},
+            }).execute()
 
     return {
         "supplier": {
