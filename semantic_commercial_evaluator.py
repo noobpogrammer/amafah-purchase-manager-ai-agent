@@ -5,7 +5,8 @@ quantity, delivery, price ceilings and RFQ state.
 """
 import json
 import logging
-from groq_client import client, UTILITY_MODEL
+import os
+from groq_client import client, NEGOTIATION_MODEL
 
 log = logging.getLogger(__name__)
 _ALLOWED = {"INFORMATION_REQUEST", "COUNTEROFFER", "ACCEPTANCE", "TERM_CHANGE", "ACKNOWLEDGEMENT", "OTHER"}
@@ -29,7 +30,7 @@ def evaluate_commercial_message(*, proposed_message: str, declared_action: str, 
     )
     try:
         response = client.chat.completions.create(
-            model=UTILITY_MODEL,
+            model=os.getenv("SEMANTIC_EVALUATOR_MODEL", NEGOTIATION_MODEL),
             temperature=0,
             max_tokens=300,
             response_format={"type": "json_object"},
