@@ -30,6 +30,23 @@ def clean_phone(phone: str) -> str:
     return "".join(c for c in phone if c.isdigit())
 
 
+def get_supplier_by_id(supplier_id: str, client_id: str | None = None):
+    """Read an active supplier by id, with optional tenant scoping."""
+    if not supplier_id:
+        return None
+    query = (
+        supabase.table("suppliers")
+        .select("*")
+        .eq("id", supplier_id)
+        .eq("is_active", True)
+        .is_("deleted_at", "null")
+    )
+    if client_id:
+        query = query.eq("client_id", client_id)
+    res = query.maybe_single().execute()
+    return res.data or None
+
+
 def get_supplier_by_phone(client_id: str, phone_number: str):
     target_digits = clean_phone(phone_number)
     if not target_digits:

@@ -2850,7 +2850,7 @@ async def flush_pending_initial_rfq_bundles():
                     break
                 bundle_id = batch["bundle_id"]
                 items = batch["items"]
-                supplier = db.get_supplier_by_id(supplier_id)
+                supplier = db.get_supplier_by_id(supplier_id, client_id=client_id)
                 if not supplier or not supplier.get("phone_number") or db.is_client_automation_paused(client_id):
                     raise RuntimeError("Supplier not reachable or client paused before dispatch")
                 plans = [BundleItem(
@@ -3357,6 +3357,20 @@ async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, cu
     client_id = current_user.get("client_id")
     if not client_id:
         raise HTTPException(status_code=401, detail="Authentication missing client_id")
+
+    # An explicit Ignore/Dismiss is an internal operator decision, not a
+    # supplier-facing instruction. Never invoke an LLM or WhatsApp for it.
+    normalized_action = (payload.response or "").strip().casefold()
+    if normalized_action in {
+        "ignore", "ignore this message", "dismiss", "dismiss this",
+        "no action", "no action needed", "do not respond",
+    }:
+        updated = db.resolve_flag_with_response(flag_id, payload.response, client_id=client_id)
+        if not updated:
+            existing = db.get_flag_by_id(flag_id, client_id=client_id)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Flagged item not found")
+        return {"status": "resolved", "flag_id": flag_id, "sent_to_supplier": False}
 
     if not payload.send_to_supplier:
         updated = db.resolve_flag_with_response(flag_id, payload.response, client_id=client_id)
