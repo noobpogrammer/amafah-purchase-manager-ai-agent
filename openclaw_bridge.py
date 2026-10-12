@@ -135,6 +135,26 @@ class LogMessageRequest(BaseModel):
     related_rfq_id: Optional[str] = None
     status: Optional[str] = None
     event_key: Optional[str] = None
+    external_message_id: Optional[str] = None
+
+
+class AcceptNegotiatedQuoteRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    rfq_id: str
+    price: Optional[float] = Field(default=None, gt=0)
+    quantity: Optional[int] = Field(default=None, gt=0)
+    accepted_by: str = "openclaw"
+
+
+class MessageDeliveryRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    body: str
+    success: bool
+    external_message_id: Optional[str] = None
+    related_rfq_id: Optional[str] = None
+    error: Optional[str] = None
 
 
 @router.post("/supplier-context", dependencies=[])
@@ -200,6 +220,11 @@ def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header
     _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
 
     variants = [variant.model_dump() for variant in req.variants]
+    allow_post_deadline = db.can_record_post_deadline_quote(
+        req.client_id,
+        req.rfq_id,
+        req.supplier_id,
+    )
     rows = db.record_quotes_batch(
         rfq_id=req.rfq_id,
         supplier_id=req.supplier_id,
@@ -207,6 +232,7 @@ def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header
         raw_message=req.raw_message,
         source_message_id=req.source_message_id,
         confidence=req.confidence,
+        allow_post_deadline=allow_post_deadline,
     )
     if not rows:
         raise HTTPException(status_code=409, detail="Quote was not recorded.")
@@ -243,6 +269,20 @@ def negotiation_decision(
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
 
+    active_session = db.get_active_negotiation_session(
+        req.client_id,
+        req.rfq_id,
+        req.supplier_id,
+    )
+
+    # Existing negotiations may finish after due_by. A brand-new negotiation
+    # may not begin after the RFQ deadline.
+    if not db.is_rfq_open(rfq) and not active_session:
+        raise HTTPException(
+            status_code=409,
+            detail="RFQ deadline passed and no in-flight negotiation exists for this supplier.",
+        )
+
     quote_rows = (
         db.supabase.table("quotes")
         .select("price,created_at")
@@ -257,11 +297,6 @@ def negotiation_decision(
         if row.get("price") is not None and float(row["price"]) > 0
     ]
 
-    active_session = db.get_active_negotiation_session(
-        req.client_id,
-        req.rfq_id,
-        req.supplier_id,
-    )
     constraints = db.get_rfq_negotiation_constraints(req.client_id, req.rfq_id)
 
     preflight = negotiation_engine.build_negotiation_preflight(
@@ -285,6 +320,42 @@ def negotiation_decision(
         or preflight.get("selected_strategy") == "ESCALATE"
     )
 
+    attempt_count = int(active_session.get("attempt_count") or 0) if active_session else 0
+    latest_counter = active_session.get("latest_agent_counter") if active_session else None
+    previous_counter = active_session.get("previous_agent_counter") if active_session else None
+
+    if preflight.get("should_counter"):
+        attempt_count += 1
+        previous_counter = latest_counter
+        latest_counter = preflight.get("recommended_anchor")
+        db.supabase.table("rfq_suppliers").update(
+            {"negotiation_attempts": attempt_count}
+        ).eq("rfq_id", req.rfq_id).eq("supplier_id", req.supplier_id).execute()
+
+    session_status = "awaiting_human_review" if requires_human else "active"
+    session = db.create_or_update_negotiation_session(
+        req.client_id,
+        req.rfq_id,
+        req.supplier_id,
+        status=session_status,
+        preferred_target=preflight.get("preferred_target"),
+        acceptable_max=preflight.get("acceptable_max"),
+        tolerated_final_ceiling=preflight.get("tolerated_final_ceiling"),
+        initial_supplier_offer=preflight.get("initial_supplier_offer"),
+        previous_supplier_offer=preflight.get("previous_supplier_offer"),
+        latest_supplier_offer=preflight.get("latest_supplier_offer"),
+        previous_agent_counter=previous_counter,
+        latest_agent_counter=latest_counter,
+        attempt_count=attempt_count,
+        supplier_total_concession=preflight.get("supplier_total_concession") or 0,
+        supplier_last_concession=preflight.get("supplier_last_concession") or 0,
+        supplier_final_detected=bool(preflight.get("supplier_final_detected")),
+        selected_strategy=preflight.get("selected_strategy"),
+        strategy_phase=preflight.get("reason_code"),
+    )
+    if not session:
+        raise HTTPException(status_code=500, detail="Negotiation decision could not be persisted.")
+
     return {
         "action": "counter" if preflight.get("should_counter") else "stop",
         "requires_human": requires_human,
@@ -295,10 +366,12 @@ def negotiation_decision(
         "allowed_counter_max": preflight.get("allowed_counter_max"),
         "supplier_final_detected": preflight.get("supplier_final_detected"),
         "tradeoff_evaluation": preflight.get("tradeoff_evaluation"),
-        "attempts_used": preflight.get("attempts_used"),
-        "attempts_remaining": preflight.get("attempts_remaining"),
+        "attempts_used": attempt_count,
+        "attempts_remaining": max(0, 10 - attempt_count),
         "preferred_target": preflight.get("preferred_target"),
         "acceptable_max": preflight.get("acceptable_max"),
+        "negotiation_session_id": session.get("id"),
+        "persisted": True,
     }
 
 
@@ -333,7 +406,7 @@ def log_message(req: LogMessageRequest, x_openclaw_key: Optional[str] = Header(d
     if direction not in {"inbound", "outbound"}:
         raise HTTPException(status_code=422, detail="direction must be inbound or outbound")
 
-    row = db.log_message(
+    row_id = db.log_message(
         client_id=req.client_id,
         supplier_id=req.supplier_id,
         direction=direction,
@@ -342,4 +415,67 @@ def log_message(req: LogMessageRequest, x_openclaw_key: Optional[str] = Header(d
         status=req.status,
         event_key=req.event_key,
     )
-    return {"logged": bool(row), "message": row}
+    if row_id and direction == "outbound" and req.external_message_id:
+        db.mark_message_sent(row_id, external_message_id=req.external_message_id)
+    return {"logged": bool(row_id), "message_id": row_id}
+
+
+@router.post("/accept-negotiated-quote")
+def accept_negotiated_quote(
+    req: AcceptNegotiatedQuoteRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    _require_openclaw_key(x_openclaw_key)
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+
+    accepted = db.accept_recorded_quote(
+        req.client_id,
+        req.rfq_id,
+        req.supplier_id,
+        price=req.price,
+        quantity=req.quantity,
+        accepted_by=req.accepted_by,
+    )
+    if not accepted:
+        raise HTTPException(
+            status_code=409,
+            detail="Quote cannot be accepted: no matching persisted quote or no valid in-flight negotiation.",
+        )
+    return {"accepted": True, "quote": accepted}
+
+
+@router.post("/message-delivery")
+def message_delivery(
+    req: MessageDeliveryRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    _require_openclaw_key(x_openclaw_key)
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+
+    row = db.find_latest_message_by_body(
+        client_id=req.client_id,
+        supplier_id=req.supplier_id,
+        direction="outbound",
+        body=req.body,
+        related_rfq_id=req.related_rfq_id,
+    )
+    if row:
+        row_id = row.get("id")
+    else:
+        row_id = db.log_message(
+            client_id=req.client_id,
+            supplier_id=req.supplier_id,
+            direction="outbound",
+            body=req.body,
+            related_rfq_id=req.related_rfq_id,
+            status="sent" if req.success else "failed",
+        )
+
+    if row_id:
+        if req.success:
+            db.mark_message_sent(row_id, external_message_id=req.external_message_id)
+        else:
+            db.mark_message_failed(row_id, req.error or "OpenClaw delivery failed")
+
+    return {"updated": bool(row_id), "message_log_id": row_id}
