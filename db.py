@@ -1118,6 +1118,37 @@ def log_message(client_id: str, supplier_id: str, direction: str,
     return None
 
 
+
+def find_latest_message_by_body(
+    client_id: str,
+    supplier_id: str,
+    direction: str,
+    body: str,
+    related_rfq_id: str = None,
+) -> dict | None:
+    """Find the newest matching message row for delivery reconciliation."""
+    if not client_id or not supplier_id or not direction or body is None:
+        return None
+    try:
+        query = (
+            supabase.table("message_log")
+            .select("*")
+            .eq("client_id", client_id)
+            .eq("supplier_id", supplier_id)
+            .eq("direction", direction)
+            .eq("body", body)
+            .order("created_at", desc=True)
+            .limit(1)
+        )
+        if related_rfq_id:
+            query = query.eq("related_rfq_id", related_rfq_id)
+        res = query.execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.warning("find_latest_message_by_body failed: %s", e)
+        return None
+
+
 def update_message_related_rfq(message_id: str, rfq_id: str):
     """
     Updates the related_rfq_id column of a message_log row once the RFQ association
