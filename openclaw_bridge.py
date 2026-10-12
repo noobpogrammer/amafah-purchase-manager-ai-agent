@@ -1632,22 +1632,23 @@ def message_delivery(
         body=req.body,
         related_rfq_id=req.related_rfq_id,
     )
-    if row:
-        row_id = row.get("id")
+    if not row:
+        # Delivery callbacks reconcile an existing message, never invent a
+        # standalone sent record (which could conceal a broken outbound log).
+        raise HTTPException(status_code=404, detail="No matching outbound message to reconcile")
+    row_id = row["id"]
+    if req.success:
+        if not req.external_message_id:
+            raise HTTPException(status_code=422, detail="Successful delivery must include platform message ID")
+        if row.get("status") == "sent":
+            if row.get("external_message_id") == req.external_message_id:
+                return {"updated": True, "message_log_id": row_id, "already_recorded": True}
+            raise HTTPException(status_code=409, detail="Message already marked sent with a different platform ID")
+        updated = db.mark_message_sent(row_id, external_message_id=req.external_message_id)
     else:
-        row_id = db.log_message(
-            client_id=req.client_id,
-            supplier_id=supplier["id"],
-            direction="outbound",
-            body=req.body,
-            related_rfq_id=req.related_rfq_id,
-            status="sent" if req.success else "failed",
-        )
-
-    if row_id:
-        if req.success:
-            db.mark_message_sent(row_id, external_message_id=req.external_message_id)
-        else:
-            db.mark_message_failed(row_id, req.error or "OpenClaw delivery failed")
-
-    return {"updated": bool(row_id), "message_log_id": row_id}
+        if row.get("status") == "sent":
+            return {"updated": False, "message_log_id": row_id, "reason": "already_sent"}
+        updated = db.mark_message_failed(row_id, req.error or "OpenClaw delivery failed")
+    if not updated:
+        raise HTTPException(status_code=503, detail="Could not persist delivery status")
+    return {"updated": True, "message_log_id": row_id}
