@@ -2904,6 +2904,154 @@ def get_initial_rfq_delivery_status(rfq_id: str, supplier_id: str) -> Optional[d
         return None
 
 
+
+def evaluate_outbound_recovery(message: dict) -> dict:
+    """Decide whether a queued outbound message is still safe to retry after restart.
+
+    This deliberately fails closed. Conversational messages are replayed only
+    when all commercial/context checks still agree that the message is current.
+    """
+    result = {"retry": False, "reason": "unknown"}
+    if not message or message.get("direction") != "outbound":
+        return {**result, "reason": "not_outbound"}
+
+    rfq_id = message.get("related_rfq_id")
+    supplier_id = message.get("supplier_id")
+    created_at = message.get("created_at")
+    if not rfq_id or not supplier_id or not created_at:
+        return {**result, "reason": "missing_rfq_supplier_or_timestamp"}
+
+    try:
+        created_dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return {**result, "reason": "invalid_message_timestamp"}
+
+    # 1) RFQ must still exist and remain active.
+    rfq = get_rfq_by_id(rfq_id)
+    if not rfq:
+        return {**result, "reason": "rfq_missing"}
+    if rfq.get("status") != "active":
+        return {**result, "reason": f"rfq_not_active:{rfq.get('status')}"}
+
+    # 2) A passed quote deadline makes an old queued message stale. Existing
+    # negotiations may continue only from live supplier turns, never by replaying
+    # an old outbound message after process restart.
+    if not is_rfq_open(rfq):
+        return {**result, "reason": "rfq_deadline_passed"}
+
+    try:
+        # 3) If any newer outbound message has already been delivered, this one
+        # is superseded and must never be replayed.
+        newer_out = (
+            supabase.table("message_log")
+            .select("id,status,created_at")
+            .eq("supplier_id", supplier_id)
+            .eq("related_rfq_id", rfq_id)
+            .eq("direction", "outbound")
+            .gt("created_at", created_at)
+            .eq("status", "sent")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if newer_out.data:
+            return {**result, "reason": "newer_outbound_already_sent"}
+
+        # 4) If the supplier replied after this message was created, conversation
+        # context has moved forward. Replaying would move the chat backwards.
+        newer_in = (
+            supabase.table("message_log")
+            .select("id,created_at")
+            .eq("supplier_id", supplier_id)
+            .eq("related_rfq_id", rfq_id)
+            .eq("direction", "inbound")
+            .gt("created_at", created_at)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if newer_in.data:
+            return {**result, "reason": "supplier_replied_after_message"}
+
+        # 5) If negotiation state advanced after this message, it is stale even
+        # when no inbound log row is available.
+        session_res = (
+            supabase.table("negotiation_sessions")
+            .select("id,status,updated_at")
+            .eq("rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if session_res.data:
+            session = session_res.data[0]
+            updated_at = session.get("updated_at")
+            if updated_at:
+                try:
+                    updated_dt = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+                    if updated_dt.tzinfo is None:
+                        updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                    if updated_dt > created_dt:
+                        return {**result, "reason": f"newer_negotiation_state:{session.get('status')}"}
+                except Exception:
+                    return {**result, "reason": "invalid_negotiation_timestamp"}
+
+            # 6) Completed/accepted/expired negotiation must never receive an old
+            # replayed message.
+            if session.get("status") not in ("active", "awaiting_human_review", "awaiting_authorization"):
+                return {**result, "reason": f"negotiation_finalized:{session.get('status')}"}
+
+        # 7) Explicit accepted quote is authoritative even if other state lags.
+        accepted = (
+            supabase.table("quotes")
+            .select("id")
+            .eq("rfq_id", rfq_id)
+            .eq("supplier_id", supplier_id)
+            .eq("is_accepted", True)
+            .limit(1)
+            .execute()
+        )
+        if accepted.data:
+            return {**result, "reason": "quote_already_accepted"}
+
+        # Message is current only if every guard above passed.
+        return {"retry": True, "reason": "all_recovery_guards_passed"}
+
+    except Exception as e:
+        logger.warning(
+            "evaluate_outbound_recovery failed closed for message %s: %s",
+            message.get("id"),
+            e,
+        )
+        return {**result, "reason": "recovery_guard_error"}
+
+
+def suppress_stale_outbound_message(message_id: str, reason: str) -> bool:
+    """Mark a stale queued message as failed/suppressed so startup cannot replay it again."""
+    if not message_id:
+        return False
+    clean_reason = f"Startup recovery suppressed stale outbound: {reason}"[:500]
+    try:
+        res = (
+            supabase.table("message_log")
+            .update({
+                "status": "failed",
+                "error_message": clean_reason,
+                "attempted_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("id", message_id)
+            .eq("status", "queued")
+            .execute()
+        )
+        return bool(res.data)
+    except Exception as e:
+        logger.warning("suppress_stale_outbound_message failed for %s: %s", message_id, e)
+        return False
+
+
 def get_queued_outbound_messages() -> list[dict]:
     """
     Fetches all outbound messages currently in 'queued' status on startup.
