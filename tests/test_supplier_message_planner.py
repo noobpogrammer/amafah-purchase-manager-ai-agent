@@ -21,14 +21,23 @@ class SupplierMessagePlannerTests(unittest.TestCase):
         item = BundleItem(rfq_id="rfq-1", product_name="Brush", quantity=24)
         self.assertEqual(plan_supplier_bundles([item, item]), [[item]])
 
-    def test_bundle_has_explicit_numbers_and_response_instructions(self):
+    def test_multi_item_numbers_are_optional_for_replies(self):
         msg = format_supplier_bundle([
             BundleItem("a", "Noora Brush", 24, deadline_hours=24),
             BundleItem("b", "PVC Pipe", 12),
         ])
         self.assertIn("1. Noora Brush", msg)
         self.assertIn("2. PVC Pipe", msg)
-        self.assertIn("each item number", msg)
+        self.assertIn("You can reply naturally", msg)
+        self.assertIn("no need to use item numbers", msg)
+        self.assertNotIn("reply with each item number", msg)
+
+    def test_single_item_message_does_not_request_item_number(self):
+        msg = format_supplier_bundle([BundleItem("a", "Noora Brush", 34, specs="123", deadline_hours=2, required_delivery_days=2)])
+        self.assertIn("*Product:* Noora Brush", msg)
+        self.assertIn("*Quantity:* 34 units", msg)
+        self.assertNotIn("1. Noora Brush", msg)
+        self.assertNotIn("item number", msg)
 
     def test_multi_quote_must_map_to_real_candidate(self):
         with self.assertRaises(AmbiguousSupplierQuote):
