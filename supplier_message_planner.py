@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import math
 from typing import Any, Mapping, Sequence
 
 
@@ -92,7 +93,7 @@ def validate_multi_rfq_quotes(
             price = Decimal(str(item.get("price")))
         except (ValueError, TypeError, InvalidOperation):
             raise AmbiguousSupplierQuote("Quote requires a valid confidence and price") from None
-        if confidence < min_confidence or not price.is_finite() or price <= 0:
+        if not math.isfinite(confidence) or confidence < min_confidence or not price.is_finite() or price <= 0:
             raise AmbiguousSupplierQuote("Low-confidence, non-finite, or non-positive quote")
         qty = item.get("quantity")
         if qty is not None and (isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0):
