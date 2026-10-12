@@ -597,7 +597,7 @@ export default function RFQDetailView({
                       <div className="quotes-grid">
                         {detailData.quotes.map((q) => {
                           const bestQuoteId = detailData.ranking?.best_quote_id || detailData.ranking?.ranking_json?.best_quote_id;
-                          const isBest = bestQuoteId
+                          const isBest = !detailData.quotes.some((quote) => quote.is_pending_revision) && bestQuoteId
                             ? bestQuoteId === q.id
                             : (detailData.ranking?.best_supplier_id === q.supplier_id && detailData.quotes.filter((x) => x.supplier_id === detailData.ranking.best_supplier_id).length === 1);
 
