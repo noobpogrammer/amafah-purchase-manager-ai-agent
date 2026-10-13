@@ -196,6 +196,15 @@ class RfqContextResolveRequest(BaseModel):
     extracted_facts: dict = Field(default_factory=dict)
 
 
+class RfqMappingValidateRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    proposed_rfq_id: str
+    message: str
+    attempt_number: int = Field(default=1, ge=1, le=3)
+    reply_to_message_id: Optional[str] = None
+
+
 class PendingCommercialDraftRequest(BaseModel):
     client_id: str
     supplier_id: str
@@ -358,6 +367,69 @@ def activation_gate(
         "pending_flags": pending_flags,
         "message": req.message,
     }
+
+
+@router.post("/validate-rfq-mapping")
+def validate_rfq_mapping(
+    req: RfqMappingValidateRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """Validate a proposed RFQ against fresh supplier-scoped candidates.
+
+    This confirms authorized identity and strong message references. It cannot
+    prove semantic equivalence of free-form product descriptions.
+    """
+    _require_openclaw_key(x_openclaw_key)
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    links = db.get_open_rfqs_for_supplier(req.supplier_id)
+    active = [
+        row.get("rfqs") or {} for row in links
+        if (row.get("rfqs") or {}).get("client_id") == req.client_id
+    ]
+    active_ids = {row["id"] for row in active if row.get("id")}
+    options = [
+        {"rfq_id": row["id"], "product_name": row.get("product_name"),
+         "specs": row.get("specs"), "quantity": row.get("quantity")}
+        for row in active if row.get("id")
+    ]
+    if req.proposed_rfq_id not in active_ids:
+        return {"status": "RETRY" if req.attempt_number < 3 else "CLARIFY",
+                "error_code": "RFQ_NOT_ACTIVE_FOR_SUPPLIER",
+                "candidates": options, "attempt_number": req.attempt_number}
+
+    if req.reply_to_message_id:
+        bundles = (
+            db.supabase.table("supplier_message_bundles")
+            .select("id").eq("client_id", req.client_id)
+            .eq("supplier_id", req.supplier_id)
+            .eq("external_message_id", req.reply_to_message_id)
+            .eq("status", "sent").limit(1).execute()
+        )
+        if bundles.data:
+            items = (
+                db.supabase.table("supplier_message_bundle_items")
+                .select("rfq_id").eq("bundle_id", bundles.data[0]["id"])
+                .eq("client_id", req.client_id).eq("supplier_id", req.supplier_id)
+                .execute()
+            )
+            allowed_ids = {x["rfq_id"] for x in (items.data or []) if x.get("rfq_id") in active_ids}
+            if allowed_ids and req.proposed_rfq_id not in allowed_ids:
+                return {"status": "RETRY" if req.attempt_number < 3 else "CLARIFY",
+                        "error_code": "REPLY_REFERENCES_DIFFERENT_RFQ",
+                        "candidates": [x for x in options if x["rfq_id"] in allowed_ids],
+                        "attempt_number": req.attempt_number}
+            if len(allowed_ids) == 1:
+                return {"status": "VERIFIED", "rfq_id": req.proposed_rfq_id,
+                        "evidence": "single_item_whatsapp_bundle"}
+
+    if len(active_ids) == 1:
+        return {"status": "VERIFIED", "rfq_id": req.proposed_rfq_id,
+                "evidence": "only_active_supplier_rfq"}
+
+    return {"status": "CANDIDATE_VALID", "rfq_id": req.proposed_rfq_id,
+            "evidence": "supplier_and_active_status_only",
+            "requires_semantic_disambiguation": True,
+            "candidates": options}
 
 
 @router.post("/negotiation-context")
@@ -854,99 +926,30 @@ def resolve_rfq_context(
                     "candidates": [x for x in candidates if x["rfq_id"] == linked],
                 }
 
-    # 2) If exactly one RFQ has an in-flight negotiation, it is a strong default
-    # for negotiation-like messages, unless stronger explicit context points elsewhere.
-    active_negotiations = [x for x in candidates if x.get("active_negotiation")]
-
-    # 3) Explicit product/spec clues can strongly narrow the set.
-    message_norm = " ".join((req.message or "").lower().split())
-    explicit_matches = []
-    if message_norm:
-        for cand in candidates:
-            product = " ".join(str(cand.get("product_name") or "").lower().split())
-            specs = " ".join(str(cand.get("specs") or "").lower().split())
-            product_tokens = [t for t in product.replace("/", " ").replace("-", " ").split() if len(t) >= 3]
-            spec_tokens = [t for t in specs.replace("/", " ").replace("-", " ").split() if len(t) >= 3]
-            product_hit = bool(product and (product in message_norm or (product_tokens and all(t in message_norm for t in product_tokens))))
-            spec_hit = bool(spec_tokens and len(spec_tokens) <= 4 and all(t in message_norm for t in spec_tokens))
-            if product_hit or spec_hit:
-                explicit_matches.append(cand)
-
-    if len(explicit_matches) == 1:
-        chosen = explicit_matches[0]
+    # Never select an RFQ from product-name token matching or from old chat
+    # memory. Supplier language, aliases, and scripts are interpreted by the
+    # model, while the backend validates a proposed candidate separately.
+    # Preserve ALL candidates: cutting to 3 silently hides valid concurrent
+    # RFQs, especially when the supplier has many open requests.
+    if len(candidates) == 1:
         return {
             "status": "RESOLVED",
-            "resolved_rfq_id": chosen["rfq_id"],
+            "resolved_rfq_id": candidates[0]["rfq_id"],
             "confidence": "high",
-            "reason": "Current supplier message explicitly matches one open RFQ's product/specification.",
-            "candidates": [chosen],
-        }
-
-    if len(active_negotiations) == 1 and not explicit_matches:
-        chosen = active_negotiations[0]
-        return {
-            "status": "RESOLVED",
-            "resolved_rfq_id": chosen["rfq_id"],
-            "confidence": "high",
-            "reason": "Exactly one open RFQ has an in-flight negotiation for this supplier.",
-            "candidates": [chosen],
-        }
-
-    # 4) Deduction: remove obviously completed/unavailable candidates when there
-    # are other live candidates, but keep them if the current message explicitly
-    # references their product so a supplier can revise/reopen context naturally.
-    reduced = []
-    for cand in candidates:
-        latest = cand.get("latest_quote") or {}
-        unavailable = bool(latest) and latest.get("is_available") is False
-        accepted = bool(latest) and latest.get("is_accepted") is True
-
-        if accepted and cand not in explicit_matches:
-            continue
-        if unavailable and cand not in explicit_matches and len(candidates) > 1:
-            continue
-        reduced.append(cand)
-
-    if not reduced:
-        reduced = candidates
-
-    # 5) Prefer at most three genuinely plausible candidates for clarification.
-    # Ordering is contextual: active negotiation, explicit match, unquoted/new,
-    # then most recent RFQ conversation.
-    def rank(cand):
-        score = 0
-        if cand in explicit_matches:
-            score += 100
-        if cand.get("active_negotiation"):
-            score += 80
-        if not cand.get("has_quote_history"):
-            score += 25
-        if cand.get("recent_rfq_messages"):
-            score += 15
-        if cand.get("supplier_status") == "responded":
-            score += 5
-        return score
-
-    reduced = sorted(reduced, key=rank, reverse=True)[:3]
-
-    if len(reduced) == 1:
-        return {
-            "status": "RESOLVED",
-            "resolved_rfq_id": reduced[0]["rfq_id"],
-            "confidence": "medium",
-            "reason": "Deduction left only one plausible open RFQ.",
-            "candidates": reduced,
+            "reason": "Only one authorized open RFQ exists for this supplier.",
+            "candidates": candidates,
         }
 
     return {
         "status": "AMBIGUOUS",
         "resolved_rfq_id": None,
         "confidence": "low",
-        "reason": "More than one RFQ remains genuinely plausible after strong-context matching and deduction.",
-        "candidates": reduced,
+        "reason": "Multiple open RFQs: use semantic interpretation with fresh candidates and server validation.",
+        "candidates": candidates,
         "clarification_guidance": (
-            "Ask one short clarification question naming only these remaining candidates. "
-            "Do not list every RFQ linked to the supplier."
+            "Infer from the current message and quoted WhatsApp reference. "
+            "Submit each proposed active RFQ for backend validation; retry on a "
+            "recoverable mapping rejection and clarify only if evidence is insufficient."
         ),
     }
 
@@ -1345,7 +1348,9 @@ def record_multi_item_quotes(req: RecordMultiItemQuotesRequest, x_openclaw_key: 
 def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header(default=None)):
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
-    _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    linked = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    if linked.get("status") != "active":
+        raise HTTPException(status_code=409, detail="Closed RFQ cannot receive a new supplier quotation.")
 
     variants = [variant.model_dump() for variant in req.variants]
     allow_post_deadline = db.can_record_post_deadline_quote(
@@ -1533,6 +1538,11 @@ def log_message(req: LogMessageRequest, x_openclaw_key: Optional[str] = Header(d
     direction = req.direction.strip().lower()
     if direction not in {"inbound", "outbound"}:
         raise HTTPException(status_code=422, detail="direction must be inbound or outbound")
+
+    if req.related_rfq_id:
+        linked = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.related_rfq_id)
+        if linked.get("status") != "active":
+            raise HTTPException(status_code=409, detail="Stale or closed RFQ. Resolve current active RFQ before logging.")
 
     row_id = db.log_message(
         client_id=req.client_id,
