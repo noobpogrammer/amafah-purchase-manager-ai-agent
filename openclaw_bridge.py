@@ -196,6 +196,15 @@ class RfqContextResolveRequest(BaseModel):
     extracted_facts: dict = Field(default_factory=dict)
 
 
+class RfqMappingValidateRequest(BaseModel):
+    client_id: str
+    supplier_id: str
+    proposed_rfq_id: str
+    message: str
+    attempt_number: int = Field(default=1, ge=1, le=3)
+    reply_to_message_id: Optional[str] = None
+
+
 class PendingCommercialDraftRequest(BaseModel):
     client_id: str
     supplier_id: str
@@ -358,6 +367,69 @@ def activation_gate(
         "pending_flags": pending_flags,
         "message": req.message,
     }
+
+
+@router.post("/validate-rfq-mapping")
+def validate_rfq_mapping(
+    req: RfqMappingValidateRequest,
+    x_openclaw_key: Optional[str] = Header(default=None),
+):
+    """Validate a proposed RFQ against fresh supplier-scoped candidates.
+
+    This confirms authorized identity and strong message references. It cannot
+    prove semantic equivalence of free-form product descriptions.
+    """
+    _require_openclaw_key(x_openclaw_key)
+    _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    links = db.get_open_rfqs_for_supplier(req.supplier_id)
+    active = [
+        row.get("rfqs") or {} for row in links
+        if (row.get("rfqs") or {}).get("client_id") == req.client_id
+    ]
+    active_ids = {row["id"] for row in active if row.get("id")}
+    options = [
+        {"rfq_id": row["id"], "product_name": row.get("product_name"),
+         "specs": row.get("specs"), "quantity": row.get("quantity")}
+        for row in active if row.get("id")
+    ]
+    if req.proposed_rfq_id not in active_ids:
+        return {"status": "RETRY" if req.attempt_number < 3 else "CLARIFY",
+                "error_code": "RFQ_NOT_ACTIVE_FOR_SUPPLIER",
+                "candidates": options, "attempt_number": req.attempt_number}
+
+    if req.reply_to_message_id:
+        bundles = (
+            db.supabase.table("supplier_message_bundles")
+            .select("id").eq("client_id", req.client_id)
+            .eq("supplier_id", req.supplier_id)
+            .eq("external_message_id", req.reply_to_message_id)
+            .eq("status", "sent").limit(1).execute()
+        )
+        if bundles.data:
+            items = (
+                db.supabase.table("supplier_message_bundle_items")
+                .select("rfq_id").eq("bundle_id", bundles.data[0]["id"])
+                .eq("client_id", req.client_id).eq("supplier_id", req.supplier_id)
+                .execute()
+            )
+            allowed_ids = {x["rfq_id"] for x in (items.data or []) if x.get("rfq_id") in active_ids}
+            if allowed_ids and req.proposed_rfq_id not in allowed_ids:
+                return {"status": "RETRY" if req.attempt_number < 3 else "CLARIFY",
+                        "error_code": "REPLY_REFERENCES_DIFFERENT_RFQ",
+                        "candidates": [x for x in options if x["rfq_id"] in allowed_ids],
+                        "attempt_number": req.attempt_number}
+            if len(allowed_ids) == 1:
+                return {"status": "VERIFIED", "rfq_id": req.proposed_rfq_id,
+                        "evidence": "single_item_whatsapp_bundle"}
+
+    if len(active_ids) == 1:
+        return {"status": "VERIFIED", "rfq_id": req.proposed_rfq_id,
+                "evidence": "only_active_supplier_rfq"}
+
+    return {"status": "CANDIDATE_VALID", "rfq_id": req.proposed_rfq_id,
+            "evidence": "supplier_and_active_status_only",
+            "requires_semantic_disambiguation": True,
+            "candidates": options}
 
 
 @router.post("/negotiation-context")
