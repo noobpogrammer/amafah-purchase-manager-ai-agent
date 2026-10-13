@@ -74,34 +74,47 @@ def _get_rfq_and_verify_link(client_id: str, supplier_id: str, rfq_id: str) -> d
     return rfq
 
 
-def _latest_supplier_bundle_rfqs(client_id: str, supplier_id: str) -> dict:
-    """Latest delivered buyer invitation; never infer its RFQs from chat memory."""
+def _supplier_bundle_scope(client_id: str, supplier_id: str, reply_to_message_id: Optional[str] = None) -> dict:
+    """Supplier identity + persisted invitation lineage; no latest-only authority."""
     bundles = (db.supabase.table("supplier_message_bundles")
         .select("id,external_message_id,created_at")
         .eq("client_id", client_id).eq("supplier_id", supplier_id)
         .eq("kind", "initial_rfq").eq("status", "sent")
-        .order("created_at", desc=True).limit(1).execute())
-    if not bundles.data:
-        return {"bundle_id": None, "rfq_ids": [], "external_message_id": None}
-    bundle = bundles.data[0]
-    rows = (db.supabase.table("supplier_message_bundle_items").select("rfq_id")
-        .eq("client_id", client_id).eq("supplier_id", supplier_id)
-        .eq("bundle_id", bundle["id"]).execute())
-    return {"bundle_id": bundle["id"],
-            "rfq_ids": list({r["rfq_id"] for r in (rows.data or [])}),
-            "external_message_id": bundle.get("external_message_id")}
+        .order("created_at", desc=True).limit(30).execute().data or [])
+    records = []
+    for bundle in bundles:
+        items = (db.supabase.table("supplier_message_bundle_items")
+            .select("rfq_id").eq("bundle_id", bundle["id"])
+            .eq("client_id", client_id).eq("supplier_id", supplier_id).execute().data or [])
+        records.append({"bundle_id": bundle["id"], "external_message_id": bundle.get("external_message_id"),
+                        "rfq_ids": sorted({row["rfq_id"] for row in items})})
+    matching = [r for r in records if reply_to_message_id and
+                r["external_message_id"] == reply_to_message_id]
+    if matching:
+        return {"mode": "stanza", "rfq_ids": matching[0]["rfq_ids"],
+                "bundle_id": matching[0]["bundle_id"], "bundles": matching}
+    return {"mode": "session", "rfq_ids": sorted({i for r in records for i in r["rfq_ids"]}),
+            "bundle_id": None, "bundles": records}
 
 
-def _require_current_bundle_rfq(client_id: str, supplier_id: str, rfq_id: str):
-    """Fail closed when same supplier has older active duplicate test RFQs.
-
-    Non-bundled legacy suppliers continue through existing authorization.
-    """
-    bundle = _latest_supplier_bundle_rfqs(client_id, supplier_id)
-    if bundle["rfq_ids"] and rfq_id not in bundle["rfq_ids"]:
-        raise HTTPException(status_code=409,
-            detail="RFQ is not in supplier's latest delivered invitation bundle. Resolve the latest reference or request clarification.")
-    return bundle
+def _require_current_bundle_rfq(client_id: str, supplier_id: str, rfq_id: str,
+                                reply_to_message_id: Optional[str] = None) -> dict:
+    scope = _supplier_bundle_scope(client_id, supplier_id, reply_to_message_id)
+    if scope["mode"] == "stanza" and rfq_id not in scope["rfq_ids"]:
+        raise HTTPException(status_code=409, detail="RFQ not in the quoted WhatsApp invitation bundle.")
+    if scope["mode"] == "session" and scope["rfq_ids"] and rfq_id not in scope["rfq_ids"]:
+        raise HTTPException(status_code=409, detail="RFQ not in the supplier's recorded invitation history.")
+    if scope["mode"] == "session" and scope["rfq_ids"]:
+        selected = db.get_rfq_by_id(rfq_id, client_id=client_id)
+        active = db.get_open_rfqs_for_supplier(supplier_id)
+        duplicates = [r.get("rfqs") or {} for r in active if
+                      (r.get("rfqs") or {}).get("client_id") == client_id and
+                      (r.get("rfqs") or {}).get("id") in scope["rfq_ids"] and
+                      (r.get("rfqs") or {}).get("product_name", "").strip().lower() ==
+                      (selected or {}).get("product_name", "").strip().lower()]
+        if len(duplicates) > 1:
+            raise HTTPException(status_code=409, detail="Identical active RFQs across invitations; ask supplier to reply to the intended invitation.")
+    return scope
 
 
 def _historical_price_benchmarks(client_id: str, rfq: dict) -> list[dict]:
@@ -169,6 +182,7 @@ class RecordQuoteRequest(BaseModel):
     raw_message: Optional[str] = None
     source_message_id: Optional[str] = None
     confidence: str = "high"
+    reply_to_message_id: Optional[str] = None
 
 
 class MarkUnavailableRequest(BaseModel):
@@ -264,6 +278,7 @@ class CommercialActionReviewRequest(BaseModel):
     proposal: dict = Field(default_factory=dict)
     assessment: dict = Field(default_factory=dict)
     session_key: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
 
 
 class NegotiationContextRequest(BaseModel):
@@ -288,6 +303,7 @@ class RfqMappingValidateRequest(BaseModel):
     message: str
     attempt_number: int = Field(default=1, ge=1, le=3)
     reply_to_message_id: Optional[str] = None
+    source_message_id: Optional[str] = None
 
 
 class PendingCommercialDraftRequest(BaseModel):
@@ -477,12 +493,12 @@ def validate_rfq_mapping(
          "specs": row.get("specs"), "quantity": row.get("quantity")}
         for row in active if row.get("id")
     ]
-    latest = _latest_supplier_bundle_rfqs(req.client_id, req.supplier_id)
+    latest = _supplier_bundle_scope(req.client_id, req.supplier_id, req.reply_to_message_id)
     latest_ids = set(latest["rfq_ids"]) & active_ids
     if latest_ids and req.proposed_rfq_id not in latest_ids:
-        return {"status": "CLARIFY", "error_code": "OLDER_RFQ_NOT_IN_LATEST_BUNDLE",
+        return {"status": "CLARIFY", "error_code": "RFQ_OUTSIDE_INVITATION_CONTEXT",
                 "candidates": [x for x in options if x["rfq_id"] in latest_ids],
-                "latest_bundle_id": latest["bundle_id"]}
+                "bundle_id": latest["bundle_id"]}
     if req.proposed_rfq_id not in active_ids:
         return {"status": "RETRY" if req.attempt_number < 3 else "CLARIFY",
                 "error_code": "RFQ_NOT_ACTIVE_FOR_SUPPLIER",
@@ -532,7 +548,7 @@ def negotiation_context(
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
-    bundle = _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id)
+    bundle = _supplier_bundle_scope(req.client_id, req.supplier_id)
 
     quotes_res = (
         db.supabase.table("quotes")
@@ -562,7 +578,7 @@ def negotiation_context(
             "due_by": rfq.get("due_by"),
         },
         "quotes": quotes_res.data or [],
-        "latest_supplier_invitation_bundle": bundle,
+        "supplier_invitation_scope": {"mode": bundle["mode"], "rfq_ids": bundle["rfq_ids"]},
         "historical_price_benchmarks": _historical_price_benchmarks(req.client_id, rfq),
         "historical_benchmarks_are_advisory_only": True,
         "acceptance_requires_current_rfq_maximum_or_human_approval": True,
@@ -681,7 +697,7 @@ def review_commercial_action(
     active_session = None
     if req.rfq_id:
         rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
-        _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id)
+        _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id, req.reply_to_message_id)
         active_session = db.get_active_negotiation_session(
             req.client_id,
             req.rfq_id,
@@ -1051,7 +1067,7 @@ def resolve_rfq_context(
                 "bundle_id": bundle_id,
             }
 
-    latest = _latest_supplier_bundle_rfqs(req.client_id, req.supplier_id)
+    latest = _supplier_bundle_scope(req.client_id, req.supplier_id, req.reply_to_message_id)
     latest_ids = set(latest["rfq_ids"]) & candidate_ids
     if latest_ids:
         candidates = [x for x in candidates if x["rfq_id"] in latest_ids]
@@ -1514,7 +1530,7 @@ def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     linked = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
-    _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id)
+    _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id, req.reply_to_message_id)
     if linked.get("status") != "active":
         raise HTTPException(status_code=409, detail="Closed RFQ cannot receive a new supplier quotation.")
 
