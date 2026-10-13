@@ -477,6 +477,12 @@ def validate_rfq_mapping(
          "specs": row.get("specs"), "quantity": row.get("quantity")}
         for row in active if row.get("id")
     ]
+    latest = _latest_supplier_bundle_rfqs(req.client_id, req.supplier_id)
+    latest_ids = set(latest["rfq_ids"]) & active_ids
+    if latest_ids and req.proposed_rfq_id not in latest_ids:
+        return {"status": "CLARIFY", "error_code": "OLDER_RFQ_NOT_IN_LATEST_BUNDLE",
+                "candidates": [x for x in options if x["rfq_id"] in latest_ids],
+                "latest_bundle_id": latest["bundle_id"]}
     if req.proposed_rfq_id not in active_ids:
         return {"status": "RETRY" if req.attempt_number < 3 else "CLARIFY",
                 "error_code": "RFQ_NOT_ACTIVE_FOR_SUPPLIER",
@@ -1045,6 +1051,20 @@ def resolve_rfq_context(
                 "bundle_id": bundle_id,
             }
 
+    latest = _latest_supplier_bundle_rfqs(req.client_id, req.supplier_id)
+    latest_ids = set(latest["rfq_ids"]) & candidate_ids
+    if latest_ids:
+        candidates = [x for x in candidates if x["rfq_id"] in latest_ids]
+        candidate_ids = latest_ids
+    # An explicit full or unique short RFQ identifier wins over name matching.
+    message_text = str(req.message or "").lower()
+    explicit = [c for c in candidates if
+                c["rfq_id"].lower() in message_text or
+                c["rfq_id"][:8].lower() in message_text]
+    if len(explicit) == 1:
+        return {"status": "RESOLVED", "resolved_rfq_id": explicit[0]["rfq_id"],
+                "confidence": "very_high", "reason": "Explicit RFQ reference in supplier message",
+                "candidates": explicit}
     # 1) Native reply / stanza context is strongest when we have the external id.
     if req.reply_to_message_id:
         msg_res = (
