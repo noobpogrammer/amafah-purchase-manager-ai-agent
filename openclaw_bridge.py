@@ -156,6 +156,13 @@ class ClaimCommercialApprovalRequest(BaseModel):
     phone_number: str
     message: str
 
+class PrepareOutboundDeliveryRequest(BaseModel):
+    client_id: str
+    supplier_id: Optional[str] = None
+    phone_number: Optional[str] = None
+    body: str
+
+
 class MessageDeliveryRequest(BaseModel):
     client_id: str
     supplier_id: Optional[str] = None
@@ -163,6 +170,7 @@ class MessageDeliveryRequest(BaseModel):
     body: str
     success: bool
     external_message_id: Optional[str] = None
+    message_log_id: Optional[str] = None
     related_rfq_id: Optional[str] = None
     error: Optional[str] = None
 
@@ -1656,6 +1664,32 @@ def accept_negotiated_quote(
     return {"accepted": True, "quote": accepted}
 
 
+@router.post("/prepare-outbound-delivery")
+def prepare_outbound_delivery(req: PrepareOutboundDeliveryRequest, x_openclaw_key: Optional[str] = Header(default=None)):
+    """Bind a pending outgoing WhatsApp turn to an existing row before transport.
+
+    No database rows are created and no commercial authorization decisions occur.
+    """
+    _require_openclaw_key(x_openclaw_key)
+    supplier = _get_supplier_for_client(req.client_id, req.supplier_id, req.phone_number)
+    sent_body = req.body or ""
+    canonical_body = re.sub(r"^\\[(?:Procurment|Procurement) Agent\\]\\s*", "", sent_body, count=1)
+    matches = []
+    for body in dict.fromkeys([canonical_body, sent_body]):
+        rows = (
+            db.supabase.table("message_log").select("id,status,body,created_at")
+            .eq("client_id", req.client_id).eq("supplier_id", supplier["id"])
+            .eq("direction", "outbound").eq("body", body)
+            .in_("status", ["queued", "sending"])
+            .order("created_at", desc=True).limit(2).execute()
+        ).data or []
+        matches.extend(rows)
+    unique = {r["id"]: r for r in matches}
+    if len(unique) != 1:
+        return {"bound": False, "reason": "no_unique_pending_outbound_record"}
+    return {"bound": True, "message_log_id": next(iter(unique))}
+
+
 @router.post("/message-delivery")
 def message_delivery(
     req: MessageDeliveryRequest,
@@ -1671,20 +1705,25 @@ def message_delivery(
     canonical_body = re.sub(r"^\\[Procurment Agent\\]\\s*", "", sent_body, count=1)
     canonical_body = re.sub(r"^\\[Procurement Agent\\]\\s*", "", canonical_body, count=1)
 
-    row = db.find_latest_message_by_body(
-        client_id=req.client_id,
-        supplier_id=supplier["id"],
-        direction="outbound",
-        body=canonical_body,
-        related_rfq_id=req.related_rfq_id,
-    )
-    if not row and canonical_body != sent_body:
-        # Some callers already log the transport-decorated body.
+    if req.message_log_id:
+        found = (
+            db.supabase.table("message_log").select("*")
+            .eq("id", req.message_log_id)
+            .eq("client_id", req.client_id)
+            .eq("supplier_id", supplier["id"])
+            .eq("direction", "outbound")
+            .limit(1).execute()
+        )
+        row = (found.data or [None])[0]
+        if row and row.get("body") not in {canonical_body, sent_body}:
+            raise HTTPException(status_code=409, detail="Bound outbound row text differs from delivered message")
+    else:
+        # Legacy source without a bound row: exact body fallback only.
         row = db.find_latest_message_by_body(
             client_id=req.client_id,
             supplier_id=supplier["id"],
             direction="outbound",
-            body=sent_body,
+            body=canonical_body,
             related_rfq_id=req.related_rfq_id,
         )
     if not row:
