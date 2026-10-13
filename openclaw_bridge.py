@@ -1664,13 +1664,29 @@ def message_delivery(
     _require_openclaw_key(x_openclaw_key)
     supplier = _get_supplier_for_client(req.client_id, req.supplier_id, req.phone_number)
 
+    # OpenClaw's WhatsApp reply tag is added at the transport layer, after
+    # procurement_log_message saved the undecorated text. Normalize ONLY the
+    # known tag; never fuzzy-match unrelated commercial messages.
+    sent_body = req.body or ""
+    canonical_body = re.sub(r"^\\[Procurment Agent\\]\\s*", "", sent_body, count=1)
+    canonical_body = re.sub(r"^\\[Procurement Agent\\]\\s*", "", canonical_body, count=1)
+
     row = db.find_latest_message_by_body(
         client_id=req.client_id,
         supplier_id=supplier["id"],
         direction="outbound",
-        body=req.body,
+        body=canonical_body,
         related_rfq_id=req.related_rfq_id,
     )
+    if not row and canonical_body != sent_body:
+        # Some callers already log the transport-decorated body.
+        row = db.find_latest_message_by_body(
+            client_id=req.client_id,
+            supplier_id=supplier["id"],
+            direction="outbound",
+            body=sent_body,
+            related_rfq_id=req.related_rfq_id,
+        )
     if not row:
         # Delivery callbacks reconcile an existing message, never invent a
         # standalone sent record (which could conceal a broken outbound log).
