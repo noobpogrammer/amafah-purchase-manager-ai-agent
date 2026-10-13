@@ -9,6 +9,7 @@ state. It intentionally does not expose arbitrary SQL or direct WhatsApp send.
 from __future__ import annotations
 
 import hmac
+import logging
 import os
 import re
 from typing import Optional
@@ -23,6 +24,7 @@ from supplier_message_planner import validate_multi_rfq_quotes, AmbiguousSupplie
 
 
 router = APIRouter(prefix="/openclaw", tags=["openclaw"])
+logger = logging.getLogger(__name__)
 
 
 def _require_openclaw_key(x_openclaw_key: Optional[str] = Header(default=None)) -> None:
@@ -74,6 +76,90 @@ def _get_rfq_and_verify_link(client_id: str, supplier_id: str, rfq_id: str) -> d
     return rfq
 
 
+def _supplier_bundle_scope(client_id: str, supplier_id: str, reply_to_message_id: Optional[str] = None) -> dict:
+    """Supplier identity + persisted invitation lineage; no latest-only authority."""
+    bundles = (db.supabase.table("supplier_message_bundles")
+        .select("id,external_message_id,created_at")
+        .eq("client_id", client_id).eq("supplier_id", supplier_id)
+        .eq("kind", "initial_rfq").eq("status", "sent")
+        .order("created_at", desc=True).limit(30).execute().data or [])
+    records = []
+    for bundle in bundles:
+        items = (db.supabase.table("supplier_message_bundle_items")
+            .select("rfq_id").eq("bundle_id", bundle["id"])
+            .eq("client_id", client_id).eq("supplier_id", supplier_id).execute().data or [])
+        records.append({"bundle_id": bundle["id"], "external_message_id": bundle.get("external_message_id"),
+                        "rfq_ids": sorted({row["rfq_id"] for row in items})})
+    matching = [r for r in records if reply_to_message_id and
+                r["external_message_id"] == reply_to_message_id]
+    if matching:
+        return {"mode": "stanza", "rfq_ids": matching[0]["rfq_ids"],
+                "bundle_id": matching[0]["bundle_id"], "bundles": matching}
+    return {"mode": "session", "rfq_ids": sorted({i for r in records for i in r["rfq_ids"]}),
+            "bundle_id": None, "bundles": records}
+
+
+def _require_current_bundle_rfq(client_id: str, supplier_id: str, rfq_id: str,
+                                reply_to_message_id: Optional[str] = None) -> dict:
+    scope = _supplier_bundle_scope(client_id, supplier_id, reply_to_message_id)
+    if scope["mode"] == "stanza" and rfq_id not in scope["rfq_ids"]:
+        raise HTTPException(status_code=409, detail="RFQ not in the quoted WhatsApp invitation bundle.")
+    if scope["mode"] == "session" and scope["rfq_ids"] and rfq_id not in scope["rfq_ids"]:
+        raise HTTPException(status_code=409, detail="RFQ not in the supplier's recorded invitation history.")
+    if scope["mode"] == "session" and scope["rfq_ids"]:
+        selected = db.get_rfq_by_id(rfq_id, client_id=client_id)
+        active = db.get_open_rfqs_for_supplier(supplier_id)
+        duplicates = [r.get("rfqs") or {} for r in active if
+                      (r.get("rfqs") or {}).get("client_id") == client_id and
+                      (r.get("rfqs") or {}).get("id") in scope["rfq_ids"] and
+                      (r.get("rfqs") or {}).get("product_name", "").strip().lower() ==
+                      (selected or {}).get("product_name", "").strip().lower()]
+        if len(duplicates) > 1:
+            raise HTTPException(status_code=409, detail="Identical active RFQs across invitations; ask supplier to reply to the intended invitation.")
+    return scope
+
+
+def _historical_price_benchmarks(client_id: str, rfq: dict) -> list[dict]:
+    """Advisory-only cross-supplier comparisons, excluding current RFQ."""
+    import re as _re
+    def norm(value):
+        return " ".join(_re.findall(r"[a-z0-9]+", str(value or "").lower()))
+    target_name = norm(rfq.get("product_name"))
+    target_specs = norm(rfq.get("specs"))
+    if not target_name:
+        return []
+    prior = (db.supabase.table("rfqs")
+        .select("id,product_name,specs,quantity,required_delivery_days,acceptable_price_min,acceptable_price_max,created_at")
+        .eq("client_id", client_id).neq("id", rfq["id"])
+        .order("created_at", desc=True).limit(150).execute())
+    matches = []
+    for old in prior.data or []:
+        if norm(old.get("product_name")) != target_name:
+            continue
+        if target_specs and norm(old.get("specs")) != target_specs:
+            continue
+        if rfq.get("quantity") and old.get("quantity") and int(rfq["quantity"]) != int(old["quantity"]):
+            continue
+        current_days, old_days = rfq.get("required_delivery_days"), old.get("required_delivery_days")
+        if current_days is not None and old_days is not None and int(current_days) != int(old_days):
+            continue
+        qs = (db.supabase.table("quotes")
+              .select("price,supplier_id,created_at,is_accepted")
+              .eq("rfq_id", old["id"]).eq("is_available", True)
+              .order("created_at", desc=True).limit(5).execute())
+        for q in qs.data or []:
+            if q.get("price") is not None:
+                matches.append({"source_rfq_id": old["id"],
+                                "supplier_id": q.get("supplier_id"),
+                                "historical_quote_aed": q["price"],
+                                "accepted": q.get("is_accepted"),
+                                "quoted_at": q.get("created_at"),
+                                "benchmark_only": True})
+        if len(matches) >= 12:
+            break
+    return matches[:12]
+
+
 class SupplierContextRequest(BaseModel):
     client_id: str
     supplier_id: Optional[str] = None
@@ -98,6 +184,7 @@ class RecordQuoteRequest(BaseModel):
     raw_message: Optional[str] = None
     source_message_id: Optional[str] = None
     confidence: str = "high"
+    reply_to_message_id: Optional[str] = None
 
 
 class MarkUnavailableRequest(BaseModel):
@@ -193,6 +280,7 @@ class CommercialActionReviewRequest(BaseModel):
     proposal: dict = Field(default_factory=dict)
     assessment: dict = Field(default_factory=dict)
     session_key: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
 
 
 class NegotiationContextRequest(BaseModel):
@@ -217,6 +305,7 @@ class RfqMappingValidateRequest(BaseModel):
     message: str
     attempt_number: int = Field(default=1, ge=1, le=3)
     reply_to_message_id: Optional[str] = None
+    source_message_id: Optional[str] = None
 
 
 class PendingCommercialDraftRequest(BaseModel):
@@ -406,6 +495,12 @@ def validate_rfq_mapping(
          "specs": row.get("specs"), "quantity": row.get("quantity")}
         for row in active if row.get("id")
     ]
+    latest = _supplier_bundle_scope(req.client_id, req.supplier_id, req.reply_to_message_id)
+    latest_ids = set(latest["rfq_ids"]) & active_ids
+    if latest_ids and req.proposed_rfq_id not in latest_ids:
+        return {"status": "CLARIFY", "error_code": "RFQ_OUTSIDE_INVITATION_CONTEXT",
+                "candidates": [x for x in options if x["rfq_id"] in latest_ids],
+                "bundle_id": latest["bundle_id"]}
     if req.proposed_rfq_id not in active_ids:
         return {"status": "RETRY" if req.attempt_number < 3 else "CLARIFY",
                 "error_code": "RFQ_NOT_ACTIVE_FOR_SUPPLIER",
@@ -455,6 +550,7 @@ def negotiation_context(
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    bundle = _supplier_bundle_scope(req.client_id, req.supplier_id)
 
     quotes_res = (
         db.supabase.table("quotes")
@@ -484,6 +580,10 @@ def negotiation_context(
             "due_by": rfq.get("due_by"),
         },
         "quotes": quotes_res.data or [],
+        "supplier_invitation_scope": {"mode": bundle["mode"], "rfq_ids": bundle["rfq_ids"]},
+        "historical_price_benchmarks": _historical_price_benchmarks(req.client_id, rfq),
+        "historical_benchmarks_are_advisory_only": True,
+        "acceptance_requires_current_rfq_maximum_or_human_approval": True,
         "active_negotiation_session": active_session,
         "constraints": constraints,
         "max_attempts": 10,
@@ -599,6 +699,7 @@ def review_commercial_action(
     active_session = None
     if req.rfq_id:
         rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+        _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id, req.reply_to_message_id)
         active_session = db.get_active_negotiation_session(
             req.client_id,
             req.rfq_id,
@@ -621,6 +722,8 @@ def review_commercial_action(
         feedback = "No RFQ-scoped hard-boundary violation detected."
         adjusted = None
 
+    if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and rfq.get("acceptable_price_max") is None:
+        outcome, feedback = "ESCALATE", "Current RFQ has no authorized maximum; historical benchmarks cannot approve acceptance."
     # Acceptance must always reference a persisted quote.
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"}:
         if not req.quote_id:
@@ -867,6 +970,8 @@ def resolve_rfq_context(
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
 
+    logger.info("rfq_route_input supplier=%s source_present=%s stanza_present=%s",
+                req.supplier_id, bool(req.source_message_id), bool(req.reply_to_message_id))
     open_links = db.get_open_rfqs_for_supplier(req.supplier_id)
     candidates = []
     candidate_ids = set()
@@ -966,6 +1071,22 @@ def resolve_rfq_context(
                 "bundle_id": bundle_id,
             }
 
+    latest = _supplier_bundle_scope(req.client_id, req.supplier_id, req.reply_to_message_id)
+    logger.info("rfq_route_scope supplier=%s mode=%s bundle=%s candidate_count=%d",
+                req.supplier_id, latest["mode"], latest["bundle_id"], len(latest["rfq_ids"]))
+    latest_ids = set(latest["rfq_ids"]) & candidate_ids
+    if latest_ids:
+        candidates = [x for x in candidates if x["rfq_id"] in latest_ids]
+        candidate_ids = latest_ids
+    # An explicit full or unique short RFQ identifier wins over name matching.
+    message_text = str(req.message or "").lower()
+    explicit = [c for c in candidates if
+                c["rfq_id"].lower() in message_text or
+                c["rfq_id"][:8].lower() in message_text]
+    if len(explicit) == 1:
+        return {"status": "RESOLVED", "resolved_rfq_id": explicit[0]["rfq_id"],
+                "confidence": "very_high", "reason": "Explicit RFQ reference in supplier message",
+                "candidates": explicit}
     # 1) Native reply / stanza context is strongest when we have the external id.
     if req.reply_to_message_id:
         msg_res = (
@@ -1415,6 +1536,7 @@ def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     linked = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id, req.reply_to_message_id)
     if linked.get("status") != "active":
         raise HTTPException(status_code=409, detail="Closed RFQ cannot receive a new supplier quotation.")
 
@@ -1669,6 +1791,9 @@ def accept_negotiated_quote(
     if not quote or not quote.get("is_available") or quote.get("price") is None:
         raise HTTPException(status_code=409, detail="Quote is not available for acceptance.")
     price_cap = rfq.get("acceptable_price_max")
+    if price_cap is None:
+        raise HTTPException(status_code=409,
+            detail="Current RFQ has no authorized maximum. Historical pricing is advisory; human approval is required.")
     if price_cap is not None and float(quote["price"]) > float(price_cap):
         raise HTTPException(status_code=409, detail="Quote exceeds buyer-approved maximum; human override required.")
     if req.price is not None and float(req.price) != float(quote["price"]):
