@@ -223,6 +223,7 @@ class LogMessageRequest(BaseModel):
     direction: str
     body: str
     related_rfq_id: Optional[str] = None
+    rfq_ids: list[str] = Field(default_factory=list)
     status: Optional[str] = None
     event_key: Optional[str] = None
     external_message_id: Optional[str] = None
@@ -1741,6 +1742,17 @@ def log_message(req: LogMessageRequest, x_openclaw_key: Optional[str] = Header(d
         status=req.status,
         event_key=req.event_key,
     )
+    if row_id and direction == "outbound" and req.rfq_ids:
+        try:
+            db.supabase.rpc("link_outbound_commercial_rfqs", {
+                "p_message_id": row_id,
+                "p_client_id": req.client_id,
+                "p_supplier_id": req.supplier_id,
+                "p_rfq_ids": req.rfq_ids,
+            }).execute()
+        except Exception as exc:
+            # Never present an unlinked commercial message as successfully logged.
+            raise HTTPException(status_code=409, detail="Outbound RFQ associations could not be verified or saved") from exc
     if row_id and direction == "outbound" and req.external_message_id:
         db.mark_message_sent(row_id, external_message_id=req.external_message_id)
     return {"logged": bool(row_id), "message_id": row_id}
