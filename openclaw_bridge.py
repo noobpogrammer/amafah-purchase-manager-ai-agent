@@ -1673,7 +1673,7 @@ def prepare_outbound_delivery(req: PrepareOutboundDeliveryRequest, x_openclaw_ke
     _require_openclaw_key(x_openclaw_key)
     supplier = _get_supplier_for_client(req.client_id, req.supplier_id, req.phone_number)
     sent_body = req.body or ""
-    canonical_body = re.sub(r"^\\[(?:Procurment|Procurement) Agent\\]\\s*", "", sent_body, count=1)
+    canonical_body = re.sub(r"^\[(?:Procurment|Procurement) Agent\]\s*", "", sent_body, count=1)
     matches = []
     for body in dict.fromkeys([canonical_body, sent_body]):
         rows = (
@@ -1702,8 +1702,8 @@ def message_delivery(
     # procurement_log_message saved the undecorated text. Normalize ONLY the
     # known tag; never fuzzy-match unrelated commercial messages.
     sent_body = req.body or ""
-    canonical_body = re.sub(r"^\\[Procurment Agent\\]\\s*", "", sent_body, count=1)
-    canonical_body = re.sub(r"^\\[Procurement Agent\\]\\s*", "", canonical_body, count=1)
+    canonical_body = re.sub(r"^\[Procurment Agent\]\s*", "", sent_body, count=1)
+    canonical_body = re.sub(r"^\[Procurement Agent\]\s*", "", canonical_body, count=1)
 
     if req.message_log_id:
         found = (
