@@ -9,6 +9,7 @@ state. It intentionally does not expose arbitrary SQL or direct WhatsApp send.
 from __future__ import annotations
 
 import hmac
+import logging
 import os
 import re
 from typing import Optional
@@ -23,6 +24,7 @@ from supplier_message_planner import validate_multi_rfq_quotes, AmbiguousSupplie
 
 
 router = APIRouter(prefix="/openclaw", tags=["openclaw"])
+logger = logging.getLogger(__name__)
 
 
 def _require_openclaw_key(x_openclaw_key: Optional[str] = Header(default=None)) -> None:
@@ -968,6 +970,8 @@ def resolve_rfq_context(
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
 
+    logger.info("rfq_route_input supplier=%s source_present=%s stanza_present=%s",
+                req.supplier_id, bool(req.source_message_id), bool(req.reply_to_message_id))
     open_links = db.get_open_rfqs_for_supplier(req.supplier_id)
     candidates = []
     candidate_ids = set()
@@ -1068,6 +1072,8 @@ def resolve_rfq_context(
             }
 
     latest = _supplier_bundle_scope(req.client_id, req.supplier_id, req.reply_to_message_id)
+    logger.info("rfq_route_scope supplier=%s mode=%s bundle=%s candidate_count=%d",
+                req.supplier_id, latest["mode"], latest["bundle_id"], len(latest["rfq_ids"]))
     latest_ids = set(latest["rfq_ids"]) & candidate_ids
     if latest_ids:
         candidates = [x for x in candidates if x["rfq_id"] in latest_ids]
