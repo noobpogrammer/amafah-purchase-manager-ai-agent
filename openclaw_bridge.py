@@ -151,6 +151,11 @@ class AcceptNegotiatedQuoteRequest(BaseModel):
     accepted_by: str = "openclaw"
 
 
+class ClaimCommercialApprovalRequest(BaseModel):
+    client_id: str
+    phone_number: str
+    message: str
+
 class MessageDeliveryRequest(BaseModel):
     client_id: str
     supplier_id: Optional[str] = None
@@ -770,10 +775,11 @@ def review_commercial_action(
             "outcome": outcome,
             "feedback": feedback,
             "adjusted_action": adjusted,
+            "approved_message": approved_text if outcome == "APPROVE" else None,
         }).execute()
-    except Exception:
-        # Decision logging must not turn an otherwise-safe decision into an outage.
-        pass
+    except Exception as exc:
+        if outcome == "APPROVE":
+            raise HTTPException(status_code=503, detail="Could not persist commercial send approval") from exc
 
     return {
         "outcome": outcome,
@@ -785,6 +791,23 @@ def review_commercial_action(
         "supplier_id": supplier.get("id"),
         "rfq_id": req.rfq_id,
     }
+
+
+@router.post("/claim-commercial-outbound")
+def claim_commercial_outbound(req: ClaimCommercialApprovalRequest, x_openclaw_key: Optional[str] = Header(default=None)):
+    """Atomically consume one exact, live backend authorization before WhatsApp sends."""
+    _require_openclaw_key(x_openclaw_key)
+    supplier = _get_supplier_for_client(req.client_id, None, req.phone_number)
+    res = db.supabase.rpc("claim_commercial_message_approval", {
+        "p_client_id": req.client_id,
+        "p_supplier_id": supplier["id"],
+        "p_body": req.message.strip(),
+    }).execute()
+    claimed = res.data or []
+    if not claimed:
+        return {"authorized": False}
+    return {"authorized": True, "approval_id": claimed[0]["approval_id"],
+            "rfq_id": claimed[0]["rfq_id"]}
 
 
 @router.post("/resolve-rfq-context")
