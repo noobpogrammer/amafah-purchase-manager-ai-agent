@@ -1769,6 +1769,9 @@ def accept_negotiated_quote(
     if not quote or not quote.get("is_available") or quote.get("price") is None:
         raise HTTPException(status_code=409, detail="Quote is not available for acceptance.")
     price_cap = rfq.get("acceptable_price_max")
+    if price_cap is None:
+        raise HTTPException(status_code=409,
+            detail="Current RFQ has no authorized maximum. Historical pricing is advisory; human approval is required.")
     if price_cap is not None and float(quote["price"]) > float(price_cap):
         raise HTTPException(status_code=409, detail="Quote exceeds buyer-approved maximum; human override required.")
     if req.price is not None and float(req.price) != float(quote["price"]):
