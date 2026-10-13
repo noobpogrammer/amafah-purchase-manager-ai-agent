@@ -788,6 +788,12 @@ def review_commercial_action(
         "attempt_number": req.attempt_number,
         "hard_guard_only": True,
         "approved_message": approved_text if outcome == "APPROVE" else None,
+        "approved_terms": {
+            "action_type": action,
+            "price": proposal.get("price"),
+            "quantity": proposal.get("quantity"),
+            "delivery_days": proposal.get("delivery_days"),
+        } if outcome == "APPROVE" else None,
         "supplier_id": supplier.get("id"),
         "rfq_id": req.rfq_id,
     }
