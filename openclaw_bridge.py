@@ -74,6 +74,77 @@ def _get_rfq_and_verify_link(client_id: str, supplier_id: str, rfq_id: str) -> d
     return rfq
 
 
+def _latest_supplier_bundle_rfqs(client_id: str, supplier_id: str) -> dict:
+    """Latest delivered buyer invitation; never infer its RFQs from chat memory."""
+    bundles = (db.supabase.table("supplier_message_bundles")
+        .select("id,external_message_id,created_at")
+        .eq("client_id", client_id).eq("supplier_id", supplier_id)
+        .eq("kind", "initial_rfq").eq("status", "sent")
+        .order("created_at", desc=True).limit(1).execute())
+    if not bundles.data:
+        return {"bundle_id": None, "rfq_ids": [], "external_message_id": None}
+    bundle = bundles.data[0]
+    rows = (db.supabase.table("supplier_message_bundle_items").select("rfq_id")
+        .eq("client_id", client_id).eq("supplier_id", supplier_id)
+        .eq("bundle_id", bundle["id"]).execute())
+    return {"bundle_id": bundle["id"],
+            "rfq_ids": list({r["rfq_id"] for r in (rows.data or [])}),
+            "external_message_id": bundle.get("external_message_id")}
+
+
+def _require_current_bundle_rfq(client_id: str, supplier_id: str, rfq_id: str):
+    """Fail closed when same supplier has older active duplicate test RFQs.
+
+    Non-bundled legacy suppliers continue through existing authorization.
+    """
+    bundle = _latest_supplier_bundle_rfqs(client_id, supplier_id)
+    if bundle["rfq_ids"] and rfq_id not in bundle["rfq_ids"]:
+        raise HTTPException(status_code=409,
+            detail="RFQ is not in supplier's latest delivered invitation bundle. Resolve the latest reference or request clarification.")
+    return bundle
+
+
+def _historical_price_benchmarks(client_id: str, rfq: dict) -> list[dict]:
+    """Advisory-only cross-supplier comparisons, excluding current RFQ."""
+    import re as _re
+    def norm(value):
+        return " ".join(_re.findall(r"[a-z0-9]+", str(value or "").lower()))
+    target_name = norm(rfq.get("product_name"))
+    target_specs = norm(rfq.get("specs"))
+    if not target_name:
+        return []
+    prior = (db.supabase.table("rfqs")
+        .select("id,product_name,specs,quantity,required_delivery_days,acceptable_price_min,acceptable_price_max,created_at")
+        .eq("client_id", client_id).neq("id", rfq["id"])
+        .order("created_at", desc=True).limit(150).execute())
+    matches = []
+    for old in prior.data or []:
+        if norm(old.get("product_name")) != target_name:
+            continue
+        if target_specs and norm(old.get("specs")) != target_specs:
+            continue
+        if rfq.get("quantity") and old.get("quantity") and int(rfq["quantity"]) != int(old["quantity"]):
+            continue
+        current_days, old_days = rfq.get("required_delivery_days"), old.get("required_delivery_days")
+        if current_days is not None and old_days is not None and int(current_days) != int(old_days):
+            continue
+        qs = (db.supabase.table("quotes")
+              .select("price,supplier_id,created_at,is_accepted")
+              .eq("rfq_id", old["id"]).eq("is_available", True)
+              .order("created_at", desc=True).limit(5).execute())
+        for q in qs.data or []:
+            if q.get("price") is not None:
+                matches.append({"source_rfq_id": old["id"],
+                                "supplier_id": q.get("supplier_id"),
+                                "historical_quote_aed": q["price"],
+                                "accepted": q.get("is_accepted"),
+                                "quoted_at": q.get("created_at"),
+                                "benchmark_only": True})
+        if len(matches) >= 12:
+            break
+    return matches[:12]
+
+
 class SupplierContextRequest(BaseModel):
     client_id: str
     supplier_id: Optional[str] = None
@@ -455,6 +526,7 @@ def negotiation_context(
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    bundle = _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id)
 
     quotes_res = (
         db.supabase.table("quotes")
@@ -484,6 +556,10 @@ def negotiation_context(
             "due_by": rfq.get("due_by"),
         },
         "quotes": quotes_res.data or [],
+        "latest_supplier_invitation_bundle": bundle,
+        "historical_price_benchmarks": _historical_price_benchmarks(req.client_id, rfq),
+        "historical_benchmarks_are_advisory_only": True,
+        "acceptance_requires_current_rfq_maximum_or_human_approval": True,
         "active_negotiation_session": active_session,
         "constraints": constraints,
         "max_attempts": 10,
@@ -599,6 +675,7 @@ def review_commercial_action(
     active_session = None
     if req.rfq_id:
         rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+        _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id)
         active_session = db.get_active_negotiation_session(
             req.client_id,
             req.rfq_id,
@@ -621,6 +698,8 @@ def review_commercial_action(
         feedback = "No RFQ-scoped hard-boundary violation detected."
         adjusted = None
 
+    if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and rfq.get("acceptable_price_max") is None:
+        outcome, feedback = "ESCALATE", "Current RFQ has no authorized maximum; historical benchmarks cannot approve acceptance."
     # Acceptance must always reference a persisted quote.
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"}:
         if not req.quote_id:
@@ -1415,6 +1494,7 @@ def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     linked = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id)
     if linked.get("status") != "active":
         raise HTTPException(status_code=409, detail="Closed RFQ cannot receive a new supplier quotation.")
 
