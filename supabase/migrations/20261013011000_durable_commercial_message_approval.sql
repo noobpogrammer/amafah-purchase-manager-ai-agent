@@ -35,6 +35,18 @@ BEGIN
         WHERE ns.rfq_id = c.rfq_id AND ns.supplier_id = c.supplier_id
           AND ns.client_id = c.client_id AND ns.status = 'active'
       ))
+      AND NOT EXISTS (
+        SELECT 1 FROM public.commercial_action_intents other
+        JOIN public.rfqs other_rfq ON other_rfq.id = other.rfq_id
+        WHERE other.client_id = c.client_id
+          AND other.supplier_id = c.supplier_id
+          AND other.outcome = 'APPROVE'
+          AND other.approved_message = c.approved_message
+          AND other.consumed_at IS NULL
+          AND other.created_at > now() - interval '15 minutes'
+          AND other.rfq_id <> c.rfq_id
+          AND other_rfq.status = 'active'
+      )
     ORDER BY c.created_at DESC
     LIMIT 1
     FOR UPDATE OF c SKIP LOCKED
