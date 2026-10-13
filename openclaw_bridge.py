@@ -149,6 +149,7 @@ class AcceptNegotiatedQuoteRequest(BaseModel):
     quantity: Optional[int] = Field(default=None, gt=0)
     quote_id: Optional[str] = None
     accepted_by: str = "openclaw"
+    approval_id: Optional[str] = None
 
 
 class ClaimCommercialApprovalRequest(BaseModel):
@@ -730,8 +731,32 @@ def review_commercial_action(
     # Commercial evaluator checks typed action data only, never LLM prose.
     # Hard boundaries above remain authoritative.
     approved_text = None
+    if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"}:
+        if not rfq or not req.quote_id or set(proposal) != {"price", "quantity", "delivery_days"}:
+            outcome, feedback = "RETRY", "Acceptance needs an RFQ, persisted quote_id, and exact price/quantity/delivery_days."
+        elif (type(proposal["price"]) not in (int, float)
+              or type(proposal["quantity"]) is not int
+              or type(proposal["delivery_days"]) is not int):
+            outcome, feedback = "RETRY", "Acceptance JSON types are invalid."
+        else:
+            qres = (db.supabase.table("quotes").select("*")
+                    .eq("id", req.quote_id).eq("rfq_id", req.rfq_id)
+                    .eq("supplier_id", req.supplier_id).limit(1).execute())
+            q = (qres.data or [None])[0]
+            if not q or not q.get("is_available") or q.get("price") is None:
+                outcome, feedback = "REJECT", "Supplier quote is missing or unavailable."
+            elif (float(proposal["price"]) != float(q["price"])
+                  or int(proposal["quantity"]) != int(q.get("quantity") or rfq["quantity"])
+                  or int(proposal["delivery_days"]) != int(rfq.get("required_delivery_days") or proposal["delivery_days"])):
+                outcome, feedback = "REJECT", "Acceptance terms do not match persisted quote or required delivery."
+            else:
+                approved_text = (f"Confirmed — AED {float(proposal['price']):g} per unit "
+                                 f"for {proposal['quantity']} pieces, delivery within "
+                                 f"{proposal['delivery_days']} days. Thank you!")
     if outcome == "APPROVE":
-        if action in {"counter", "counteroffer", "negotiate"}:
+        if action in {"accept", "confirm", "award", "accept_quote"}:
+            pass  # Acceptance checked against the exact persisted quote above.
+        elif action in {"counter", "counteroffer", "negotiate"}:
             if not rfq or set(proposal) != {"price", "quantity", "delivery_days"}:
                 outcome, feedback = "RETRY", "Counter requires RFQ plus exactly price, quantity, delivery_days."
             elif (isinstance(proposal["price"], bool)
@@ -765,8 +790,9 @@ def review_commercial_action(
         )
         adjusted = None
 
+    approval_id = None
     try:
-        db.supabase.table("commercial_action_intents").insert({
+        audit_result = db.supabase.table("commercial_action_intents").insert({
             "client_id": req.client_id,
             "supplier_id": req.supplier_id,
             "rfq_id": req.rfq_id,
@@ -785,6 +811,8 @@ def review_commercial_action(
             "adjusted_action": adjusted,
             "approved_message": approved_text if outcome == "APPROVE" else None,
         }).execute()
+        if outcome == "APPROVE":
+            approval_id = (audit_result.data or [None])[0]["id"]
     except Exception as exc:
         if outcome == "APPROVE":
             raise HTTPException(status_code=503, detail="Could not persist commercial send approval") from exc
@@ -792,6 +820,7 @@ def review_commercial_action(
     return {
         "outcome": outcome,
         "feedback": feedback,
+        "approval_id": approval_id if action in {"accept", "confirm", "award", "accept_quote"} and outcome == "APPROVE" else None,
         "adjusted_action": adjusted,
         "attempt_number": req.attempt_number,
         "hard_guard_only": True,
@@ -1627,6 +1656,8 @@ def accept_negotiated_quote(
     rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
     # A separate acceptance endpoint must enforce the same buyer limits as
     # counteroffers; reviewing a counter cannot authorize accepting a deal.
+    if not req.approval_id:
+        raise HTTPException(status_code=409, detail="Acceptance requires approved commercial review ID.")
     if not req.quote_id:
         raise HTTPException(status_code=422, detail="Acceptance requires an exact persisted quote_id.")
     quote_res = (
@@ -1646,6 +1677,16 @@ def accept_negotiated_quote(
     if authorized_quantity is not None and quote.get("quantity") is not None:
         if int(quote["quantity"]) != int(authorized_quantity):
             raise HTTPException(status_code=409, detail="Quote quantity differs from RFQ; human approval required.")
+
+    claim = db.supabase.rpc("claim_quote_acceptance_approval", {
+        "p_approval_id": req.approval_id,
+        "p_client_id": req.client_id,
+        "p_supplier_id": req.supplier_id,
+        "p_rfq_id": req.rfq_id,
+        "p_quote_id": req.quote_id,
+    }).execute()
+    if not claim.data:
+        raise HTTPException(status_code=409, detail="Acceptance approval invalid, expired, mismatched, or already consumed.")
 
     accepted = db.accept_recorded_quote(
         req.client_id,
