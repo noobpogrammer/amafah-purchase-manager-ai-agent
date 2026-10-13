@@ -1534,6 +1534,15 @@ def log_message(req: LogMessageRequest, x_openclaw_key: Optional[str] = Header(d
     if direction not in {"inbound", "outbound"}:
         raise HTTPException(status_code=422, detail="direction must be inbound or outbound")
 
+    if req.related_rfq_id:
+        linked_rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.related_rfq_id)
+        if linked_rfq.get("status") != "active":
+            raise HTTPException(status_code=409, detail="Cannot log a new supplier message against a closed RFQ; resolve current RFQ first.")
+    else:
+        # Do not create unattributed commercial outbound rows that cannot be
+        # reconciled to a specific RFQ. Non-RFQ messages can still be logged.
+        pass
+
     row_id = db.log_message(
         client_id=req.client_id,
         supplier_id=req.supplier_id,
