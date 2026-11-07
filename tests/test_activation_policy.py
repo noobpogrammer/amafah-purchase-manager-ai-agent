@@ -4,7 +4,6 @@ import unittest
 from unittest.mock import patch
 os.environ.setdefault("SUPABASE_URL", "https://localhost.supabase.co")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "phase2-fake-service-role-key")
-os.environ.setdefault("GROQ_API_KEY", "phase2-fake-groq-key")
 os.environ["OPENCLAW_TOOL_API_KEY"] = "phase2-test-tool-key"
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -48,6 +47,25 @@ class ActivationPolicyTests(unittest.TestCase):
     def test_commercial_requires_context(self):
         self.assertEqual(self.check("For Noora Brush my final price is AED 15",has_rfq=True)["engagement_decision"],"ENGAGE")
         self.assertEqual(self.check("For Noora Brush my final price is AED 15",has_rfq=False)["engagement_decision"],"HUMAN_REVIEW")
+
+    def test_short_replies_reach_main_ai_only_with_buying_context(self):
+        for msg in ("24", "Agreed", "yes", "3 days", "haan theek hai"):
+            with self.subTest(message=msg):
+                active = self.check(msg, has_rfq=True)
+                self.assertTrue(active["allow_autonomous_reply"])
+                self.assertEqual(active["engagement_reason"], "interpret_in_existing_procurement_context")
+                self.assertFalse(self.check(msg, has_rfq=False)["allow_autonomous_reply"])
+                self.assertFalse(self.check(msg, has_rfq=True, paused=True)["allow_autonomous_reply"])
+
+    def test_product_switch_and_conditional_agreement_are_left_to_main_ai(self):
+        for msg in ("Now the fans: agreed at 85 each", "Agreed, but only for 100 instead of 50"):
+            result = self.check(msg, has_rfq=True)
+            self.assertEqual(result["engagement_decision"], "ENGAGE")
+            # Interpretation is enabled; this endpoint never grants acceptance.
+            self.assertNotIn("approval_id", result)
+
+    def test_empty_message_is_not_activated_by_open_rfqs(self):
+        self.assertFalse(self.check("  ", has_rfq=True)["allow_autonomous_reply"])
 
     def test_pause_overrides_commercial_intent(self):
         result = self.check("Noora Brush AED 15",has_rfq=True,paused=True)

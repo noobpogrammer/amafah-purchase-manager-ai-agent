@@ -341,8 +341,8 @@ def evaluate_supplier_tradeoff(
 
     if commercial_parse is None and text:
         try:
-            import groq_client
-            commercial_parse = groq_client.parse_commercial_message(text)
+            from openclaw_bridge import parse_commercial_message
+            commercial_parse = parse_commercial_message(text)
         except Exception:
             commercial_parse = None
 

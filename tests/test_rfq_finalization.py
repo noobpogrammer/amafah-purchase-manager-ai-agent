@@ -14,19 +14,6 @@ import main
 import db
 
 
-@pytest.fixture(autouse=True)
-def reset_queue():
-    """Ensure the outbound queue is fresh for each test."""
-    main.outbound_queue = asyncio.Queue()
-    yield
-    while not main.outbound_queue.empty():
-        try:
-            main.outbound_queue.get_nowait()
-            main.outbound_queue.task_done()
-        except Exception:
-            pass
-
-
 class TestAtomicFinalizationAuthority:
     """Tests 1-5: Atomic finalization claim authority via claim_rfq_for_finalization RPC."""
 

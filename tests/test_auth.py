@@ -237,9 +237,6 @@ def test_get_invite_token_lifecycle(monkeypatch):
     assert r.json() == {"status": "claimed"}
 
 
-
-
-
 def test_delete_supplier_requires_admin(monkeypatch):
     import auth
     import db

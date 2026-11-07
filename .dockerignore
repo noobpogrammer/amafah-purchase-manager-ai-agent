@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+**/__pycache__
+.pytest_cache
+.venv
+venv
+node_modules
+frontend
+openclaw-railway-template
+tests
+docs

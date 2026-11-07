@@ -4,7 +4,6 @@ import unittest
 from unittest.mock import patch, MagicMock
 os.environ.setdefault("SUPABASE_URL", "https://localhost.supabase.co")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "test-service-key")
-os.environ.setdefault("GROQ_API_KEY", "test-groq-key")
 import db
 
 

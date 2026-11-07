@@ -47,42 +47,44 @@ def get_supplier_by_id(supplier_id: str, client_id: str | None = None):
     return res.data or None
 
 
+class AmbiguousSupplierPhoneError(ValueError):
+    """More than one active supplier record can represent this sender."""
+
+
 def get_supplier_by_phone(client_id: str, phone_number: str):
     target_digits = clean_phone(phone_number)
     if not target_digits:
         return None
 
-    res = (
-        supabase.table("suppliers")
-        .select("*")
-        .eq("client_id", client_id)
-        .eq("phone_number", phone_number)
-        .eq("is_active", True)
-        .is_("deleted_at", "null")
-        .execute()
-    )
-    if res.data:
-        return res.data[0]
-
-    # Fallback: match by cleaned digits if stored with spaces, +, or dashes
-    all_suppliers = (
-        supabase.table("suppliers")
-        .select("*")
-        .eq("client_id", client_id)
-        .eq("is_active", True)
-        .is_("deleted_at", "null")
-        .execute()
-        .data
-    )
-    for s in (all_suppliers or []):
-        s_digits = clean_phone(s.get("phone_number"))
-        if s_digits == target_digits:
-            return s
-        if len(target_digits) >= 9 and len(s_digits) >= 9:
-            if target_digits.endswith(s_digits.lstrip("0")) or s_digits.endswith(target_digits.lstrip("0")):
-                return s
-
-    return None
+    # Inspect all active tenant records, even when there is an exact match:
+    # a differently formatted duplicate must not be hidden by an early return.
+    matches = {}
+    offset = 0
+    page_size = 500
+    while True:
+        rows = (supabase.table("suppliers").select("*")
+                .eq("client_id", client_id).eq("is_active", True)
+                .is_("deleted_at", "null").order("id")
+                .range(offset, offset + page_size - 1).execute().data or [])
+        for supplier in rows:
+            digits = clean_phone(supplier.get("phone_number"))
+            local_digits = digits.lstrip("0")
+            target_local = target_digits.lstrip("0")
+            suffix_match = (
+                len(local_digits) >= 9 and len(target_local) >= 9
+                and (target_digits.endswith(local_digits) or digits.endswith(target_local))
+            )
+            if digits == target_digits or suffix_match:
+                matches[supplier["id"]] = supplier
+        if len(matches) > 1:
+            raise AmbiguousSupplierPhoneError(
+                "Multiple active supplier records match this WhatsApp sender. "
+                "Resolve the supplier records before automated handling."
+            )
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return next(iter(matches.values()), None)
 
 
 def get_supplier_by_phone_any_client(phone_number: str):

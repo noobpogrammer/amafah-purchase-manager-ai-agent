@@ -12,6 +12,7 @@ on:
       - '.github/workflows/phase2-supplier-workflow.yml'
   push:
     branches:
+      - 'main'
       - 'feat/phase2-bundle-revision-multiitem-20261012'
 jobs:
   validate:
@@ -22,7 +23,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Check Python syntax
-        run: python -m compileall -q main.py db.py openclaw_bridge.py groq_client.py supplier_message_planner.py
+        run: python -m compileall -q main.py db.py openclaw_bridge.py supplier_message_planner.py
       - name: Execute deterministic supplier workflow tests
         run: python -m unittest discover -s tests -p 'test_supplier_message_planner.py' -v
       - name: Install backend dependencies
@@ -31,16 +32,19 @@ jobs:
         env:
           SUPABASE_URL: https://localhost.supabase.co
           SUPABASE_SERVICE_ROLE_KEY: phase2-ci-placeholder
-          GROQ_API_KEY: phase2-ci-placeholder
           OPENCLAW_TOOL_API_KEY: phase2-test-tool-key
         run: python -m unittest discover -s tests -p 'test_phase2_bridge.py' -v
       - name: Run Option C activation gate tests
         env:
           SUPABASE_URL: https://localhost.supabase.co
           SUPABASE_SERVICE_ROLE_KEY: phase2-ci-placeholder
-          GROQ_API_KEY: phase2-ci-placeholder
           OPENCLAW_TOOL_API_KEY: phase2-test-tool-key
         run: python -m unittest discover -s tests -p 'test_activation_policy.py' -v
+      - name: Run session routing and supplier identity tests
+        env:
+          SUPABASE_URL: https://localhost.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: phase2-ci-placeholder
+        run: python -m pytest -q tests/test_session_context_security.py tests/test_activation_policy.py tests/test_openclaw_analysis.py
       - name: Set up Node for frontend build
         uses: actions/setup-node@v4
         with:

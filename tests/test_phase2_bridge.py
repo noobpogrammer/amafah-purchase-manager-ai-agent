@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 os.environ.setdefault("SUPABASE_URL", "https://localhost.supabase.co")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "phase2-fake-service-role-key")
-os.environ.setdefault("GROQ_API_KEY", "phase2-fake-groq-key")
 os.environ["OPENCLAW_TOOL_API_KEY"] = "phase2-test-tool-key"
 
 from fastapi import FastAPI

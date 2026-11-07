@@ -9,9 +9,6 @@ from unittest.mock import patch, MagicMock, AsyncMock
 from pydantic import ValidationError
 import main
 import db
-import policy_validator
-from policy_validator import ActionProposal, ActionCategory, validate_action, MAX_NEGOTIATION_ATTEMPTS
-from groq_client import AgentContext, format_agent_context_for_prompt
 
 
 @pytest.fixture
@@ -206,217 +203,12 @@ class TestLastQuoteNegotiationPolicy:
         assert ctx["tolerated_final_ceiling"] == 46.0
 
 
-    @pytest.mark.asyncio
-    async def test_18_supplier_revises_48_to_45_final_stops_without_escalation(self, mock_supabase):
-        mock_rfq = {
-            "id": RFQ_ID,
-            "client_id": DEMO_CLIENT,
-            "product_name": "LED Panel 60W",
-            "last_quote": 43.0,
-            "status": "active",
-        }
-        context = AgentContext(
-            client_id=DEMO_CLIENT,
-            supplier_id=SUPPLIER_ID,
-            open_rfqs=[mock_rfq],
-        )
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 45.0, "variants": [{"price": 45.0, "variant_label": None}]},
-        )
-        with patch.object(db, "record_quote"), \
-             patch.object(db, "log_message", return_value="msg-1"), \
-             patch("main.enqueue_message", new_callable=AsyncMock), \
-             patch.object(db, "flag_for_human_review") as mock_flag:
-            res = await main.execute_validated_action(val, context, "45 final", {"id": SUPPLIER_ID, "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "recorded"
-            mock_flag.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_19_supplier_says_44_final_stops_without_escalation(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 44.0, "variants": [{"price": 44.0, "variant_label": None}]},
-        )
-        with patch.object(db, "record_quote"), patch.object(db, "log_message", return_value="msg-1"), patch("main.enqueue_message", new_callable=AsyncMock), patch.object(db, "flag_for_human_review") as mock_flag:
-            res = await main.execute_validated_action(val, context, "44 is my final price", {"id": SUPPLIER_ID, "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "recorded"
-            mock_flag.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_20_supplier_says_43_5_final_stops_without_escalation(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 43.5, "variants": [{"price": 43.5, "variant_label": None}]},
-        )
-        with patch.object(db, "record_quote"), patch.object(db, "log_message", return_value="msg-1"), patch("main.enqueue_message", new_callable=AsyncMock), patch.object(db, "flag_for_human_review") as mock_flag:
-            res = await main.execute_validated_action(val, context, "43.5 final offer", {"id": SUPPLIER_ID, "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "recorded"
-            mock_flag.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_21_supplier_says_47_final_escalates_to_agent_attention(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 47.0, "variants": [{"price": 47.0, "variant_label": None}]},
-        )
-        with patch.object(db, "record_quote"), \
-             patch.object(db, "log_message", return_value="msg-1"), \
-             patch("main.enqueue_message", new_callable=AsyncMock), \
-             patch.object(db, "flag_for_human_review", return_value=[{"id": "flag-1"}]) as mock_flag:
-            res = await main.execute_validated_action(val, context, "AED 47 final", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "escalated_to_human"
-            mock_flag.assert_called_once()
-            flag_args = mock_flag.call_args.kwargs
-            assert "Historical Last Quote:\nAED 43.0" in flag_args["reason"]
-            assert "Tolerated Final Ceiling:\nAED 46.0" in flag_args["reason"]
-            assert "Supplier Final Quote:\nAED 47.0" in flag_args["reason"]
-
-    @pytest.mark.asyncio
-    async def test_22_supplier_says_47_final_escalates_to_agent_attention(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 47.0, "variants": [{"price": 47.0, "variant_label": "India"}]},
-        )
-        with patch.object(db, "record_quote"), \
-             patch.object(db, "log_message", return_value="msg-1"), \
-             patch("main.enqueue_message", new_callable=AsyncMock), \
-             patch.object(db, "flag_for_human_review", return_value=[{"id": "flag-2"}]) as mock_flag:
-            res = await main.execute_validated_action(val, context, "47 is my final price", {"id": SUPPLIER_ID, "name": "Apex Lighting", "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "escalated_to_human"
-            assert "Variant:\nIndia" in mock_flag.call_args.kwargs["reason"]
-            assert "Supplier Final Quote:\nAED 47.0" in mock_flag.call_args.kwargs["reason"]
-
-    @pytest.mark.asyncio
-    async def test_23_supplier_says_best_price_45_no_escalation(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 45.0, "variants": [{"price": 45.0, "variant_label": None}]},
-        )
-        with patch.object(db, "record_quote"), patch.object(db, "log_message", return_value="msg-1"), patch("main.enqueue_message", new_callable=AsyncMock), patch.object(db, "flag_for_human_review") as mock_flag:
-            res = await main.execute_validated_action(val, context, "Best price is 45 AED", {"id": SUPPLIER_ID, "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "recorded"
-            mock_flag.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_24_supplier_says_cannot_go_below_45_no_escalation(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 45.0, "variants": [{"price": 45.0, "variant_label": None}]},
-        )
-        with patch.object(db, "record_quote"), patch.object(db, "log_message", return_value="msg-1"), patch("main.enqueue_message", new_callable=AsyncMock), patch.object(db, "flag_for_human_review") as mock_flag:
-            res = await main.execute_validated_action(val, context, "I cannot go below 45 AED", {"id": SUPPLIER_ID, "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "recorded"
-            mock_flag.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_25_supplier_says_cannot_go_below_47_escalation(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 47.0, "variants": [{"price": 47.0, "variant_label": None}]},
-        )
-        with patch.object(db, "record_quote"), \
-             patch.object(db, "log_message", return_value="msg-1"), \
-             patch("main.enqueue_message", new_callable=AsyncMock), \
-             patch.object(db, "flag_for_human_review", return_value=[{"id": "flag-3"}]) as mock_flag:
-            res = await main.execute_validated_action(val, context, "Cannot go lower than 47 AED", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "escalated_to_human"
-            mock_flag.assert_called_once()
-
-
 # ============================================================
 # 3. ATTEMPT LIMIT TESTS (26-31)
 # ============================================================
 
 class TestNegotiationAttempts:
 
-    def test_26_attempts_below_3_and_quote_above_ceiling_may_continue(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "last_quote": 43.0, "status": "active", "due_by": "2099-01-01T00:00:00Z"}
-        mock_quote = {"id": QUOTE_ID, "rfq_id": RFQ_ID, "supplier_id": SUPPLIER_ID, "price": 48.0, "is_available": True}
-        with patch.object(db, "get_quote_by_id", return_value=mock_quote), \
-             patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
-             patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
-             patch.object(db, "get_negotiation_attempts", return_value=1):
-            proposal = ActionProposal(
-                tool_name="negotiate_price",
-                arguments={"rfq_id": RFQ_ID, "quote_id": QUOTE_ID, "quoted_price": 48.0, "counter_price": 43.0, "negotiation_message": "Could you do 43 AED?"},
-            )
-            res = validate_action(proposal, client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
-            assert res.is_valid is True
-            assert res.sanitized_args["preferred_target"] == 43.0
-            assert res.sanitized_args["tolerated_final_ceiling"] == 46.0
-
-    @pytest.mark.asyncio
-    async def test_27_attempt_3_reached_and_quote_47_creates_agent_attention(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 47.0, "variants": [{"price": 47.0, "variant_label": None}]},
-        )
-        with patch.object(db, "record_quote"), \
-             patch.object(db, "get_negotiation_attempts", return_value=10), \
-             patch.object(db, "log_message", return_value="msg-1"), \
-             patch("main.enqueue_message", new_callable=AsyncMock), \
-             patch.object(db, "flag_for_human_review", return_value=[{"id": "flag-4"}]) as mock_flag:
-            res = await main.execute_validated_action(val, context, "I can offer 47", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "escalated_to_human"
-            assert "Autonomous negotiation limit reached (10/10)" in mock_flag.call_args.kwargs["reason"]
-
-            res = await main.execute_validated_action(val, context, "I can offer 46", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "escalated_to_human"
-            assert "Autonomous negotiation limit reached (10/10)" in mock_flag.call_args.kwargs["reason"]
-
-    @pytest.mark.asyncio
-    async def test_28_attempt_3_reached_and_quote_45_no_escalation(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 43.0, "variants": [{"price": 43.0, "variant_label": None}]},
-        )
-        with patch.object(db, "record_quote"), \
-             patch.object(db, "get_negotiation_attempts", return_value=10), \
-             patch.object(db, "log_message", return_value="msg-1"), \
-             patch("main.enqueue_message", new_callable=AsyncMock), \
-             patch.object(db, "flag_for_human_review") as mock_flag:
-            res = await main.execute_validated_action(val, context, "I can offer 43", {"id": SUPPLIER_ID, "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "recorded"
-            mock_flag.assert_not_called()
 
     def test_29_supplier_reply_does_not_consume_attempt(self):
         # Inbound webhook processing does not increment attempts
@@ -429,21 +221,6 @@ class TestNegotiationAttempts:
             db.record_quote(RFQ_ID, SUPPLIER_ID, 45.0)
             mock_inc.assert_not_called()
 
-    def test_31_strictly_no_fourth_autonomous_negotiation(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "last_quote": 43.0, "status": "active", "due_by": "2099-01-01T00:00:00Z"}
-        mock_quote = {"id": QUOTE_ID, "rfq_id": RFQ_ID, "supplier_id": SUPPLIER_ID, "price": 48.0, "is_available": True}
-        with patch.object(db, "get_quote_by_id", return_value=mock_quote), \
-             patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
-             patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
-             patch.object(db, "get_negotiation_attempts", return_value=10):
-            proposal = ActionProposal(
-                tool_name="negotiate_price",
-                arguments={"rfq_id": RFQ_ID, "quote_id": QUOTE_ID, "quoted_price": 48.0, "counter_price": 43.0, "negotiation_message": "Can you do 43?"},
-            )
-            res = validate_action(proposal, client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
-            assert res.is_valid is False
-            assert "attempt limit reached" in res.reason.lower()
-
 
 # ============================================================
 # 4. SAFETY & LIFECYCLE TESTS (32-40)
@@ -451,20 +228,6 @@ class TestNegotiationAttempts:
 
 class TestNegotiationSafetyBoundaries:
 
-    @pytest.mark.asyncio
-    async def test_32_final_price_inside_tolerance_does_not_close_rfq(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 45.0, "variants": [{"price": 45.0, "variant_label": None}]},
-        )
-        with patch.object(db, "record_quote"), patch.object(db, "log_message", return_value="msg-1"), patch("main.enqueue_message", new_callable=AsyncMock):
-            with patch.object(db, "close_rfq") as mock_close:
-                await main.execute_validated_action(val, context, "45 final", {"id": SUPPLIER_ID, "phone_number": "+971501111111"}, DEMO_CLIENT)
-                mock_close.assert_not_called()
 
     def test_33_final_price_inside_tolerance_does_not_issue_po(self):
         # System has no autonomous PO creation functions
@@ -473,95 +236,6 @@ class TestNegotiationSafetyBoundaries:
 
     def test_34_final_price_inside_tolerance_does_not_award_supplier(self):
         assert not hasattr(db, "award_supplier")
-
-    @pytest.mark.asyncio
-    async def test_35_final_price_above_tolerance_preserves_supplier_quote_before_escalation(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 47.0, "variants": [{"price": 47.0, "variant_label": None}]},
-        )
-        recorded_calls = []
-        with patch.object(db, "record_quote", side_effect=lambda **kw: recorded_calls.append(kw)), \
-             patch.object(db, "log_message", return_value="msg-1"), \
-             patch("main.enqueue_message", new_callable=AsyncMock), \
-             patch.object(db, "flag_for_human_review", return_value=[{"id": "flag-5"}]):
-            res = await main.execute_validated_action(val, context, "47 final", {"id": SUPPLIER_ID, "name": "Apex", "phone_number": "+971501111111"}, DEMO_CLIENT)
-            assert res["status"] == "escalated_to_human"
-            assert len(recorded_calls) == 1
-            assert recorded_calls[0]["price"] == 47.0
-
-    def test_36_cross_tenant_isolation_maintained(self, mock_supabase):
-        other_tenant = "99999999-9999-9999-9999-999999999999"
-        mock_rfq = {"id": RFQ_ID, "client_id": other_tenant, "last_quote": 43.0, "status": "active", "due_by": "2099-01-01T00:00:00Z"}
-        mock_quote = {"id": QUOTE_ID, "rfq_id": RFQ_ID, "supplier_id": SUPPLIER_ID, "price": 48.0, "is_available": True}
-        with patch.object(db, "get_quote_by_id", return_value=mock_quote), \
-             patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
-             patch.object(db, "get_rfq_by_id", return_value=mock_rfq):
-            proposal = ActionProposal(
-                tool_name="negotiate_price",
-                arguments={"rfq_id": RFQ_ID, "quote_id": QUOTE_ID, "quoted_price": 48.0, "counter_price": 43.0, "negotiation_message": "Offer 43"},
-            )
-            res = validate_action(proposal, client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
-            assert res.is_valid is False
-            assert "cross-tenant" in res.reason.lower()
-
-    def test_37_exact_quote_id_targeting_unchanged(self, mock_supabase):
-        mock_supabase.table().select().eq().execute.return_value.data = []
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "last_quote": 43.0, "status": "active", "due_by": "2099-01-01T00:00:00Z"}
-        with patch.object(db, "get_quote_by_id", return_value=None):
-            proposal = ActionProposal(
-                tool_name="negotiate_price",
-                arguments={"rfq_id": RFQ_ID, "quote_id": "nonexistent-quote", "quoted_price": 48.0, "counter_price": 43.0, "negotiation_message": "Offer 43"},
-            )
-            res = validate_action(proposal, client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
-            assert res.is_valid is False
-            assert "does not exist" in res.reason.lower()
-
-    def test_38_withdrawn_quote_cannot_negotiate(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "last_quote": 43.0, "status": "active", "due_by": "2099-01-01T00:00:00Z"}
-        mock_quote = {"id": QUOTE_ID, "rfq_id": RFQ_ID, "supplier_id": SUPPLIER_ID, "price": 48.0, "is_available": False}
-        with patch.object(db, "get_quote_by_id", return_value=mock_quote), patch.object(db, "get_rfq_by_id", return_value=mock_rfq):
-            proposal = ActionProposal(
-                tool_name="negotiate_price",
-                arguments={"rfq_id": RFQ_ID, "quote_id": QUOTE_ID, "quoted_price": 48.0, "counter_price": 43.0, "negotiation_message": "Offer 43"},
-            )
-            res = validate_action(proposal, client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
-            assert res.is_valid is False
-            assert "withdrawn" in res.reason.lower()
-
-    def test_39_superseded_quote_cannot_negotiate(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "last_quote": 43.0, "status": "active", "due_by": "2099-01-01T00:00:00Z"}
-        older_quote = {"id": "quote-older", "rfq_id": RFQ_ID, "supplier_id": SUPPLIER_ID, "price": 48.0, "is_available": True}
-        newer_quote = {"id": "quote-newer", "rfq_id": RFQ_ID, "supplier_id": SUPPLIER_ID, "price": 46.0, "is_available": True}
-        with patch.object(db, "get_quote_by_id", return_value=older_quote), \
-             patch.object(db, "get_quotes_for_rfq", return_value=[newer_quote]), \
-             patch.object(db, "get_rfq_by_id", return_value=mock_rfq):
-            proposal = ActionProposal(
-                tool_name="negotiate_price",
-                arguments={"rfq_id": RFQ_ID, "quote_id": "quote-older", "quoted_price": 48.0, "counter_price": 43.0, "negotiation_message": "Offer 43"},
-            )
-            res = validate_action(proposal, client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
-            assert res.is_valid is False
-            assert "superseded" in res.reason.lower()
-
-    def test_40_deadline_blocks_negotiation(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "last_quote": 43.0, "status": "active", "due_by": "2020-01-01T00:00:00Z"}
-        mock_quote = {"id": QUOTE_ID, "rfq_id": RFQ_ID, "supplier_id": SUPPLIER_ID, "price": 48.0, "is_available": True}
-        with patch.object(db, "get_quote_by_id", return_value=mock_quote), \
-             patch.object(db, "get_quotes_for_rfq", return_value=[mock_quote]), \
-             patch.object(db, "get_rfq_by_id", return_value=mock_rfq), \
-             patch.object(db, "is_rfq_open", return_value=False):
-            proposal = ActionProposal(
-                tool_name="negotiate_price",
-                arguments={"rfq_id": RFQ_ID, "quote_id": QUOTE_ID, "quoted_price": 48.0, "counter_price": 43.0, "negotiation_message": "Offer 43"},
-            )
-            res = validate_action(proposal, client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, context_rfqs=[mock_rfq])
-            assert res.is_valid is False
-            assert "deadline has passed" in res.reason.lower() or "closed" in res.reason.lower()
 
 
 # ============================================================
@@ -614,27 +288,6 @@ class TestNegotiationAuditTrail:
         )
         assert record["arguments"]["quote_id"] == QUOTE_ID
 
-    @pytest.mark.asyncio
-    async def test_45_escalation_decision_is_auditable_with_flag_link(self, mock_supabase):
-        mock_rfq = {"id": RFQ_ID, "client_id": DEMO_CLIENT, "product_name": "LED Panel 60W", "last_quote": 43.0, "status": "active"}
-        context = AgentContext(client_id=DEMO_CLIENT, supplier_id=SUPPLIER_ID, open_rfqs=[mock_rfq])
-        val = policy_validator.ValidationResult(
-            is_valid=True,
-            action="record_quote",
-            category=ActionCategory.MUTATION,
-            sanitized_args={"rfq_id": RFQ_ID, "price": 47.0, "variants": [{"price": 47.0, "variant_label": None}]},
-        )
-        updated_decisions = []
-        with patch.object(db, "record_quote"), \
-             patch.object(db, "log_message", return_value="msg-1"), \
-             patch("main.enqueue_message", new_callable=AsyncMock), \
-             patch.object(db, "flag_for_human_review", return_value=[{"id": "flag-audit-1"}]), \
-             patch.object(db, "update_agent_decision", side_effect=lambda dec_id, **kw: updated_decisions.append((dec_id, kw))):
-            await main.execute_validated_action(val, context, "47 final", {"id": SUPPLIER_ID, "phone_number": "+971501111111"}, DEMO_CLIENT, decision_id="dec-123")
-            assert len(updated_decisions) == 1
-            assert updated_decisions[0][1]["flag_id"] == "flag-audit-1"
-            assert updated_decisions[0][1]["arguments"]["last_quote"] == 43.0
-            assert updated_decisions[0][1]["arguments"]["tolerated_final_ceiling"] == 46.0
 
     def test_46_no_chain_of_thought_stored_in_decision_args(self):
         raw_args = {

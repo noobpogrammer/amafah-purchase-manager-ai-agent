@@ -1,11 +1,11 @@
 # Amafah - WhatsApp Purchase Manager AI Agent
 
-An intelligent, autonomous AI agent webhook service built with **FastAPI**, **Groq (LLM & Tool Calling)**, and **Supabase (PostgreSQL)** for processing incoming supplier RFQ (Request for Quotation) responses on WhatsApp via Evolution API.
+An intelligent, autonomous AI agent webhook service built with **FastAPI**, **OpenClaw**, and **Supabase (PostgreSQL)** for processing incoming supplier RFQ (Request for Quotation) responses on WhatsApp through the OpenClaw gateway.
 
 ## Features
 
-- **Autonomous Tool Calling**: Leverages Groq's LLM tool calling capabilities to interpret supplier messages and execute precise database operations.
-- **WhatsApp Webhook Integration**: Processes incoming webhooks from Evolution API to handle real-time communication with suppliers.
+- **Autonomous Tool Calling**: OpenClaw interprets supplier messages and calls authenticated procurement tools; the backend validates commercial authority before mutations and commitments.
+- **WhatsApp Webhook Integration**: OpenClaw owns supplier conversations and transport. The backend exposes the `/openclaw` tool bridge.
 - **RFQ Tracking & Management**: Automatically matches supplier quotes, specs, delivery lead times, and status against open RFQs.
 - **Supabase Integration**: Direct database interactions for managing suppliers, products, and RFQs.
 
@@ -13,8 +13,8 @@ An intelligent, autonomous AI agent webhook service built with **FastAPI**, **Gr
 
 ```
 .
-├── main.py            # FastAPI entry point & Evolution API webhook handler
-├── groq_client.py     # Groq LLM integration & Tool execution engine
+├── main.py            # Buyer APIs, scheduling, dispatch and reports
+├── openclaw_bridge.py  # Procurement tools, analysis and commercial authorization
 ├── db.py              # Supabase database layer & query functions
 ├── schema.sql         # PostgreSQL schema definition
 ├── requirements.txt   # Python dependencies
@@ -26,7 +26,8 @@ An intelligent, autonomous AI agent webhook service built with **FastAPI**, **Gr
 ### 1. Prerequisites
 
 - Python 3.9+
-- Groq API Key
+- OpenClaw service configured with a model
+- OPENCLAW_BASE_URL and shared OPENCLAW_TOOL_API_KEY
 - Supabase project credentials
 
 ### 2. Installation
@@ -80,3 +81,13 @@ To create and apply a schema change:
 
 MIT
 
+
+## OpenClaw-only migration
+
+The legacy action validator, local AI reasoning/tool loop, text guardrails and Groq client have been removed. Commercial action review remains in `openclaw_bridge.py`; its approval and acceptance RPCs remain authoritative.
+
+Three analysis functions call the authenticated `POST /internal/procurement/analyze` endpoint in the companion `openclaw-railway-template` service: commercial fact/tradeoff extraction, multi-item quote parsing and quote ranking. Sessions are isolated and the procurement plugin disables tools for these analysis sessions. No WhatsApp delivery is requested. Returned facts are checked by backend schemas and existing RFQ/quote checks. Commercial parsing retains the existing deterministic fallback; multi-item parsing returns no mapped items on failure; ranking errors propagate without saving an invented recommendation.
+
+Deploy the updated OpenClaw wrapper **and procurement-tools plugin first**, then this backend. No database migrations are required. A backend deployed against the old wrapper cannot use the new analysis endpoint; parsing falls back and ranking fails. No Groq credentials or Groq SDK are required.
+
+Local verification covers analysis transport contracts, parsing failures, candidate validation, rankings, existing bridge flows and wrapper response extraction. Live gateway/model execution must still be checked against the deployed OpenClaw service.

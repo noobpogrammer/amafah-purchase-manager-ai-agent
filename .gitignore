@@ -24,3 +24,7 @@ frontend/dist/
 frontend/playwright-report/
 frontend/test-results/
 
+
+# Separate companion repository and local test cache
+openclaw-railway-template/
+.pytest_cache/

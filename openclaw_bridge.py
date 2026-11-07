@@ -10,21 +10,329 @@ from __future__ import annotations
 
 import hmac
 import logging
+import math
 import os
 import re
-from typing import Optional
+from typing import Optional, List, Dict, Any, Literal
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
 import db
 import negotiation_engine
-import groq_client
+import requests
 from supplier_message_planner import validate_multi_rfq_quotes, AmbiguousSupplierQuote
 
 
-router = APIRouter(prefix="/openclaw", tags=["openclaw"])
 logger = logging.getLogger(__name__)
+
+# OpenClaw analysis: structured extraction and advisory rankings.
+# These helpers request analysis only; commercial authority is enforced below.
+def _request_openclaw_analysis(operation: str, data: dict, schema: dict) -> dict:
+    base = os.getenv("OPENCLAW_BASE_URL", "").rstrip("/")
+    key = os.getenv("OPENCLAW_TOOL_API_KEY", "").strip()
+    if not base or not key:
+        raise RuntimeError("OpenClaw analysis is not configured")
+    response = requests.post(
+        f"{base}/internal/procurement/analyze",
+        headers={"X-OpenClaw-Key": key},
+        json={"operation": operation, "data": data, "schema": schema},
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("ok") is not True or not isinstance(payload.get("result"), dict):
+        raise ValueError("Invalid OpenClaw analysis response")
+    return payload["result"]
+
+class CommercialPriceInfo(BaseModel):
+    amount: Optional[float] = None
+    currency: Optional[str] = "AED"
+    per_unit: Optional[bool] = None
+
+class CommercialDeliveryInfo(BaseModel):
+    days: Optional[int] = None
+    unit: Optional[str] = "calendar_days"
+
+class CommercialQuantityInfo(BaseModel):
+    value: Optional[int] = None
+    minimum_order_quantity: Optional[int] = None
+
+class CommercialSpecificationInfo(BaseModel):
+    alternative: Optional[str] = None
+
+class CommercialPaymentTermsInfo(BaseModel):
+    text: Optional[str] = None
+
+class CommercialTradeoffInfo(BaseModel):
+    present: bool = False
+    dimension: Optional[str] = None  # "price", "delivery", "quantity", "specification", "payment", "other"
+    condition_text: Optional[str] = None
+
+class CommercialParseResult(BaseModel):
+    intent: str = "other"  # "quote_update", "conditional_offer", "clarification", "rejection", "final_offer", "availability_update", "other"
+    routing_intent: Literal["NEW_QUOTE", "REVISION", "NEGOTIATION_REPLY", "UNKNOWN"] = "UNKNOWN"
+    price: Optional[CommercialPriceInfo] = None
+    delivery: Optional[CommercialDeliveryInfo] = None
+    quantity: Optional[CommercialQuantityInfo] = None
+    specification: Optional[CommercialSpecificationInfo] = None
+    payment_terms: Optional[CommercialPaymentTermsInfo] = None
+    tradeoff: Optional[CommercialTradeoffInfo] = None
+    supplier_final: bool = False
+    explicit_product_reference: Optional[str] = None
+    confidence: float = 1.0
+
+def _fallback_parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] = None) -> CommercialParseResult:
+    text = (message_text or "").strip()
+    if not text:
+        return CommercialParseResult(intent="other", confidence=0.0)
+
+    res = CommercialParseResult(intent="other", confidence=0.9)
+
+    # 1. Price extraction
+    price_val = None
+    per_unit = bool(re.search(r"\b(?:per\s*(?:pc|piece|unit|item|nos?)|each|/\s*(?:pc|piece|unit))\b", text, re.I))
+
+    p_match = re.search(r"(?:aed|dhs?|dirhams?)\s*(\d+(?:\.\d+)?)", text, re.I)
+    if not p_match:
+        p_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:aed|dhs?|dirhams?)", text, re.I)
+    if not p_match:
+        p_match = re.search(r"\b(?:i\s+can\s+do|can\s+do|offer|price\s*is|rate\s*is|final\s*is|final)\s*(\d+(?:\.\d+)?)\b", text, re.I)
+    if not p_match:
+        p_match = re.search(r"^\s*(\d+(?:\.\d+)?)\s*(?:if\b|,|\.|$)", text, re.I)
+
+    if p_match:
+        try:
+            pv = float(p_match.group(1))
+            if pv > 0 and not math.isnan(pv) and not math.isinf(pv):
+                price_val = pv
+                res.price = CommercialPriceInfo(amount=pv, currency="AED", per_unit=per_unit)
+                res.intent = "quote_update"
+        except Exception:
+            pass
+
+    # 2. Delivery extraction
+    deliv_days = None
+    deliv_unit = "calendar_days"
+    d_match = re.search(r"(\d+)[-\s]*(?:working|business)[-\s]*days?", text, re.I)
+    if d_match:
+        deliv_days = int(d_match.group(1))
+        deliv_unit = "working_days"
+    else:
+        d_match = re.search(r"(?:ready\s+in|lead\s*time\s*(?:around|is|of)?|delivery\s+(?:in|is|of)?|\b)(\d+)[-\s]*days?", text, re.I)
+        if d_match:
+            deliv_days = int(d_match.group(1))
+        else:
+            w_match = re.search(r"(?:lead\s*time\s*(?:around|is|of)?|ready\s+in|in)?\s*(?:one|1)\s*week", text, re.I)
+            if w_match:
+                deliv_days = 7
+            else:
+                w_match2 = re.search(r"(\d+)\s*weeks?", text, re.I)
+                if w_match2:
+                    deliv_days = int(w_match2.group(1)) * 7
+
+    if deliv_days is not None and 0 < deliv_days <= 365:
+        res.delivery = CommercialDeliveryInfo(days=deliv_days, unit=deliv_unit)
+
+    # 3. Quantity extraction
+    qty_val = None
+    moq_val = None
+    moq_match = re.search(r"\b(?:moq|minimum\s+order\s+quantity)\s*(?:is|of|:)?\s*(\d+)\b", text, re.I)
+    if moq_match:
+        moq_val = int(moq_match.group(1))
+
+    qty_match = re.search(r"\b(?:take|order|buy)\s*(\d+)\s*(?:pcs|pieces|units|nos)?\b", text, re.I)
+    if qty_match:
+        qty_val = int(qty_match.group(1))
+    elif not moq_val:
+        qty_match2 = re.search(r"\b(\d+)\s*(?:pcs|pieces|units|nos)\b", text, re.I)
+        if qty_match2 and (not p_match or qty_match2.group(1) != p_match.group(1)):
+            qty_val = int(qty_match2.group(1))
+
+    if qty_val or moq_val:
+        res.quantity = CommercialQuantityInfo(value=qty_val, minimum_order_quantity=moq_val)
+
+    # 4. Specification extraction
+    spec_match = re.search(r"\b(?:alternative\s+brand|substitute\s+brand|brand)\s*(?::\s*|\s+)([A-Za-z0-9\s]+?)(?:\s+at|\s+for|\s+with|$|\.|\,)", text, re.I)
+    if not spec_match:
+        spec_match = re.search(r"\b(?:alternative|substitute)\s*(?::\s*|\s+)([A-Za-z0-9\s]+?)(?:\s+at|\s+for|\s+with|$|\.|\,)", text, re.I)
+    if spec_match:
+        spec_alt = spec_match.group(1).strip()
+        res.specification = CommercialSpecificationInfo(alternative=spec_alt)
+    elif re.search(r"\b(?:another\s+model\s+instead|different\s+model)\b", text, re.I):
+        res.specification = CommercialSpecificationInfo(alternative="another model")
+
+    # 5. Payment terms extraction
+    pay_match = re.search(r"\b(\d+%\s*advance(?:\s+against\s+\w+)?)\b", text, re.I)
+    if pay_match:
+        res.payment_terms = CommercialPaymentTermsInfo(text=pay_match.group(1))
+    elif re.search(r"\b(advance\s*payment|cash\s*on\s*delivery|cod|lc|bank\s*transfer)\b", text, re.I):
+        m_p = re.search(r"\b(advance\s*payment|cash\s*on\s*delivery|cod|lc|bank\s*transfer)\b", text, re.I)
+        res.payment_terms = CommercialPaymentTermsInfo(text=m_p.group(1))
+
+    # 6. Tradeoff detection
+    # Delivery conditional check
+    cond_deliv = re.search(r"\b(?:if\s+(?:you\s+(?:can\s+)?)?(?:accept|allow|take|do)\s+(\d+)\s*(?:days?|working\s*days?)|if\s+delivery\s+is\s+(\d+)\s*(?:days?|working\s*days?)|can\s+reduce.*if\s+(?:delivery\s+is\s+)?(\d+)\s*days?|(\d+)\s*days?\s*delivery|(\d+)-day\s*delivery)\b", text, re.I)
+    if cond_deliv or (re.search(r"\bif\b", text, re.I) and deliv_days is not None and price_val is not None):
+        res.tradeoff = CommercialTradeoffInfo(
+            present=True,
+            dimension="delivery",
+            condition_text=f"{deliv_days}-day delivery" if deliv_days else "delivery condition"
+        )
+        res.intent = "conditional_offer"
+    elif qty_val or moq_val or re.search(r"\b(?:if\s+you\s+(?:can\s+)?(?:take|order|buy)|moq)\b", text, re.I):
+        if re.search(r"\b(?:if|moq)\b", text, re.I):
+            res.tradeoff = CommercialTradeoffInfo(
+                present=True,
+                dimension="quantity",
+                condition_text=f"{qty_val or moq_val} units" if (qty_val or moq_val) else "quantity condition"
+            )
+            res.intent = "conditional_offer"
+    elif res.specification and res.specification.alternative:
+        res.tradeoff = CommercialTradeoffInfo(
+            present=True,
+            dimension="specification",
+            condition_text=res.specification.alternative
+        )
+        res.intent = "conditional_offer"
+    elif res.payment_terms and res.payment_terms.text:
+        res.tradeoff = CommercialTradeoffInfo(
+            present=True,
+            dimension="payment",
+            condition_text=res.payment_terms.text
+        )
+        res.intent = "conditional_offer"
+
+    # 7. Supplier final detection
+    if re.search(r"\b(?:final\s*price|best\s*and\s*final|cannot\s*go\s*lower|rock\s*bottom|final\s*offer|my\s*last\s*price|take\s*it\s*or\s*leave\s*it|final\s*\d+)\b", text, re.I):
+        res.supplier_final = True
+        if res.intent == "quote_update":
+            res.intent = "final_offer"
+
+    # 8. Routing-only intent classification.
+    # This never chooses an RFQ. It only helps deterministic routing narrow the
+    # database-backed candidate set in main.py.
+    revision_signal = re.search(
+        r"\b(?:revised|revision|updated\s+(?:quote|price|rate)|new\s+(?:quote|price|rate)|"
+        r"our\s+new\s+rate|changed\s+(?:price|rate)|lower(?:ed)?\s+(?:it\s+)?to)\b",
+        text,
+        re.I,
+    )
+    negotiation_signal = re.search(
+        r"\b(?:i\s+can\s+do|we\s+can\s+do|can\s+do|best\s+(?:i|we)\s+can\s+do|"
+        r"best\s+price|best\s+and\s+final|final(?:\s+(?:price|offer))?|\d+(?:\.\d+)?\s+final|"
+        r"cannot\s+go\s+lower|can't\s+go\s+lower|can(?:not|'t)\s+accept|deal|meet\s+you\s+at)\b",
+        text,
+        re.I,
+    )
+
+    if revision_signal:
+        res.routing_intent = "REVISION"
+    elif negotiation_signal:
+        res.routing_intent = "NEGOTIATION_REPLY"
+    elif price_val is not None or deliv_days is not None or res.intent in {"quote_update", "conditional_offer"}:
+        res.routing_intent = "NEW_QUOTE"
+    else:
+        res.routing_intent = "UNKNOWN"
+
+    # 9. Explicit product reference check
+    if candidate_rfqs:
+        for entry in candidate_rfqs:
+            r_obj = entry.get("rfqs", entry) if isinstance(entry, dict) else entry
+            p_name = r_obj.get("product_name") if isinstance(r_obj, dict) else None
+            if p_name and p_name.lower() in text.lower():
+                res.explicit_product_reference = p_name
+                break
+
+    return res
+
+class MultiRFQQuoteItem(BaseModel):
+    candidate_rfq_id: Optional[str] = None
+    product_reference: Optional[str] = None
+    quantity: Optional[int] = None
+    price: Optional[float] = None
+    variant_label: Optional[str] = None
+    delivery_time: Optional[str] = None
+    quality_notes: Optional[str] = None
+    supplier_final: bool = False
+    confidence: float = 0.0
+
+class MultiRFQQuoteParseResult(BaseModel):
+    items: List[MultiRFQQuoteItem] = Field(default_factory=list)
+
+def parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] = None) -> Dict[str, Any]:
+    if not message_text or not message_text.strip():
+        return CommercialParseResult(intent="other", confidence=0.0).model_dump()
+    try:
+        result = CommercialParseResult.model_validate(_request_openclaw_analysis("commercial_parse", {
+            "message": message_text, "candidate_rfqs": candidate_rfqs or [],
+        }, CommercialParseResult.model_json_schema()))
+        if result.price and result.price.amount is not None:
+            if not math.isfinite(result.price.amount) or result.price.amount <= 0:
+                result.price = None
+                result.confidence = 0.5
+        if result.delivery and result.delivery.days is not None:
+            if result.delivery.days <= 0 or result.delivery.days > 365:
+                result.delivery = None
+        if result.quantity and result.quantity.value is not None and result.quantity.value <= 0:
+            result.quantity.value = None
+        deterministic = _fallback_parse_commercial_message(message_text, candidate_rfqs)
+        if deterministic.routing_intent in {"REVISION", "NEGOTIATION_REPLY"}:
+            result.routing_intent = deterministic.routing_intent
+        return result.model_dump()
+    except (requests.RequestException, ValueError, RuntimeError):
+        # Preserve the existing deterministic fallback; it cannot grant buyer authority.
+        logger.warning("OpenClaw commercial parsing unavailable; using deterministic extraction")
+        return _fallback_parse_commercial_message(message_text, candidate_rfqs).model_dump()
+
+def parse_multi_rfq_quotes(message_text: str, candidate_rfqs: Optional[list] = None) -> Dict[str, Any]:
+    candidates = []
+    for entry in candidate_rfqs or []:
+        rfq = entry.get("rfqs", entry) if isinstance(entry, dict) else None
+        if not isinstance(rfq, dict) or not rfq.get("id"):
+            continue
+        candidates.append({"rfq_id": str(rfq["id"]), "product_name": rfq.get("product_name"),
+            "specs": rfq.get("specs"), "quantity": rfq.get("quantity"),
+            "item_number": rfq.get("item_number"), "reference": rfq.get("reference") or str(rfq["id"])[:8]})
+    if not message_text or not message_text.strip() or len(candidates) < 2:
+        return {"items": []}
+    try:
+        parsed = MultiRFQQuoteParseResult.model_validate(_request_openclaw_analysis("multi_rfq_quote_parser", {
+            "message": message_text, "candidate_rfqs": candidates,
+        }, MultiRFQQuoteParseResult.model_json_schema()))
+        allowed_ids = {c["rfq_id"] for c in candidates}
+        clean = []
+        for item in parsed.items:
+            row = item.model_dump()
+            if str(row.get("candidate_rfq_id") or "") not in allowed_ids:
+                row["candidate_rfq_id"] = None
+            price = row.get("price")
+            if price is not None and (not math.isfinite(price) or price <= 0):
+                row["price"] = None
+            clean.append(row)
+        return {"items": clean}
+    except (requests.RequestException, ValueError, RuntimeError):
+        logger.warning("OpenClaw multi-item parsing unavailable; no quotes mapped")
+        return {"items": []}
+
+class RankedQuote(BaseModel):
+    quote_id: str
+    rank: int = Field(ge=1)
+    summary: str = ""
+
+class QuoteRanking(BaseModel):
+    best_quote_id: str
+    reasoning: str
+    ranking: list[RankedQuote]
+
+def rank_quotes(rfq_details: str, quotes_summary: str) -> dict:
+    # main.generate_ranking additionally validates every returned ID against actual quotes.
+    result = _request_openclaw_analysis("quote_ranking", {"rfq_details": rfq_details, "quotes_summary": quotes_summary},
+        QuoteRanking.model_json_schema())
+    return QuoteRanking.model_validate(result).model_dump()
+
+# Authenticated tools called by OpenClaw.
+router = APIRouter(prefix="/openclaw", tags=["openclaw"])
 
 
 def _require_openclaw_key(x_openclaw_key: Optional[str] = Header(default=None)) -> None:
@@ -46,15 +354,25 @@ def _get_supplier_for_client(client_id: str, supplier_id: Optional[str], phone_n
             .select("*")
             .eq("id", supplier_id)
             .eq("client_id", client_id)
+            .eq("is_active", True)
+            .is_("deleted_at", "null")
             .limit(1)
             .execute()
         )
         supplier = res.data[0] if res.data else None
     elif phone_number:
-        supplier = db.get_supplier_by_phone(client_id, phone_number)
+        try:
+            supplier = db.get_supplier_by_phone(client_id, phone_number)
+        except db.AmbiguousSupplierPhoneError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "AMBIGUOUS_SUPPLIER_PHONE",
+                "message": str(exc),
+            }) from exc
 
     if not supplier:
-        raise HTTPException(status_code=404, detail="Supplier not found for this client.")
+        raise HTTPException(status_code=404, detail="Active supplier not found for this client.")
+    if supplier.get("is_active") is False or supplier.get("deleted_at") is not None:
+        raise HTTPException(status_code=409, detail="Supplier is inactive or deleted; automated actions are disabled.")
     return supplier
 
 
@@ -164,7 +482,7 @@ class SupplierContextRequest(BaseModel):
     client_id: str
     supplier_id: Optional[str] = None
     phone_number: Optional[str] = None
-    history_limit: int = Field(default=20, ge=1, le=50)
+    history_limit: int = Field(default=0, ge=0, le=50)
 
 
 class QuoteVariant(BaseModel):
@@ -290,6 +608,7 @@ class NegotiationContextRequest(BaseModel):
     rfq_id: str
 
 class RfqContextResolveRequest(BaseModel):
+    include_history: bool = False
     client_id: str
     supplier_id: str
     message: str
@@ -359,9 +678,9 @@ def activation_gate(
         or pending_flags
     )
 
-    # Option C: a greeting or personal conversation cannot activate procurement.
-    # The model may interpret commercial details *after* this deterministic gate,
-    # but it must not override a DENY. Fail closed for ambiguous text.
+    # Explicit greetings/personal-only messages stay silent. Other replies with
+    # buying state reach the main model in its existing OpenClaw conversation;
+    # missing keywords alone must not discard "agreed", "24", or mixed-language replies.
     message = (req.message or "").strip()
     normalized = " ".join(message.casefold().split())
     greetings = re.compile(
@@ -413,6 +732,8 @@ def activation_gate(
         # Human-review flags alone never authorize procurement replies. A repeated
         # out-of-context inquiry must stay silent after its review row is created.
         decision, reason = "ENGAGE", "explicit_procurement_intent_with_context"
+    elif open_links or active_session or pending_clarification:
+        decision, reason = "ENGAGE", "interpret_in_existing_procurement_context"
     elif is_commercial:
         decision, reason = "HUMAN_REVIEW", "procurement_intent_without_active_context"
     else:
@@ -463,11 +784,22 @@ def activation_gate(
             {
                 "rfq_id": (row.get("rfqs") or {}).get("id"),
                 "product_name": (row.get("rfqs") or {}).get("product_name"),
+                "specs": (row.get("rfqs") or {}).get("specs"),
+                "quantity": (row.get("rfqs") or {}).get("quantity"),
+                "last_quote": (row.get("rfqs") or {}).get("last_quote"),
+                "acceptable_price_max": (row.get("rfqs") or {}).get("acceptable_price_max"),
+                "required_delivery_days": (row.get("rfqs") or {}).get("required_delivery_days"),
+                "quantity_flexible": (row.get("rfqs") or {}).get("quantity_flexible"),
+                "quantity_max": (row.get("rfqs") or {}).get("quantity_max"),
+                "delivery_flexible": (row.get("rfqs") or {}).get("delivery_flexible"),
+                "max_delivery_days": (row.get("rfqs") or {}).get("max_delivery_days"),
                 "supplier_status": row.get("status"),
                 "due_by": (row.get("rfqs") or {}).get("due_by"),
             }
             for row in open_links
         ],
+        "active_negotiation_context": active_session,
+        "pending_clarification_context": pending_clarification,
         "pending_flags": pending_flags,
         "message": req.message,
     }
@@ -997,7 +1329,7 @@ def resolve_rfq_context(
 
         session = db.get_active_negotiation_session(req.client_id, rfq["id"], req.supplier_id)
 
-        recent_res = (
+        recent_messages = (
             db.supabase.table("message_log")
             .select("id,direction,body,created_at,external_message_id")
             .eq("client_id", req.client_id)
@@ -1005,8 +1337,8 @@ def resolve_rfq_context(
             .eq("related_rfq_id", rfq["id"])
             .order("created_at", desc=True)
             .limit(5)
-            .execute()
-        )
+            .execute().data or []
+        ) if req.include_history else []
 
         candidates.append({
             "rfq_id": rfq["id"],
@@ -1020,7 +1352,7 @@ def resolve_rfq_context(
             "has_quote_history": bool(quote_rows),
             "latest_quote": latest_quote,
             "active_negotiation": bool(session),
-            "recent_rfq_messages": recent_res.data or [],
+            "recent_rfq_messages": recent_messages,
         })
 
     if not candidates:
@@ -1296,7 +1628,7 @@ def parse_multi_item_quotes(req: MultiItemSupplierQuoteRequest, x_openclaw_key: 
             ]
     if len(links) < 2:
         return {"status": "SINGLE_RFQ", "items": [], "bundle_id": bundle_id}
-    items = (groq_client.parse_multi_rfq_quotes(req.message, links) or {}).get("items") or []
+    items = (parse_multi_rfq_quotes(req.message, links) or {}).get("items") or []
     if not items:
         return {"status": "NO_ITEMS", "items": [], "bundle_id": bundle_id}
     allowed_ids = [str(x["rfqs"]["id"]) for x in links]
@@ -1430,7 +1762,7 @@ def supplier_context(
         req.client_id,
         supplier["id"],
         limit=req.history_limit,
-    )
+    ) if req.history_limit else []
     active_session = db.get_active_negotiation_session_for_supplier(
         req.client_id,
         supplier["id"],
@@ -1447,6 +1779,7 @@ def supplier_context(
         "automation_paused": db.is_client_automation_paused(req.client_id),
         "active_rfqs": open_rfqs,
         "conversation_history": history,
+        "history_source": "database_recovery" if req.history_limit else "openclaw_session",
         "active_negotiation_session": active_session,
     }
 

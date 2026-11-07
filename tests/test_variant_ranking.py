@@ -50,7 +50,7 @@ from fastapi.testclient import TestClient
 import main
 import db
 import auth
-import groq_client
+import openclaw_bridge
 
 
 client = TestClient(main.app)
@@ -74,7 +74,7 @@ class TestVariantAwareRanking:
             }
         ]
         with patch.object(db, "get_quotes_for_rfq", return_value=quotes), \
-             patch.object(groq_client, "rank_quotes", return_value={
+             patch.object(openclaw_bridge, "rank_quotes", return_value={
                  "best_quote_id": "q-1",
                  "reasoning": "Supplier 1 is the sole and best offer.",
                  "ranking": [{"quote_id": "q-1", "rank": 1, "summary": "AED 50, 2 days"}]
@@ -120,7 +120,7 @@ class TestVariantAwareRanking:
             },
         ]
         with patch.object(db, "get_quotes_for_rfq", return_value=quotes), \
-             patch.object(groq_client, "rank_quotes", return_value={
+             patch.object(openclaw_bridge, "rank_quotes", return_value={
                  "best_quote_id": "q-china",
                  "reasoning": "China variant offers lower cost at AED 38.",
                  "ranking": [
@@ -148,7 +148,7 @@ class TestVariantAwareRanking:
             {"id": "q-3", "rfq_id": "rfq-1", "supplier_id": "supp-B", "variant_label": "UAE", "price": 40.0, "suppliers": {"name": "Supplier B"}},
         ]
         with patch.object(db, "get_quotes_for_rfq", return_value=quotes), \
-             patch.object(groq_client, "rank_quotes", return_value={
+             patch.object(openclaw_bridge, "rank_quotes", return_value={
                  "best_quote_id": "q-2",
                  "reasoning": "China offers lowest price.",
                  "ranking": [
@@ -170,7 +170,7 @@ class TestVariantAwareRanking:
             {"id": "q-real-1", "rfq_id": "rfq-1", "supplier_id": "supp-1", "price": 50.0, "suppliers": {"name": "Supplier 1"}}
         ]
         with patch.object(db, "get_quotes_for_rfq", return_value=quotes), \
-             patch.object(groq_client, "rank_quotes", return_value={
+             patch.object(openclaw_bridge, "rank_quotes", return_value={
                  "best_quote_id": "q-hallucinated-999",
                  "reasoning": "Fake quote",
                  "ranking": [{"quote_id": "q-hallucinated-999", "rank": 1}]
@@ -189,7 +189,7 @@ class TestVariantAwareRanking:
             {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "supp-1", "price": 50.0, "suppliers": {"name": "Supplier 1"}}
         ]
         with patch.object(db, "get_quotes_for_rfq", return_value=quotes), \
-             patch.object(groq_client, "rank_quotes", return_value={
+             patch.object(openclaw_bridge, "rank_quotes", return_value={
                  "best_quote_id": None,
                  "reasoning": "Only 1 quote",
                  "ranking": [{"quote_id": "q-1", "rank": 1, "summary": "50 AED"}]
@@ -206,7 +206,7 @@ class TestVariantAwareRanking:
             {"id": "q-latest-rev", "rfq_id": "rfq-1", "supplier_id": "supp-1", "variant_label": "India", "price": 40.0, "suppliers": {"name": "Supplier 1"}}
         ]
         with patch.object(db, "get_quotes_for_rfq", return_value=effective_quotes) as mock_get_quotes, \
-             patch.object(groq_client, "rank_quotes", return_value={
+             patch.object(openclaw_bridge, "rank_quotes", return_value={
                  "best_quote_id": "q-latest-rev",
                  "reasoning": "Best revision",
                  "ranking": [{"quote_id": "q-latest-rev", "rank": 1}]
@@ -223,7 +223,7 @@ class TestVariantAwareRanking:
             {"id": "q-rfq-1", "rfq_id": "rfq-1", "supplier_id": "supp-1", "price": 50.0, "suppliers": {"name": "Supplier 1"}}
         ]
         with patch.object(db, "get_quotes_for_rfq", return_value=rfq1_quotes), \
-             patch.object(groq_client, "rank_quotes", return_value={
+             patch.object(openclaw_bridge, "rank_quotes", return_value={
                  "best_quote_id": "q-rfq-2-other",
                  "reasoning": "Wrong quote",
                  "ranking": [{"quote_id": "q-rfq-2-other", "rank": 1}]
@@ -241,7 +241,7 @@ class TestVariantAwareRanking:
             {"id": "q-2", "rfq_id": "rfq-1", "supplier_id": "supp-1", "variant_label": "B", "price": 60.0, "suppliers": {"name": "Supplier 1"}},
         ]
         with patch.object(db, "get_quotes_for_rfq", return_value=quotes), \
-             patch.object(groq_client, "rank_quotes", return_value={
+             patch.object(openclaw_bridge, "rank_quotes", return_value={
                  "best_quote_id": "q-1",
                  "reasoning": "Ranked",
                  "ranking": [

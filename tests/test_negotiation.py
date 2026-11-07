@@ -7,8 +7,6 @@ from pydantic import ValidationError
 
 import db
 import main
-import policy_validator
-from policy_validator import ActionProposal, validate_action, ActionCategory, MAX_NEGOTIATION_ATTEMPTS
 
 
 @pytest.fixture
@@ -235,162 +233,16 @@ class TestCompetitiveContext:
 # ==============================================================================
 # 4. Policy & Validator Layer Tests (Items 22 - 29)
 # ==============================================================================
-class TestPolicyValidator:
-    def test_negotiation_action_requires_exact_rfq_and_supplier(self, mock_supabase):
-        proposal = ActionProposal(
-            tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 65.0, "counter_price": 60.0, "negotiation_message": "Could you do AED 60?"},
-        )
-        context_rfq = {
-            "rfqs": {
-                "id": "rfq-1",
-                "client_id": "client-1",
-                "status": "active",
-                "due_by": (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(),
-            },
-            "supplier_id": "sup-1",
-        }
-        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 65.0, "is_available": True}
-        with patch("db.get_quote_by_id", return_value=mock_quote), \
-             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
-            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-            assert res.is_valid is True
-            assert res.action == "negotiate_price"
-            assert res.sanitized_args["quoted_price"] == 65.0
-            assert res.sanitized_args["counter_price"] == 60.0
-            assert res.sanitized_args["quote_id"] == "q-1"
-
-    def test_negotiation_blocked_for_cross_tenant(self, mock_supabase):
-        proposal = ActionProposal(
-            tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 65.0, "counter_price": 60.0, "negotiation_message": "Can you offer AED 60?"},
-        )
-        context_rfq = {
-            "rfqs": {
-                "id": "rfq-1",
-                "client_id": "client-other",
-                "status": "active",
-                "due_by": (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(),
-            },
-            "supplier_id": "sup-1",
-        }
-        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 65.0, "is_available": True}
-        with patch("db.get_quote_by_id", return_value=mock_quote), \
-             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
-            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-            assert res.is_valid is False
-            assert "Cross-tenant violation" in res.reason
-
-    def test_negotiation_blocked_after_deadline(self):
-        proposal = ActionProposal(
-            tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 65.0, "counter_price": 60.0, "negotiation_message": "Can you offer AED 60?"},
-        )
-        context_rfq = {
-            "rfqs": {
-                "id": "rfq-1",
-                "client_id": "client-1",
-                "status": "active",
-                "due_by": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
-            },
-            "supplier_id": "sup-1",
-        }
-        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 65.0, "is_available": True}
-        with patch("db.get_quote_by_id", return_value=mock_quote), \
-             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
-            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-            assert res.is_valid is False
-            assert "closed or deadline has passed" in res.reason
-
-    def test_negotiation_blocked_for_closed_rfq(self):
-        proposal = ActionProposal(
-            tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 65.0, "counter_price": 60.0, "negotiation_message": "Can you offer AED 60?"},
-        )
-        context_rfq = {
-            "rfqs": {
-                "id": "rfq-1",
-                "client_id": "client-1",
-                "status": "closed",
-                "due_by": (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(),
-            },
-            "supplier_id": "sup-1",
-        }
-        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 65.0, "is_available": True}
-        with patch("db.get_quote_by_id", return_value=mock_quote), \
-             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
-            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-            assert res.is_valid is False
-            assert "closed or deadline has passed" in res.reason
-
-    def test_high_risk_actions_blocked_regardless_of_confidence(self):
-        for hr_tool in ("close_rfq", "accept_quote", "generate_ranking", "save_ranking", "delete_quote"):
-            proposal = ActionProposal(
-                tool_name=hr_tool,
-                arguments={"rfq_id": "rfq-1"},
-                confidence=0.99,
-            )
-            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1")
-            assert res.is_valid is False
-            assert res.category == ActionCategory.HIGH_RISK
 
 
 # ==============================================================================
 # 5. Negotiation Attempt Limits Tests (Items 30 - 32)
 # ==============================================================================
-class TestNegotiationLimits:
-    def test_negotiation_attempt_increment_and_enforcement(self, mock_supabase):
-        mock_supabase.table().select().eq().eq().execute.return_value.data = [{"negotiation_attempts": 2}]
-        attempts = db.get_negotiation_attempts("rfq-1", "sup-1")
-        assert attempts == 2
-
-        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 75.0, "is_available": True}
-        with patch("db.get_negotiation_attempts", return_value=10), \
-             patch("db.get_quote_by_id", return_value=mock_quote), \
-             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
-            proposal = ActionProposal(
-                tool_name="negotiate_price",
-                arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 75.0, "counter_price": 70.0, "negotiation_message": "Please reduce your price."},
-            )
-            context_rfq = {
-                "rfqs": {
-                    "id": "rfq-1",
-                    "client_id": "client-1",
-                    "status": "active",
-                    "due_by": (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(),
-                },
-                "supplier_id": "sup-1",
-            }
-            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-            assert res.is_valid is False
-            assert "Negotiation attempt limit reached" in res.reason
 
 
 # ==============================================================================
 # 6. WhatsApp Continuity & Routing Tests (Items 33 - 37)
 # ==============================================================================
-class TestWhatsAppContinuity:
-    def test_format_rfq_context_does_not_reveal_competitor_identity(self):
-        open_rfqs = [{
-            "id": "rfq-1",
-            "product_name": "LED Panel",
-            "specs": "60W",
-            "quantity": 10,
-            "acceptable_price_min": 50.0,
-            "acceptable_price_max": 60.0,
-        }]
-        with patch("db.get_competitive_pricing_context", return_value={
-            "has_competition": True,
-            "competing_quotes_count": 2,
-            "best_competing_price": 54.0,
-        }), patch("db.get_negotiation_attempts", return_value=1):
-            ctx = main.format_rfq_context(open_rfqs, current_supplier_id="sup-1")
-            assert "Best competing quote is AED 54.0" in ctx
-            assert "Negotiation Attempts Made: 1/10" in ctx
-            assert "Acceptable Price Range: AED 50.0 - 60.0" in ctx
-            # Ensure no supplier names or IDs appear in the text
-            assert "Supplier" not in ctx or "supplier" in ctx.lower()
-            assert "sup-2" not in ctx
 
 
 # ==============================================================================
@@ -406,170 +258,10 @@ class TestDeadlineBehavior:
         res = db.record_quote("rfq-1", "sup-1", 55.0)
         assert res is None
 
-    def test_negotiation_fails_after_deadline(self):
-        proposal = ActionProposal(
-            tool_name="negotiate_price",
-            arguments={"rfq_id": "rfq-1", "quote_id": "q-1", "quoted_price": 65.0, "counter_price": 60.0, "negotiation_message": "Discount please"},
-        )
-        context_rfq = {
-            "rfqs": {
-                "id": "rfq-1",
-                "client_id": "client-1",
-                "status": "active",
-                "due_by": (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
-            },
-            "supplier_id": "sup-1",
-        }
-        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 65.0, "is_available": True}
-        with patch("db.get_quote_by_id", return_value=mock_quote), \
-             patch("db.get_quotes_for_rfq", return_value=[mock_quote]):
-            res = validate_action(proposal, client_id="client-1", supplier_id="sup-1", context_rfqs=[context_rfq])
-            assert res.is_valid is False
-            assert "closed or deadline has passed" in res.reason
-
 
 # ==============================================================================
 # 8. Webhook Negotiation Flow Integration Tests
 # ==============================================================================
-class TestWebhookNegotiationIntegration:
-    @pytest.mark.asyncio
-    async def test_webhook_negotiation_direct_match(self, mock_supabase):
-        from fastapi.testclient import TestClient
-        client = TestClient(main.app)
-
-        payload = {
-            "instance": "test_instance",
-            "data": {
-                "key": {"fromMe": False, "remoteJid": "971501234567@s.whatsapp.net"},
-                "message": {
-                    "conversation": "Our price is AED 68 per unit, 2 days delivery",
-                    "contextInfo": {"stanzaId": "msg-100"},
-                },
-            },
-        }
-
-        mock_client_row = {"id": "client-1", "name": "Test Client", "whatsapp_instance": "test_instance"}
-        mock_supplier_row = {"id": "sup-1", "name": "Al Noor", "phone_number": "971501234567", "client_id": "client-1"}
-        mock_rfq_supplier = {
-            "id": "rs-1",
-            "rfq_id": "rfq-1",
-            "supplier_id": "sup-1",
-            "sent_message_id": "msg-100",
-            "negotiation_attempts": 0,
-            "rfqs": {
-                "id": "rfq-1",
-                "client_id": "client-1",
-                "product_name": "LED Panel",
-                "specs": "60W",
-                "quantity": 10,
-                "status": "active",
-                "acceptable_price_min": 50.0,
-                "acceptable_price_max": 60.0,
-                "due_by": (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(),
-            },
-        }
-        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 68.0, "is_available": True}
-
-        with patch("db.get_client_by_instance", return_value=mock_client_row), \
-             patch("db.get_supplier_by_phone", return_value=mock_supplier_row), \
-             patch("db.get_rfq_supplier_by_sent_message_id", return_value=mock_rfq_supplier), \
-             patch("db.get_supplier_prior_quotes", return_value=[mock_quote]), \
-             patch("db.get_quote_by_id", return_value=mock_quote), \
-             patch("db.get_quotes_for_rfq", return_value=[mock_quote]), \
-             patch("db.get_competitive_pricing_context", return_value={"has_competition": True, "competing_quotes_count": 1, "best_competing_price": 55.0}), \
-             patch("db.get_negotiation_attempts", return_value=0), \
-             patch("db.increment_negotiation_attempts", return_value=1) as mock_inc, \
-             patch("db.record_quote", return_value={"id": "q-1"}) as mock_rec, \
-             patch("db.log_message") as mock_log, \
-             patch("main.enqueue_message", new_callable=AsyncMock) as mock_enq, \
-             patch("groq_client.route_supplier_message", return_value={
-                 "tool_name": "negotiate_price",
-                 "arguments": {
-                     "rfq_id": "rfq-1",
-                     "quote_id": "q-1",
-                     "quoted_price": 68.0,
-                     "counter_price": 50.0,
-                     "negotiation_message": "Thank you. Could you consider revising closer to AED 50 per unit?",
-                     "delivery_time": "2 days",
-                 },
-             }):
-            resp = client.post("/webhook/whatsapp", json=payload)
-            assert resp.status_code == 200
-            assert resp.json()["status"] == "negotiation_sent"
-            assert resp.json()["attempts"] == 1
-            mock_inc.assert_called_once_with("rfq-1", "sup-1")
-            mock_enq.assert_called_once()
-            assert "Thank you. Could you consider revising closer to AED 50" in mock_enq.call_args[0][1]
-
-    @pytest.mark.asyncio
-    async def test_webhook_negotiation_failed_atomic_increment_suppresses_counteroffer(self, mock_supabase):
-        from fastapi.testclient import TestClient
-        client = TestClient(main.app)
-
-        payload = {
-            "instance": "test_instance",
-            "data": {
-                "key": {"fromMe": False, "remoteJid": "971501234567@s.whatsapp.net"},
-                "message": {
-                    "conversation": "Our price is AED 68 per unit",
-                    "contextInfo": {"stanzaId": "msg-100"},
-                },
-            },
-        }
-
-        mock_client_row = {"id": "client-1", "name": "Test Client", "whatsapp_instance": "test_instance"}
-        mock_supplier_row = {"id": "sup-1", "name": "Al Noor", "phone_number": "971501234567", "client_id": "client-1"}
-        mock_rfq_supplier = {
-            "id": "rs-1",
-            "rfq_id": "rfq-1",
-            "supplier_id": "sup-1",
-            "sent_message_id": "msg-100",
-            "negotiation_attempts": 2, # Validator sees 2 and allows it
-            "rfqs": {
-                "id": "rfq-1",
-                "client_id": "client-1",
-                "product_name": "LED Panel",
-                "specs": "60W",
-                "quantity": 10,
-                "status": "active",
-                "acceptable_price_min": 50.0,
-                "acceptable_price_max": 60.0,
-                "due_by": (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(),
-            },
-        }
-
-        mock_quote = {"id": "q-1", "rfq_id": "rfq-1", "supplier_id": "sup-1", "price": 68.0, "is_available": True}
-
-        with patch("db.get_client_by_instance", return_value=mock_client_row), \
-             patch("db.get_supplier_by_phone", return_value=mock_supplier_row), \
-             patch("db.get_rfq_supplier_by_sent_message_id", return_value=mock_rfq_supplier), \
-             patch("db.get_supplier_prior_quotes", return_value=[mock_quote]), \
-             patch("db.get_quote_by_id", return_value=mock_quote), \
-             patch("db.get_quotes_for_rfq", return_value=[mock_quote]), \
-             patch("db.get_competitive_pricing_context", return_value={"has_competition": True, "competing_quotes_count": 1, "best_competing_price": 55.0}), \
-             patch("db.get_negotiation_attempts", return_value=2), \
-             patch("db.increment_negotiation_attempts", return_value=-1) as mock_inc, \
-             patch("db.record_quote", return_value={"id": "q-1"}) as mock_rec, \
-             patch("db.log_message") as mock_log, \
-             patch("main.enqueue_message", new_callable=AsyncMock) as mock_enq, \
-             patch("groq_client.route_supplier_message", return_value={
-                 "tool_name": "negotiate_price",
-                 "arguments": {
-                     "rfq_id": "rfq-1",
-                     "quote_id": "q-1",
-                     "quoted_price": 68.0,
-                     "counter_price": 50.0,
-                     "negotiation_message": "Counter-offer message that should be suppressed",
-                 },
-             }):
-            resp = client.post("/webhook/whatsapp", json=payload)
-            assert resp.status_code == 200
-            assert resp.json()["status"] == "rejected_by_policy"
-            mock_inc.assert_called_once_with("rfq-1", "sup-1")
-            # Counteroffer was NOT enqueued; THANK_YOU_MSG was enqueued instead
-            mock_enq.assert_called_once()
-            assert "Counter-offer" not in mock_enq.call_args[0][1]
-            assert mock_enq.call_args[0][1] == main.THANK_YOU_MSG
 
 
 # ==============================================================================
@@ -666,4 +358,3 @@ class TestAtomicNegotiationConcurrency:
         with patch("db.increment_negotiation_attempts") as mock_inc:
             db.record_quote("rfq-1", "sup-1", 100.0)
             mock_inc.assert_not_called()
-

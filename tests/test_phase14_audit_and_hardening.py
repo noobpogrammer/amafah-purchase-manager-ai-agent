@@ -12,8 +12,6 @@ from fastapi.testclient import TestClient
 import auth
 import db
 import main
-from groq_client import AgentContext
-from policy_validator import ActionProposal, ValidationResult
 
 client = TestClient(main.app)
 
@@ -275,27 +273,6 @@ def test_webhook_claim_lifecycle_processing_completed_failed():
         # 3. Mark failed
         mock_rpc.return_value.execute.return_value = MagicMock(data=True)
         assert db.fail_webhook_message(CLIENT_UUID, "msg-rec-2", "Timeout error") is True
-
-
-def test_webhook_unhandled_failure_calls_fail_webhook():
-    """24-25: Unhandled error in webhook marks claim as failed."""
-    with patch.object(db, "get_client_by_instance", return_value={"id": CLIENT_UUID, "name": "Amafha"}), \
-         patch.object(db, "claim_webhook_message", return_value=True), \
-         patch.object(db, "get_supplier_by_phone", side_effect=RuntimeError("DB disconnect")), \
-         patch.object(db, "fail_webhook_message") as mock_fail:
-
-        resp = client.post("/webhook/whatsapp", json={
-            "event": "messages.upsert",
-            "instance": "inst_amafha",
-            "data": {
-                "key": {"id": "msg-crash-1", "remoteJid": "971501112233@s.whatsapp.net", "fromMe": False},
-                "message": {"conversation": "Quote: AED 50"},
-            }
-        })
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "error_logged"
-        mock_fail.assert_called_once()
-        assert "DB disconnect" in mock_fail.call_args[0][2]
 
 
 # ============================================================
