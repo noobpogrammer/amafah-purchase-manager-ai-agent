@@ -633,13 +633,23 @@ async def finalize_rfq_job(rfq: dict):
         if not rfq_suppliers:
             rfq_suppliers = db.get_rfq_suppliers_for_rfq(rfq_id)
 
-        msg = f"RFQ for '{prod}' is now closed as the deadline has passed. Thank you!"
+        description = prod
+        if rfq.get("specs"):
+            description += f" ({rfq['specs']})"
+        if rfq.get("quantity") is not None:
+            description += f", {rfq['quantity']} units"
+        msg = f"The quotation window for '{description}' has ended. We are no longer requesting quotes for this item. Thank you!"
         all_notifications_confirmed = True
 
         for item in rfq_suppliers:
             supplier = item.get("suppliers") or {}
             supplier_id = supplier.get("id") or item.get("supplier_id")
             phone = supplier.get("phone_number")
+            # Expiring a request for quotations must not imply cancellation of
+            # an already accepted agreement. Re-read per supplier on recovery.
+            if supplier_id and (item.get("status") == "accepted" or db.supplier_has_accepted_quote(rfq_id, supplier_id)):
+                logger.info("[Finalization] Suppressed deadline notice for accepted supplier (rfq=%s supplier=%s)", rfq_id, supplier_id)
+                continue
             if not phone and supplier_id:
                 sup_row = db.get_supplier_by_id(supplier_id)
                 if sup_row:

@@ -1207,6 +1207,14 @@ def _build_effective_quotes_from_history(rows: list[dict], include_unavailable: 
     return effective_quotes
 
 
+def supplier_has_accepted_quote(rfq_id: str, supplier_id: str) -> bool:
+    """Fresh, RFQ/supplier-specific check for deadline notices; propagate read failures."""
+    result = (supabase.table("quotes").select("id")
+              .eq("rfq_id", rfq_id).eq("supplier_id", supplier_id)
+              .eq("is_accepted", True).limit(1).execute())
+    return bool(result.data)
+
+
 def get_quotes_for_rfq(rfq_id: str, include_unavailable: bool = False) -> list:
     """
     Returns one current effective commercial offer per supplier + variant_label.

@@ -497,6 +497,7 @@ class TestReminderSystemAudit:
         with patch.object(db, "get_active_rfqs_past_deadline", return_value=[mock_expired_rfq]), \
              patch.object(db, "get_active_rfq_suppliers_with_deadlines", return_value=[]), \
              patch.object(db, "claim_rfq_for_finalization", return_value=True) as mock_claim_rfq, \
+             patch.object(db, "supplier_has_accepted_quote", return_value=False), \
              patch.object(db, "get_message_by_event_key", return_value=None), \
              patch.object(db, "log_message", return_value="msg-log-123") as mock_log, \
              patch.object(db, "get_quotes_for_rfq", return_value=mock_quotes), \
@@ -508,7 +509,7 @@ class TestReminderSystemAudit:
 
             # Verify participating suppliers were notified
             assert mock_enqueue.call_count == 2
-            assert "closed as the deadline has passed" in mock_enqueue.call_args_list[0][0][1].lower()
+            assert "quotation window" in mock_enqueue.call_args_list[0][0][1].lower()
 
             # Verify master RFQ claimed for finalization
             mock_claim_rfq.assert_called_once_with("rfq-100")

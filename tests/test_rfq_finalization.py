@@ -14,6 +14,11 @@ import main
 import db
 
 
+@pytest.fixture(autouse=True)
+def no_accepted_quote_unless_tested(monkeypatch):
+    monkeypatch.setattr(db, "supplier_has_accepted_quote", lambda *args: False)
+
+
 class TestAtomicFinalizationAuthority:
     """Tests 1-5: Atomic finalization claim authority via claim_rfq_for_finalization RPC."""
 
@@ -145,13 +150,13 @@ class TestIdempotentClosureNotifications:
                 "client-1",
                 "sup-1",
                 "outbound",
-                "RFQ for 'Steel Bars' is now closed as the deadline has passed. Thank you!",
+                "The quotation window for 'Steel Bars' has ended. We are no longer requesting quotes for this item. Thank you!",
                 related_rfq_id="rfq-clean-1",
                 event_key="rfq_closed:rfq-clean-1:sup-1",
             )
             mock_enq.assert_called_once_with(
                 "+971500000001",
-                "RFQ for 'Steel Bars' is now closed as the deadline has passed. Thank you!",
+                "The quotation window for 'Steel Bars' has ended. We are no longer requesting quotes for this item. Thank you!",
                 rfq_id="rfq-clean-1",
                 supplier_id="sup-1",
                 message_log_id="msg-log-new",
@@ -213,13 +218,13 @@ class TestIdempotentClosureNotifications:
                 "client-1",
                 "sup-2",
                 "outbound",
-                "RFQ for 'Copper Wire' is now closed as the deadline has passed. Thank you!",
+                "The quotation window for 'Copper Wire' has ended. We are no longer requesting quotes for this item. Thank you!",
                 related_rfq_id="rfq-part-notif",
                 event_key="rfq_closed:rfq-part-notif:sup-2",
             )
             mock_enq.assert_called_once_with(
                 "+971500000002",
-                "RFQ for 'Copper Wire' is now closed as the deadline has passed. Thank you!",
+                "The quotation window for 'Copper Wire' has ended. We are no longer requesting quotes for this item. Thank you!",
                 rfq_id="rfq-part-notif",
                 supplier_id="sup-2",
                 message_log_id="msg-sup-2-new",

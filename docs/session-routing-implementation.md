@@ -44,3 +44,7 @@ The wrapper persists instruction jobs on /data, uses exclusive per-job execution
 The quote RPC migration fixes partial-index inference in ON CONFLICT and persists quantity. Quote saving now fails closed on RPC errors rather than performing lossy direct inserts. General post-save guidance asks the main AI to continue negotiation when appropriate, while preserving final-offer escalation and buying-authority checks.
 
 Deployment: wrapper first, then backend and frontend. Migration 20261107110757 was applied via CLI db push using a temporary remote-history-aligned deployment directory after a dry-run confirmed it was the only pending migration. Historical remote migration records were not edited or replayed. Live transactional tests verified quantity and duplicate-source upserts, then rolled back.
+
+## Accepted suppliers and deadline notices
+
+RFQ finalization reads accepted quote state separately for each RFQ/supplier and skips expiry notices for accepted suppliers. Acceptance remains intact when the quotation window ends. Other recipients receive a quotation-window notice identifying product, specifications and quantity. Read failures stop notification creation and leave finalization recoverable.
