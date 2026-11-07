@@ -13,8 +13,8 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
   const [showCustomConfig, setShowCustomConfig] = useState({});
   const [customFormState, setCustomFormState] = useState({});
 
-  const loadFlags = async () => {
-    setLoading(true);
+  const loadFlags = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const data = await fetchFlags();
       setFlags(data || []);
@@ -29,6 +29,13 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
   useEffect(() => {
     loadFlags();
   }, []);
+
+  const hasProcessingInstructions = flags.some(f => f.status === 'processing');
+  useEffect(() => {
+    if (!hasProcessingInstructions) return;
+    const timer = setInterval(() => loadFlags(true), 5000);
+    return () => clearInterval(timer);
+  }, [hasProcessingInstructions]);
 
   const handleResolve = async (flagId) => {
     setResolvingId(flagId);
@@ -55,7 +62,12 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
       await loadFlags();
     } catch (err) {
       console.error(err);
-      alert('Error sending human response: ' + err.message);
+      if (!err.status) {
+        await loadFlags(true);
+        alert('The instruction status could not be confirmed. Check the processing status before retrying.');
+      } else {
+        alert('Instruction request: ' + err.message);
+      }
     } finally {
       setResolvingId(null);
     }
@@ -144,7 +156,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
     }
   };
 
-  const pendingFlags = flags.filter((f) => f.status === 'pending');
+  const pendingFlags = flags.filter((f) => f.status === 'pending' || f.status === 'processing');
   const resolvedFlags = flags.filter((f) => f.status === 'resolved');
 
   return (
@@ -184,6 +196,9 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                   const suppName = flag.suppliers?.name || 'Supplier';
                   const phone = flag.suppliers?.phone_number || '';
                   const product = flag.rfqs?.product_name || '';
+                  const processing = flag.status === 'processing';
+                  const instructionJob = flag.metadata?.operator_instruction;
+                  const instructionState = instructionJob?.state || 'processing';
 
                   const isTradeoff = flag.category === 'negotiation_tradeoff_authorization' || flag.metadata?.type === 'negotiation_tradeoff_authorization';
                   const isFinalQuote = flag.category === 'supplier_final_quote_decision' || flag.metadata?.type === 'supplier_final_quote_decision';
@@ -243,7 +258,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               type="button"
                               className="btn btn-primary btn-sm"
                               onClick={() => handleFinalQuoteDecision(flag, 'keep_for_evaluation')}
-                              disabled={resolvingId === flag.id}
+                              disabled={resolvingId === flag.id || processing}
                             >
                               <Check size={14} />
                               Keep Quote for Evaluation
@@ -253,7 +268,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               type="button"
                               className="btn btn-sm tradeoff-btn-secondary"
                               onClick={() => handleFinalQuoteDecision(flag, 'end_supplier')}
-                              disabled={resolvingId === flag.id}
+                              disabled={resolvingId === flag.id || processing}
                             >
                               <XCircle size={14} style={{ color: '#dc2626' }} />
                               End Negotiation With Supplier
@@ -310,7 +325,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               type="button"
                               className="btn btn-primary btn-sm"
                               onClick={() => handleTradeoffDecision(flag, 'approve')}
-                              disabled={resolvingId === flag.id}
+                              disabled={resolvingId === flag.id || processing}
                             >
                               <ShieldCheck size={14} />
                               <span>
@@ -326,7 +341,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               type="button"
                               className="btn btn-sm tradeoff-btn-secondary"
                               onClick={() => handleTradeoffDecision(flag, 'reject')}
-                              disabled={resolvingId === flag.id}
+                              disabled={resolvingId === flag.id || processing}
                             >
                               <XCircle size={14} style={{ color: '#dc2626' }} />
                               <span>
@@ -342,7 +357,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               type="button"
                               className={`btn btn-sm tradeoff-btn-custom-toggle ${isCustomOpen ? 'active' : ''}`}
                               onClick={() => setShowCustomConfig((prev) => ({ ...prev, [flag.id]: !prev[flag.id] }))}
-                              disabled={resolvingId === flag.id}
+                              disabled={resolvingId === flag.id || processing}
                             >
                               <Sliders size={14} style={{ color: '#4338ca' }} />
                               <span>{isCustomOpen ? 'Hide Custom Range' : 'Set Custom Range'}</span>
@@ -449,11 +464,13 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                       <div className={isTradeoff ? 'human-response-section tradeoff-response-section' : 'human-response-section'} style={{ marginTop: '0.85rem', paddingTop: '0.85rem' }}>
                         <label className={isTradeoff ? 'tradeoff-label' : 'form-label flex-items'} style={{ marginBottom: '0.4rem' }}>
                           <FileText size={14} /> <strong>Agent Instruction / Guidance:</strong>
+                          {processing && <span role="status"> — {instructionState === 'queued' ? 'Queued for AI' : instructionState === 'running' ? 'AI is processing' : instructionState === 'completed' ? 'Completed; updating review item' : instructionState === 'unknown' ? 'Outcome uncertain — check the conversation before sending anything again' : instructionState === 'failed' ? 'Needs attention: instruction could not proceed' : 'Processing'}</span>}
                         </label>
                         <textarea
                           className={`input-field textarea-input ${isTradeoff ? 'tradeoff-textarea' : ''}`}
                           placeholder="Type instruction for AI agent to execute (e.g., 'We accept 50% advance against PI', 'Offer 48 AED')..."
                           rows={2}
+                          disabled={processing}
                           value={responseTexts[flag.id] || ''}
                           onChange={(e) => setResponseTexts({ ...responseTexts, [flag.id]: e.target.value })}
                         />
@@ -471,18 +488,18 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                             <button
                               className={`btn btn-sm ${isTradeoff ? 'tradeoff-btn-secondary' : 'btn-secondary'}`}
                               onClick={() => handleResolve(flag.id)}
-                              disabled={resolvingId === flag.id}
+                              disabled={resolvingId === flag.id || (processing && !['unknown', 'failed'].includes(instructionState))}
                             >
                               <Check size={14} style={isTradeoff ? { color: '#059669' } : {}} />
-                              <span>{resolvingId === flag.id ? 'Resolving...' : 'Mark Resolved'}</span>
+                              <span>{resolvingId === flag.id ? 'Resolving...' : (processing ? 'Mark Reviewed — Do Not Resend' : 'Mark Resolved')}</span>
                             </button>
                             <button
                               className="btn btn-primary btn-sm"
                               onClick={() => handleRespond(flag.id)}
-                              disabled={resolvingId === flag.id || !(responseTexts[flag.id] || '').trim()}
+                              disabled={resolvingId === flag.id || processing || !(responseTexts[flag.id] || '').trim()}
                             >
                               <Send size={14} />
-                              <span>{resolvingId === flag.id ? 'Processing...' : 'Send Instruction & Resolve'}</span>
+                              <span>{resolvingId === flag.id ? 'Processing...' : 'Queue Instruction & Resolve When Complete'}</span>
                             </button>
                           </div>
                         </div>

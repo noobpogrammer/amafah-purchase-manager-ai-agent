@@ -4,6 +4,7 @@ OpenClaw owns supplier-facing WhatsApp transport and conversational orchestratio
 FastAPI owns procurement state, policy, persistence, scheduling, and operator APIs.
 """
 
+import operator_jobs
 import asyncio
 import csv
 import io
@@ -109,38 +110,6 @@ def send_via_openclaw_whatsapp(phone_number: str, message: str) -> dict:
     payload = response.json()
     if not payload.get("ok"):
         raise RuntimeError(payload.get("error") or "OpenClaw WhatsApp send failed")
-    return payload
-
-
-def send_operator_instruction_to_openclaw(
-    phone_number: str,
-    instruction: str,
-    *,
-    flag_id: str,
-    rfq_id: Optional[str] = None,
-    reason: Optional[str] = None,
-) -> dict:
-    """Resume the supplier's existing OpenClaw WhatsApp session with trusted operator guidance."""
-    if not OPENCLAW_BASE_URL:
-        raise RuntimeError("OPENCLAW_BASE_URL is not configured")
-    if not OPENCLAW_TOOL_API_KEY:
-        raise RuntimeError("OPENCLAW_TOOL_API_KEY is not configured")
-    response = requests.post(
-        f"{OPENCLAW_BASE_URL}/internal/procurement/operator-instruction",
-        headers={"Content-Type": "application/json", "X-OpenClaw-Key": OPENCLAW_TOOL_API_KEY},
-        json={
-            "phone_number": phone_number,
-            "instruction": instruction,
-            "flag_id": flag_id,
-            "rfq_id": rfq_id,
-            "reason": reason,
-        },
-        timeout=120,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not payload.get("ok"):
-        raise RuntimeError(payload.get("error") or "OpenClaw operator instruction failed")
     return payload
 
 
@@ -973,6 +942,11 @@ async def lifespan(app: FastAPI):
         id="check_deadlines_and_reminders",
         replace_existing=True,
     )
+    scheduler.add_job(
+        operator_jobs.sync_jobs, "interval", seconds=10,
+        args=[OPENCLAW_BASE_URL, OPENCLAW_TOOL_API_KEY],
+        max_instances=1, coalesce=True, id="operator_instructions", replace_existing=True,
+    )
     scheduler.start()
     yield
     print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Shutting down RFQ scheduler...")
@@ -1562,6 +1536,11 @@ async def resolve_flag_endpoint(flag_id: str, current_user=Depends(get_current_u
     if not client_id:
         raise HTTPException(status_code=401, detail="Authentication missing client_id")
 
+    existing = db.get_flag_by_id(flag_id, client_id=client_id)
+    if existing and existing.get("status") == "processing":
+        job = (existing.get("metadata") or {}).get("operator_instruction") or {}
+        if job and job.get("state") not in {"unknown", "failed"}:
+            raise HTTPException(status_code=409, detail="Instruction is still processing; check its status before resolving.")
     result = db.resolve_flag(flag_id, client_id=client_id)
     if not result:
         raise HTTPException(status_code=404, detail="Flagged item not found")
@@ -1643,6 +1622,13 @@ async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, cu
     if not client_id:
         raise HTTPException(status_code=401, detail="Authentication missing client_id")
 
+    if not payload.send_to_supplier or (payload.response or "").strip().casefold() in {
+        "ignore", "ignore this message", "dismiss", "dismiss this", "no action", "no action needed", "do not respond",
+    }:
+        existing = db.get_flag_by_id(flag_id, client_id=client_id)
+        if existing and existing.get("status") == "processing" and (existing.get("metadata") or {}).get("operator_instruction"):
+            raise HTTPException(status_code=409, detail="An instruction is already processing; resolving cannot cancel it.")
+
     # An explicit Ignore/Dismiss is an internal operator decision, not a
     # supplier-facing instruction. Never invoke an LLM or WhatsApp for it.
     normalized_action = (payload.response or "").strip().casefold()
@@ -1665,39 +1651,36 @@ async def respond_to_flag_endpoint(flag_id: str, payload: FlagRespondRequest, cu
                 raise HTTPException(status_code=404, detail="Flagged item not found")
         return {"status": "resolved", "flag_id": flag_id, "sent_to_supplier": False}
 
-    flag = db.claim_flag_for_operator_action(flag_id, client_id)
+    flag = db.get_flag_by_id(flag_id, client_id=client_id)
     if not flag:
-        existing = db.get_flag_by_id(flag_id, client_id=client_id)
-        if not existing:
-            raise HTTPException(status_code=404, detail="Flagged item not found")
-        return JSONResponse(status_code=409, content={"status": "conflict", "detail": f"Flag is already {existing.get('status')}"})
-
+        raise HTTPException(status_code=404, detail="Flagged item not found")
+    expected_job_id = operator_jobs.job_id(client_id, flag_id, payload.response)
+    existing_job = (flag.get("metadata") or {}).get("operator_instruction") or {}
+    if existing_job.get("id") == expected_job_id:
+        return JSONResponse(status_code=200 if flag.get("status") == "resolved" else 202, content={
+            "status": flag.get("status"), "flag_id": flag_id, "instruction_status": existing_job.get("state"),
+            "job_id": expected_job_id, "sent_to_supplier": False,
+        })
+    if flag.get("status") != "pending":
+        raise HTTPException(status_code=409, detail=f"Flag is already {flag.get('status')}")
     supplier = flag.get("suppliers") or db.get_supplier_by_id(flag.get("supplier_id"))
-    phone = supplier.get("phone_number") if supplier else None
-    if not supplier or not phone:
-        db.release_flag_claim(flag_id, client_id)
+    if not supplier or not supplier.get("phone_number"):
         raise HTTPException(status_code=400, detail="Supplier phone is unavailable for this flag")
-
     try:
-        result = await run_in_threadpool(
-            send_operator_instruction_to_openclaw,
-            phone,
-            payload.response,
-            flag_id=flag_id,
-            rfq_id=flag.get("rfq_id"),
-            reason=flag.get("reason"),
-        )
-        db.complete_flag_operator_action(flag_id, client_id, payload.response)
-        return {
-            "status": "resolved",
-            "flag_id": flag_id,
-            "sent_to_supplier": True,
-            "openclaw": {"session_key": result.get("session_key"), "phone_number": result.get("phone_number")},
-        }
-    except Exception as exc:
-        logger.exception("OpenClaw operator instruction failed for flag %s", flag_id)
-        db.release_flag_claim(flag_id, client_id)
-        raise HTTPException(status_code=502, detail=f"Failed to continue supplier session in OpenClaw: {exc}")
+        job = operator_jobs.enqueue(flag, payload.response)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Instruction was not queued; please retry.")
+    if not job:
+        # A concurrent submit may have won. Re-read without releasing its claim.
+        current = db.get_flag_by_id(flag_id, client_id=client_id) or {}
+        current_job = (current.get("metadata") or {}).get("operator_instruction") or {}
+        if current_job.get("id") != expected_job_id:
+            raise HTTPException(status_code=409, detail="Another instruction is already processing")
+        job = current_job
+    return JSONResponse(status_code=202, content={
+        "status": "processing", "flag_id": flag_id, "instruction_status": job["state"],
+        "job_id": job["id"], "sent_to_supplier": False,
+    })
 
 
 class NegotiationAuthorizationRequest(BaseModel):

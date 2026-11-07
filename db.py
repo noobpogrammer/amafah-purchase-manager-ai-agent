@@ -558,38 +558,9 @@ def record_quotes_batch(rfq_id: str, supplier_id: str, variants: list[dict],
     except Exception as e:
         logger.warning(f"record_quote_variants RPC error: {e}")
 
-    # Fallback to direct batch insert
-    try:
-        rows_to_insert = []
-        has_available_priced_variant = False
-        for v in variants:
-            price = v.get("price")
-            avail = v.get("is_available", True)
-            if avail and price is not None and float(price) > 0:
-                has_available_priced_variant = True
-            rows_to_insert.append({
-                "rfq_id": rfq_id,
-                "supplier_id": supplier_id,
-                "quote_group_id": group_id,
-                "variant_label": v.get("variant_label"),
-                "price": price,
-                "delivery_time": v.get("delivery_time"),
-                "quality_notes": v.get("quality_notes"),
-                "raw_message": raw_message,
-                "confidence": confidence or "high",
-                "is_available": avail,
-                "source_message_id": source_message_id,
-            })
-
-        insert_res = supabase.table("quotes").insert(rows_to_insert).execute()
-        if insert_res.data and has_available_priced_variant:
-            supabase.table("rfq_suppliers").update({"status": "responded"}).eq(
-                "rfq_id", rfq_id
-            ).eq("supplier_id", supplier_id).execute()
-        return insert_res.data or []
-    except Exception as e:
-        logger.error(f"Fallback record_quotes_batch error: {e}")
-        return []
+    # Quotation persistence is atomic and database-authoritative. Do not bypass
+    # RPC failures with a less strict direct insert that can lose fields/state.
+    return []
 
 
 def record_quote(rfq_id: str, supplier_id: str, price: float = None,

@@ -358,7 +358,9 @@ export async function respondToFlag(flagId, responseText, sendToSupplier = true)
   });
   if (!response.ok) {
     const errData = await response.json().catch(() => ({}));
-    throw new Error(errData.detail || 'Failed to respond to flag');
+    const error = new Error(errData.detail || 'Instruction request could not be accepted');
+    error.status = response.status;
+    throw error;
   }
   return await response.json();
 }

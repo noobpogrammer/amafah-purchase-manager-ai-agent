@@ -53,58 +53,29 @@ class TestMultiVariantDatabaseAndBatchSemantics:
     """Database batch recording, effective retrieval, quote groups, and revision logic."""
 
     def test_3_same_quote_group_id_for_batch(self):
-        """3. All variants recorded in one batch receive the exact same quote_group_id."""
-        inserted_rows = []
-        mock_supabase = MagicMock()
-        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{"id": "rfq-1", "status": "active"}]
-
-        def mock_insert(rows):
-            nonlocal inserted_rows
-            inserted_rows = rows
-            res_mock = MagicMock()
-            res_mock.data = rows
-            return res_mock
-
-        mock_supabase.table.return_value.insert = mock_insert
-        # Mock RPC raising error so it exercises the atomic batch logic
-        mock_supabase.rpc.side_effect = Exception("RPC simulated offline")
-
-        with patch.object(db, "supabase", mock_supabase), \
-             patch("db.is_rfq_open", return_value=True):
-            variants = [
-                {"variant_label": "India", "price": 45.0},
-                {"variant_label": "China", "price": 38.0},
-            ]
-            res = db.record_quotes_batch("rfq-1", "supp-1", variants, raw_message="India 45, China 38")
-            assert len(inserted_rows) == 2
-            group_1 = inserted_rows[0]["quote_group_id"]
-            group_2 = inserted_rows[1]["quote_group_id"]
-            assert group_1 is not None
-            assert group_1 == group_2
-            assert uuid.UUID(group_1)  # valid UUID
+        mock = MagicMock()
+        mock.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{"id":"rfq-1","status":"active"}]
+        captured=[]
+        def rpc(name,payload):
+            captured.append(payload)
+            rows=[{**v,"quote_group_id":payload["p_quote_group_id"]} for v in payload["p_variants"]]
+            result=MagicMock();result.execute.return_value.data=rows;return result
+        mock.rpc.side_effect=rpc
+        with patch.object(db,"supabase",mock),patch("db.is_rfq_open",return_value=True):
+            rows=db.record_quotes_batch("rfq-1","supplier",[{"price":45},{"price":38}])
+        assert len(rows)==2
+        assert rows[0]["quote_group_id"]==rows[1]["quote_group_id"]
+        mock.table.return_value.insert.assert_not_called()
 
     def test_4_different_messages_get_different_group_ids(self):
-        """4. Sequential batch calls generate distinct quote_group_ids."""
-        captured_groups = []
-        mock_supabase = MagicMock()
-        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{"id": "rfq-1", "status": "active"}]
-
-        def mock_insert(rows):
-            captured_groups.append(rows[0]["quote_group_id"])
-            res_mock = MagicMock()
-            res_mock.data = rows
-            return res_mock
-
-        mock_supabase.table.return_value.insert = mock_insert
-        mock_supabase.rpc.side_effect = Exception("RPC simulated offline")
-
-        with patch.object(db, "supabase", mock_supabase), \
-             patch("db.is_rfq_open", return_value=True):
-            db.record_quotes_batch("rfq-1", "supp-1", [{"variant_label": "A", "price": 10.0}])
-            db.record_quotes_batch("rfq-1", "supp-1", [{"variant_label": "B", "price": 20.0}])
-
-            assert len(captured_groups) == 2
-            assert captured_groups[0] != captured_groups[1]
+        mock=MagicMock()
+        mock.table.return_value.select.return_value.eq.return_value.execute.return_value.data=[{"id":"rfq-1","status":"active"}]
+        mock.rpc.return_value.execute.return_value.data=[{"id":"quote"}]
+        with patch.object(db,"supabase",mock),patch("db.is_rfq_open",return_value=True):
+            db.record_quotes_batch("rfq-1","supplier",[{"price":10}])
+            db.record_quotes_batch("rfq-1","supplier",[{"price":20}])
+        groups=[c.args[1]["p_quote_group_id"] for c in mock.rpc.call_args_list]
+        assert len(groups)==2 and groups[0]!=groups[1]
 
     def test_8_and_9_revision_semantics_unrevised_variant_remains_effective(self):
         """8 & 9. Revising only India from 3.0 to 2.8 leaves China 2.5 effective."""
@@ -176,27 +147,14 @@ class TestMultiVariantDatabaseAndBatchSemantics:
             assert labels["China"] is False
             assert labels["India"] is True
 
-    def test_20_supplier_status_becomes_responded(self):
-        """20. When at least one valid priced variant is recorded, rfq_suppliers.status becomes 'responded'."""
-        updated_status = {}
-        mock_supabase = MagicMock()
-        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{"id": "rfq-1", "status": "active"}]
-
-        def mock_update(payload):
-            nonlocal updated_status
-            updated_status = payload
-            mock_builder = MagicMock()
-            mock_builder.eq.return_value.eq.return_value.execute.return_value.data = [{}]
-            return mock_builder
-
-        mock_supabase.table.return_value.update = mock_update
-        mock_supabase.table.return_value.insert.return_value.execute.return_value.data = [{"id": "q1"}]
-        mock_supabase.rpc.side_effect = Exception("RPC offline")
-
-        with patch.object(db, "supabase", mock_supabase), \
-             patch("db.is_rfq_open", return_value=True):
-            db.record_quotes_batch("rfq-1", "supp-1", [{"variant_label": "India", "price": 45.0, "is_available": True}])
-            assert updated_status.get("status") == "responded"
+    def test_20_rpc_failure_never_bypasses_atomic_persistence(self):
+        mock=MagicMock()
+        mock.table.return_value.select.return_value.eq.return_value.execute.return_value.data=[{"id":"rfq-1","status":"active"}]
+        mock.rpc.side_effect=RuntimeError("RPC failure")
+        with patch.object(db,"supabase",mock),patch("db.is_rfq_open",return_value=True):
+            assert db.record_quotes_batch("rfq-1","supplier",[{"price":45}])==[]
+        mock.table.return_value.insert.assert_not_called()
+        mock.table.return_value.update.assert_not_called()
 
     def test_22_and_23_batch_failure_does_not_partially_insert_or_update_status(self):
         """22 & 23. If RFQ is closed, record_quotes_batch fails closed (returns empty, no insert, no status update)."""
@@ -210,33 +168,15 @@ class TestMultiVariantDatabaseAndBatchSemantics:
             mock_supabase.table.return_value.insert.assert_not_called()
             mock_supabase.table.return_value.update.assert_not_called()
 
-    def test_27_source_message_id_persisted(self):
-        """27. source_message_id is attached to all variants in the batch."""
-        inserted_rows = []
-        mock_supabase = MagicMock()
-        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{"id": "rfq-1", "status": "active"}]
-
-        def mock_insert(rows):
-            nonlocal inserted_rows
-            inserted_rows = rows
-            res_mock = MagicMock()
-            res_mock.data = rows
-            return res_mock
-
-        mock_supabase.table.return_value.insert = mock_insert
-        mock_supabase.rpc.side_effect = Exception("RPC offline")
-
-        with patch.object(db, "supabase", mock_supabase), \
-             patch("db.is_rfq_open", return_value=True):
-            db.record_quotes_batch(
-                "rfq-1",
-                "supp-1",
-                [{"variant_label": "India", "price": 45.0}, {"variant_label": "China", "price": 38.0}],
-                source_message_id="msg-inbound-123"
-            )
-            assert len(inserted_rows) == 2
-            assert inserted_rows[0]["source_message_id"] == "msg-inbound-123"
-            assert inserted_rows[1]["source_message_id"] == "msg-inbound-123"
+    def test_27_source_message_id_and_quantity_reach_atomic_persistence(self):
+        mock=MagicMock()
+        mock.table.return_value.select.return_value.eq.return_value.execute.return_value.data=[{"id":"rfq-1","status":"active"}]
+        mock.rpc.return_value.execute.return_value.data=[{"id":"quote"}]
+        with patch.object(db,"supabase",mock),patch("db.is_rfq_open",return_value=True):
+            db.record_quotes_batch("rfq-1","supplier",[{"price":28,"quantity":10}],source_message_id="11111111-1111-4111-8111-111111111111")
+        payload=mock.rpc.call_args.args[1]
+        assert payload["p_source_message_id"]=="11111111-1111-4111-8111-111111111111"
+        assert payload["p_variants"][0]["quantity"]==10
 
 
 class TestMultiVariantExecutionAndIntegration:
@@ -244,23 +184,10 @@ class TestMultiVariantExecutionAndIntegration:
 
 
     def test_21_master_rfq_remains_active_after_quote(self):
-        """21. Recording quote variants leaves master rfqs.status active until finalization."""
-        mock_rfq = {"id": "rfq-1", "status": "active", "deadline_hours": 24}
-        mock_supabase = MagicMock()
-        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [mock_rfq]
-        mock_supabase.table.return_value.insert.return_value.execute.return_value.data = [{"id": "q1"}]
-        mock_supabase.rpc.side_effect = Exception("RPC offline")
-
-        with patch.object(db, "supabase", mock_supabase), \
-             patch("db.is_rfq_open", return_value=True):
-            db.record_quotes_batch("rfq-1", "s-1", [{"variant_label": "India", "price": 45.0}])
-            # rfqs table update should NEVER be called by record_quotes_batch
-            # Only rfq_suppliers is updated
-            called_tables = [c[0][0] for c in mock_supabase.table.call_args_list if len(c[0]) > 0]
-            # Verify 'rfq_suppliers' updated, 'rfqs' never updated
-            assert "rfq_suppliers" in called_tables
-            update_calls_on_rfq = [
-                c for c in mock_supabase.table.mock_calls
-                if "rfqs" in str(c) and "update" in str(c)
-            ]
-            assert len(update_calls_on_rfq) == 0
+        mock=MagicMock()
+        mock.table.return_value.select.return_value.eq.return_value.execute.return_value.data=[{"id":"rfq-1","status":"active"}]
+        mock.rpc.return_value.execute.return_value.data=[{"id":"quote"}]
+        with patch.object(db,"supabase",mock),patch("db.is_rfq_open",return_value=True):
+            assert db.record_quotes_batch("rfq-1","supplier",[{"price":45}])==[{"id":"quote"}]
+        mock.table.return_value.update.assert_not_called()
+        assert mock.rpc.call_args.args[0]=="record_quote_variants"

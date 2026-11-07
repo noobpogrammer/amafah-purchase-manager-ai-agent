@@ -34,3 +34,13 @@ A controlled live follow-up still needs to verify actual session-history availab
 ## Native message ID persistence fix
 
 Supplier quote saving resolves a native WhatsApp message ID to a tenant/supplier-scoped inbound `message_log` UUID before calling quote persistence. Native IDs stay in the text `external_message_id` column. The adapter reuses existing inbound records, rejects ambiguous or mismatched sources, and uses a stable event key for insert retries. Quotation and unavailable-state paths use the same adapter. No schema or buying-authority rules changed.
+
+## Durable operator instruction workflow
+
+Review responses enqueue a stable instruction ID in the existing tenant-scoped flag metadata with a single pending-to-processing update. The API returns 202 queued rather than waiting for model completion. A background worker reconciles wrapper receipts; only completed processing resolves the flag. The frontend shows queued/running/uncertain states and polls while processing. No field claims successful WhatsApp delivery merely because processing was accepted.
+
+The wrapper persists instruction jobs on /data, uses exclusive per-job execution locks, and resumes queued jobs after restart. Requests with the same ID and payload reuse the receipt; changed payloads with the same ID are rejected. Uncertain executions are never blindly replayed. An operator must check the conversation before taking further action on an uncertain job. Unknown/failed jobs can be marked reviewed without resending; queued/running jobs cannot be dismissed as though cancellation had succeeded.
+
+The quote RPC migration fixes partial-index inference in ON CONFLICT and persists quantity. Quote saving now fails closed on RPC errors rather than performing lossy direct inserts. General post-save guidance asks the main AI to continue negotiation when appropriate, while preserving final-offer escalation and buying-authority checks.
+
+Deployment: wrapper first, then backend and frontend. Migration 20261107110757 was applied via CLI db push using a temporary remote-history-aligned deployment directory after a dry-run confirmed it was the only pending migration. Historical remote migration records were not edited or replayed. Live transactional tests verified quantity and duplicate-source upserts, then rolled back.

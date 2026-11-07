@@ -1932,7 +1932,13 @@ def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header
     )
     if not rows:
         raise HTTPException(status_code=409, detail="Quote was not recorded.")
-    return {"recorded": True, "quotes": rows}
+    return {"recorded": True, "quotes": rows, "workflow": {
+        "next_action": "evaluate_negotiation",
+        "guidance": "Saving is not the end of handling. Compare each saved offer with current RFQ terms. "
+                    "For a negotiable offer above authority, seek a better offer; being above budget alone "
+                    "does not require human review. Preserve conditions and review proposed commercial actions. "
+                    "A final offer outside authority, missing buying authority or unresolved conditions may require human review.",
+    }}
 
 
 @router.post("/mark-unavailable")
