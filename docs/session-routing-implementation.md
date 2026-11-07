@@ -30,3 +30,7 @@ Rollback only this change's hunks; do not reset either repository or discard the
 Offline tests use mocked database and WhatsApp requests. They cover normalized and duplicate phone numbers (including later pages), tenant isolation, inactive/deleted supplier lookups, optional history recovery, short-reply activation, pause/greeting/no-context cases, per-product tool payloads, mapping-tool availability, denied delivery and analysis tool isolation. Existing route tests also exercise invitation ambiguity.
 
 A controlled live follow-up still needs to verify actual session-history availability, product interpretation, conditional agreement, sent recipients and saved terms, along with before/after whole-turn token usage. No token reduction or live semantic accuracy is claimed from offline tests.
+
+## Native message ID persistence fix
+
+Supplier quote saving resolves a native WhatsApp message ID to a tenant/supplier-scoped inbound `message_log` UUID before calling quote persistence. Native IDs stay in the text `external_message_id` column. The adapter reuses existing inbound records, rejects ambiguous or mismatched sources, and uses a stable event key for insert retries. Quotation and unavailable-state paths use the same adapter. No schema or buying-authority rules changed.

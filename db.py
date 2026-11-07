@@ -1071,7 +1071,7 @@ def get_rfq_suppliers_for_rfq(rfq_id: str) -> list[dict]:
 
 def log_message(client_id: str, supplier_id: str, direction: str,
                  body: str, related_rfq_id: str = None, status: str = None,
-                 event_key: str = None) -> str:
+                 event_key: str = None, external_message_id: str = None) -> str:
     """
     Logs an inbound or outbound message in message_log and returns the inserted row ID.
     If event_key is provided and already exists, returns the existing row ID (idempotency).
@@ -1094,6 +1094,9 @@ def log_message(client_id: str, supplier_id: str, direction: str,
         payload["status"] = status
     elif direction == "outbound":
         payload["status"] = "queued"
+
+    if external_message_id is not None:
+        payload["external_message_id"] = external_message_id
 
     if event_key is not None:
         payload["event_key"] = event_key

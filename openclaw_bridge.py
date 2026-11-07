@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import re
+from uuid import UUID
 from typing import Optional, List, Dict, Any, Literal
 
 from fastapi import APIRouter, Header, HTTPException
@@ -1865,6 +1866,46 @@ def record_multi_item_quotes(req: RecordMultiItemQuotesRequest, x_openclaw_key: 
     return saved.data
 
 
+
+def _resolve_quote_source(client_id: str, supplier_id: str, source_id: Optional[str],
+                          raw_message: Optional[str]) -> Optional[str]:
+    """Translate a channel message ID into a scoped inbound message_log UUID.
+
+    Native WhatsApp IDs are text, not UUIDs. Preserve both identifiers rather
+    than passing the native ID to quote RPC UUID parameters or dropping it.
+    """
+    if not source_id:
+        return None
+    source_id = source_id.strip()
+    try:
+        internal_id = str(UUID(source_id))
+    except ValueError:
+        internal_id = None
+    query = (db.supabase.table("message_log").select("id,body")
+             .eq("client_id", client_id).eq("supplier_id", supplier_id)
+             .eq("direction", "inbound"))
+    result = query.eq("id" if internal_id else "external_message_id", internal_id or source_id).limit(2).execute()
+    matches = result.data or []
+    if len(matches) > 1:
+        raise HTTPException(status_code=409, detail="Source message ID has multiple inbound records.")
+    if matches:
+        if raw_message and matches[0].get("body", "").strip() != raw_message.strip():
+            raise HTTPException(status_code=409, detail="Source message content does not match the saved inbound message.")
+        return str(UUID(matches[0]["id"]))
+    if internal_id:
+        raise HTTPException(status_code=422, detail="Source UUID must identify this supplier's saved inbound message.")
+    if not raw_message or not raw_message.strip():
+        raise HTTPException(status_code=422, detail="raw_message is required to persist a native channel message ID.")
+    message_id = db.log_message(
+        client_id=client_id, supplier_id=supplier_id, direction="inbound", body=raw_message,
+        event_key=f"openclaw:inbound:{client_id}:{supplier_id}:{source_id}",
+        external_message_id=source_id,
+    )
+    if not message_id:
+        raise HTTPException(status_code=503, detail="Could not persist the inbound source message; quotation was not saved.")
+    return str(UUID(message_id))
+
+
 @router.post("/record-quote")
 def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header(default=None)):
     _require_openclaw_key(x_openclaw_key)
@@ -1885,7 +1926,7 @@ def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header
         supplier_id=req.supplier_id,
         variants=variants,
         raw_message=req.raw_message,
-        source_message_id=req.source_message_id,
+        source_message_id=_resolve_quote_source(req.client_id, req.supplier_id, req.source_message_id, req.raw_message),
         confidence=req.confidence,
         allow_post_deadline=allow_post_deadline,
     )
@@ -1908,7 +1949,7 @@ def mark_unavailable(req: MarkUnavailableRequest, x_openclaw_key: Optional[str] 
         raw_message=req.raw_message,
         confidence="high",
         is_available=False,
-        source_message_id=req.source_message_id,
+        source_message_id=_resolve_quote_source(req.client_id, req.supplier_id, req.source_message_id, req.raw_message),
     )
     if not row:
         raise HTTPException(status_code=409, detail="Unavailable state was not recorded.")

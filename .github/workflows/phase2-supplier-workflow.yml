@@ -44,7 +44,7 @@ jobs:
         env:
           SUPABASE_URL: https://localhost.supabase.co
           SUPABASE_SERVICE_ROLE_KEY: phase2-ci-placeholder
-        run: python -m pytest -q tests/test_session_context_security.py tests/test_activation_policy.py tests/test_openclaw_analysis.py
+        run: python -m pytest -q tests/test_session_context_security.py tests/test_activation_policy.py tests/test_openclaw_analysis.py tests/test_quote_source_identity.py
       - name: Set up Node for frontend build
         uses: actions/setup-node@v4
         with:
