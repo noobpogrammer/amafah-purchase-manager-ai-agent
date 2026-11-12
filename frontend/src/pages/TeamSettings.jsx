@@ -139,7 +139,7 @@ export default function TeamSettings({ navigate }) {
 
         {latestInviteLink && (
           <div style={{ marginTop: '1.25rem', padding: '1rem', background: 'rgba(255,255,255,0.03)', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)' }}>
-            <label className="form-label flex-items" style={{ marginBottom: '0.5rem', color: '#10b981' }}>
+            <label className="form-label flex-items" style={{ marginBottom: '0.5rem', color: 'var(--success)' }}>
               <LinkIcon size={16} /> Shareable Invite Link:
             </label>
             <div className="invite-link-row">

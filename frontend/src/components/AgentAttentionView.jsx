@@ -128,7 +128,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
       return (
         <span
           className="badge badge-flag business"
-          style={{ background: '#0f766e', color: '#ffffff', fontWeight: 600, padding: '4px 10px', borderRadius: '6px', fontSize: '0.75rem' }}
+          style={{ background: 'var(--success)', color: '#ffffff', fontWeight: 600, padding: '4px 10px', borderRadius: '6px', fontSize: '0.75rem' }}
         >
           Final Quote Decision
         </span>
@@ -138,7 +138,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
       return (
         <span 
           className="badge badge-flag business tradeoff-badge" 
-          style={{ background: '#4338ca', color: '#ffffff', fontWeight: 600, padding: '4px 10px', borderRadius: '6px', fontSize: '0.75rem' }}
+          style={{ background: 'var(--primary)', color: '#ffffff', fontWeight: 600, padding: '4px 10px', borderRadius: '6px', fontSize: '0.75rem' }}
         >
           Trade-Off Authorization Required
         </span>
@@ -213,7 +213,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                           <strong className={isTradeoff ? 'tradeoff-supplier-name' : ''}>{suppName}</strong>
                           {phone && (
                             <span className={isTradeoff ? 'tradeoff-phone' : 'phone-sub'}>
-                              <Phone size={12} style={isTradeoff ? { color: '#64748b' } : {}} /> {phone}
+                              <Phone size={12} style={isTradeoff ? { color: 'var(--text-muted)' } : {}} /> {phone}
                             </span>
                           )}
                           {product && (
@@ -226,9 +226,9 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                       </div>
 
                       {isFinalQuote && (
-                        <div className="tradeoff-proposal-box" style={{ borderColor: '#0f766e' }}>
+                        <div className="tradeoff-proposal-box" style={{ borderColor: 'var(--success)' }}>
                           <div className="tradeoff-proposal-title">
-                            <ShieldCheck size={18} style={{ color: '#0f766e' }} />
+                            <ShieldCheck size={18} style={{ color: 'var(--success)' }} />
                             <span>Final Supplier Quote</span>
                           </div>
 
@@ -270,7 +270,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               onClick={() => handleFinalQuoteDecision(flag, 'end_supplier')}
                               disabled={resolvingId === flag.id || processing}
                             >
-                              <XCircle size={14} style={{ color: '#dc2626' }} />
+                              <XCircle size={14} style={{ color: 'var(--danger)' }} />
                               End Negotiation With Supplier
                             </button>
                           </div>
@@ -281,7 +281,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                       {isTradeoff ? (
                         <div className="tradeoff-proposal-box">
                           <div className="tradeoff-proposal-title">
-                            <Sliders size={18} style={{ color: '#4338ca' }} />
+                            <Sliders size={18} style={{ color: 'var(--primary)' }} />
                             <span>Supplier Trade-Off Proposal</span>
                           </div>
 
@@ -343,7 +343,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               onClick={() => handleTradeoffDecision(flag, 'reject')}
                               disabled={resolvingId === flag.id || processing}
                             >
-                              <XCircle size={14} style={{ color: '#dc2626' }} />
+                              <XCircle size={14} style={{ color: 'var(--danger)' }} />
                               <span>
                                 {meta.dimension === 'delivery'
                                   ? `Keep ${meta.current_value || 2}-day requirement`
@@ -359,7 +359,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               onClick={() => setShowCustomConfig((prev) => ({ ...prev, [flag.id]: !prev[flag.id] }))}
                               disabled={resolvingId === flag.id || processing}
                             >
-                              <Sliders size={14} style={{ color: '#4338ca' }} />
+                              <Sliders size={14} style={{ color: 'var(--primary)' }} />
                               <span>{isCustomOpen ? 'Hide Custom Range' : 'Set Custom Range'}</span>
                             </button>
                           </div>
@@ -490,7 +490,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                               onClick={() => handleResolve(flag.id)}
                               disabled={resolvingId === flag.id || (processing && !['unknown', 'failed'].includes(instructionState))}
                             >
-                              <Check size={14} style={isTradeoff ? { color: '#059669' } : {}} />
+                              <Check size={14} style={isTradeoff ? { color: 'var(--success)' } : {}} />
                               <span>{resolvingId === flag.id ? 'Resolving...' : (processing ? 'Mark Reviewed — Do Not Resend' : 'Mark Resolved')}</span>
                             </button>
                             <button

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Bot } from 'lucide-react';
+import { Layers } from 'lucide-react';
 
 export default function AuthShell({ title, subtitle, children, footer }) {
   return (
@@ -7,11 +7,11 @@ export default function AuthShell({ title, subtitle, children, footer }) {
       <div className="auth-card card">
         <div className="auth-brand">
           <div className="logo-icon-wrap">
-            <Bot size={22} className="logo-icon" />
+            <Layers size={22} className="logo-icon" />
           </div>
           <div>
-            <h1 className="brand-title">Amafha</h1>
-            <span className="brand-subtitle">WhatsApp RFQ Procurement Agent</span>
+            <h1 className="brand-title">Amafah</h1>
+            <span className="brand-subtitle">Procurement workspace</span>
           </div>
         </div>
         <h2 className="view-title">{title}</h2>

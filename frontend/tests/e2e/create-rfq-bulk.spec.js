@@ -5,7 +5,7 @@ test.describe('Create RFQ — Bulk CSV Mode', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Create RFQ' }).click();
+    await page.locator('.sidebar-create').click();
     await page.getByRole('button', { name: 'Upload Material Requisition' }).click();
 
     // Upload invalid .pdf file
@@ -22,7 +22,7 @@ test.describe('Create RFQ — Bulk CSV Mode', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Create RFQ' }).click();
+    await page.locator('.sidebar-create').click();
     await page.getByRole('button', { name: 'Upload Material Requisition' }).click();
 
     const sampleCsv = `SL #,Description,Qty,Last Cost
@@ -36,20 +36,20 @@ test.describe('Create RFQ — Bulk CSV Mode', () => {
     });
 
     // Check table rendered with 2 rows
-    const table = page.locator('table.table');
+    const table = page.locator('.bulk-compact-list');
     await expect(table).toBeVisible();
-    await expect(table.locator('tbody tr')).toHaveCount(2);
+    await expect(table.locator('.bulk-item')).toHaveCount(2);
 
     // Verify row contents
-    await expect(table.locator('input[value*="Copper Water Pipe"]')).toBeVisible();
-    await expect(table.locator('input[value*="Brass Ball Valve"]')).toBeVisible();
+    await expect(table.locator('.bulk-product-title').first()).toHaveText(/Copper Water Pipe/);
+    await expect(table.locator('.bulk-product-title').nth(1)).toHaveText(/Brass Ball Valve/);
   });
 
   test('should toggle row selection and block submission if none selected', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Create RFQ' }).click();
+    await page.locator('.sidebar-create').click();
     await page.getByRole('button', { name: 'Upload Material Requisition' }).click();
 
     const sampleCsv = `SL #,Description,Qty,Last Cost\n1,PVC Conduit Pipe 25mm,100,12.00`;
@@ -60,7 +60,7 @@ test.describe('Create RFQ — Bulk CSV Mode', () => {
       buffer: Buffer.from(sampleCsv),
     });
 
-    const checkbox = page.locator('table.table input[type="checkbox"]').first();
+    const checkbox = page.locator('.bulk-item input[type="checkbox"]').first();
     await expect(checkbox).toBeChecked();
 
     // Uncheck row
@@ -68,8 +68,7 @@ test.describe('Create RFQ — Bulk CSV Mode', () => {
     await expect(checkbox).not.toBeChecked();
 
     // Try submit
-    await page.getByRole('button', { name: 'Confirm Bulk Upload' }).click();
-    await expect(page.locator('.error-alert')).toContainText('Select at least one row before submitting');
+    await expect(page.getByRole('button', { name: 'Create 0 requests' })).toBeDisabled();
 
     // Recheck row
     await checkbox.check();
@@ -80,7 +79,7 @@ test.describe('Create RFQ — Bulk CSV Mode', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Create RFQ' }).click();
+    await page.locator('.sidebar-create').click();
     await page.getByRole('button', { name: 'Upload Material Requisition' }).click();
 
     const sampleCsv = `SL #,Description,Qty,Last Cost\n1,Galvanized Elbow 90 Deg,40,8.50`;
@@ -91,24 +90,24 @@ test.describe('Create RFQ — Bulk CSV Mode', () => {
       buffer: Buffer.from(sampleCsv),
     });
 
-    const table = page.locator('table.table');
+    const table = page.locator('.bulk-compact-list');
     await expect(table).toBeVisible();
 
     // Edit quantity
-    const qtyInput = table.locator('tbody tr input[type="number"]').first();
+    const qtyInput = table.getByLabel('Quantity',{exact:true}).first();
     await qtyInput.fill('75');
 
     // Edit category dropdown on row
-    const rowCategorySelect = table.locator('tbody tr select').first();
+    const rowCategorySelect = table.getByLabel('Category',{exact:true}).first();
     await rowCategorySelect.selectOption('Plumbing');
 
     // Submit bulk upload
-    await page.getByRole('button', { name: 'Confirm Bulk Upload' }).click();
+    await page.getByRole('button', { name: 'Create 1 request' }).click();
 
     // Verify summary card
     const summaryCard = page.locator('.result-card');
     await expect(summaryCard).toBeVisible();
     await expect(summaryCard.getByText('Bulk RFQs Created')).toBeVisible();
-    await expect(summaryCard.getByText('Created 2 RFQs')).toBeVisible();
+    await expect(summaryCard.getByText('Created 1 RFQ')).toBeVisible();
   });
 });

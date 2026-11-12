@@ -428,16 +428,15 @@ export async function setupAppMocks(page, options = {}) {
     }
 
     if (url.includes('/rfq/bulk-create')) {
+      const multipart = await new Response(req.postDataBuffer(), { headers: { 'content-type': req.headers()['content-type'] } }).formData();
+      const updates = JSON.parse(multipart.get('row_updates') || '[]');
       return route.fulfill({
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({
           status: 'success',
-          created_count: 2,
-          rfqs: [
-            { rfq_id: 'rfq-bulk-1', product_name: 'Copper Pipe 1/2', matched_suppliers_count: 2 },
-            { rfq_id: 'rfq-bulk-2', product_name: 'Brass Ball Valve', matched_suppliers_count: 1 },
-          ],
+          created_count: updates.length,
+          rfqs: updates.map((row, index) => ({ rfq_id: `rfq-bulk-${index + 1}`, product_name: row.product_name, matched_suppliers_count: 1 })),
           failed_rows: [],
         }),
       });
@@ -554,6 +553,15 @@ export async function setupAppMocks(page, options = {}) {
         contentType: 'application/json',
         body: JSON.stringify({ status: 'valid', client_id: mockClient.id, role: 'member' }),
       });
+    }
+
+    // New read-only detail sources have no records in this fixture.
+    if (/\/rest\/v1\/(rfq_negotiation_constraints|supplier_message_bundle_items)(\?|$)/.test(url)) {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: '[]' });
+    }
+    // Mocked tests must never fall through to a live Supabase database.
+    if (url.includes('.supabase.co/rest/')) {
+      throw new Error(`Missing API fixture: ${new URL(url).pathname}`);
     }
 
     // Pass through static assets, HTML, JS, CSS

@@ -191,7 +191,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
               </div>
               <h3 className="hero-supplier-name">AI Recommends: {bestOfferTitle}</h3>
               {bestOfferSub && (
-                <p style={{ margin: '0.25rem 0 0.5rem 0', fontWeight: 600, color: 'var(--color-primary-light, #38bdf8)' }}>
+                <p style={{ margin: '0.25rem 0 0.5rem 0', fontWeight: 600, color: 'var(--primary)' }}>
                   {bestOfferSub}
                 </p>
               )}
@@ -222,7 +222,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                 <p>No quotes recorded yet for this RFQ. Awaiting supplier replies on WhatsApp.</p>
               </div>
             ) : (
-              <table className="data-table">
+              <div className="table-scroll" role="region" aria-label="Supplier quotations" tabIndex={0}><table className="data-table">
                 <thead>
                   <tr>
                     <th>Supplier</th>
@@ -289,7 +289,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                     );
                   })}
                 </tbody>
-              </table>
+              </table></div>
             )}
           </div>
 
@@ -313,7 +313,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
               </div>
 
               {showQuoteHistory && (
-                <table className="data-table">
+                <div className="table-scroll" role="region" aria-label="Supplier quotations" tabIndex={0}><table className="data-table">
                   <thead>
                     <tr>
                       <th>Supplier</th>
@@ -336,7 +336,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
                       </tr>
                     ))}
                   </tbody>
-                </table>
+                </table></div>
               )}
             </div>
           )}

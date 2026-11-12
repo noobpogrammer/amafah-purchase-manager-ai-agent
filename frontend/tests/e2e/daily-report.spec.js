@@ -5,7 +5,7 @@ test.describe('Daily Procurement Report', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Daily Report' }).click();
+    await page.getByRole('button', { name: 'Daily reports' }).click();
     await expect(page.getByRole('heading', { name: 'Daily Procurement Report', exact: true })).toBeVisible();
 
     const dateInput = page.locator('#report-date-input');
@@ -18,7 +18,7 @@ test.describe('Daily Procurement Report', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Daily Report' }).click();
+    await page.getByRole('button', { name: 'Daily reports' }).click();
 
     const dateInput = page.locator('#report-date-input');
     await dateInput.fill('2026-09-12');
@@ -38,7 +38,7 @@ test.describe('Daily Procurement Report', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Daily Report' }).click();
+    await page.getByRole('button', { name: 'Daily reports' }).click();
 
     // Fill date that returns nodata in mock
     const dateInput = page.locator('#report-date-input');
@@ -64,7 +64,7 @@ test.describe('Daily Procurement Report', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Daily Report' }).click();
+    await page.getByRole('button', { name: 'Daily reports' }).click();
 
     // Force error response
     await page.route('**/reports/daily*', async (route) => {

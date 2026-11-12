@@ -1,0 +1,43 @@
+import { test, expect, setupAuthenticatedSession } from './fixtures/test-base.js';
+for (const width of [1440, 375]) {
+  test(`RFQ sections, field spacing and supplier dialog remain readable at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({width, height:1000});
+    await setupAuthenticatedSession(page, 'admin');
+    await page.goto('/');
+    await page.locator('.sidebar-create').click();
+    const form = page.locator('.rfq-create-form');
+    await expect(form.getByRole('group')).toHaveCount(3);
+    await form.getByLabel('Product Name *', {exact:true}).fill('Test lights');
+    await form.getByLabel('Specifications / Notes *', {exact:true}).fill('50W LED');
+    await form.getByLabel('Required Delivery (Days)', {exact:true}).fill('2');
+    await form.getByLabel('Acceptable Price Min (AED)', {exact:true}).fill('30');
+    await form.getByLabel('Acceptable Price Max (AED)', {exact:true}).fill('20');
+    const specs = await form.getByLabel('Specifications / Notes *', {exact:true}).boundingBox();
+    const nextSection = await page.locator('#request-suppliers').boundingBox();
+    expect(nextSection.y - specs.y - specs.height).toBeGreaterThan(16);
+    await form.getByRole('button', {name:'Submit & Match Suppliers'}).click();
+    await expect(form.locator('.error-alert')).toContainText('Min cannot be greater than');
+    await form.getByRole('link', {name:'1. Item details'}).click();
+    await expect(form.getByLabel('Product Name *', {exact:true})).toHaveValue('Test lights');
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+    await page.screenshot({path:`/private/tmp/amafah-form-${width}.png`, fullPage:true});
+    await form.getByLabel('Acceptable Price Max (AED)', {exact:true}).fill('40');
+    const submitted = page.waitForRequest(req => req.url().includes('/rfq/create') && req.method() === 'POST');
+    await form.getByRole('button', {name:'Submit & Match Suppliers'}).click();
+    const payload = (await submitted).postDataJSON();
+    expect(payload.product_name).toBe('Test lights');
+    expect(Number(payload.required_delivery_days)).toBe(2);
+    expect(Number(payload.acceptable_price_max)).toBe(40);
+    await expect(page.locator('.result-card')).toBeVisible();
+    await page.getByRole('navigation').getByRole('button',{name:'Suppliers',exact:true}).click();
+    const tags=page.locator('.category-tag-group').first();
+    expect(await tags.evaluate(el => parseFloat(getComputedStyle(el).gap))).toBeGreaterThanOrEqual(8);
+    await page.getByRole('button',{name:'Add New Supplier'}).click();
+    const dialog=page.getByRole('dialog',{name:'Add New Supplier'});
+    await expect(dialog.getByRole('heading',{name:'Add New Supplier'})).toBeVisible();
+    expect(await dialog.evaluate(el => getComputedStyle(el).backgroundColor)).toBe('rgb(255, 255, 255)');
+    await page.screenshot({path:`/private/tmp/amafah-supplier-dialog-${width}.png`, fullPage:true});
+    await dialog.getByRole('button',{name:'Cancel'}).click();
+    await expect(dialog).not.toBeVisible();
+  });
+}

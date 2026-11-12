@@ -5,7 +5,7 @@ test.describe('Supplier Directory', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Supplier Directory' })).toBeVisible();
 
     // Click Add New Supplier
@@ -36,7 +36,7 @@ test.describe('Supplier Directory', () => {
     await setupAuthenticatedSession(page, 'admin', { suppliers: [] });
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
     await expect(page.getByText('No Suppliers Found')).toBeVisible();
 
     // Click Add First Supplier
@@ -50,7 +50,7 @@ test.describe('Supplier Directory', () => {
   test('should filter suppliers by name or phone number', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
 
     const searchInput = page.locator('input[placeholder*="Search by supplier name"]');
 
@@ -73,7 +73,7 @@ test.describe('Supplier Directory', () => {
   test('should filter suppliers by category dropdown', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
 
     const catSelect = page.locator('.filter-select-wrap select');
 
@@ -90,7 +90,7 @@ test.describe('Supplier Directory', () => {
   test('should open edit modal and update supplier details successfully', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
 
     // Click Edit on Al Noor
     const row = page.locator('tr').filter({ hasText: 'Al Noor Hardware & Tools' });
@@ -112,7 +112,7 @@ test.describe('Supplier Directory', () => {
   test('should close modal when clicking X or Cancel buttons', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
 
     // Open and close with X
     await page.getByRole('button', { name: 'Add New Supplier' }).click();
@@ -130,7 +130,7 @@ test.describe('Supplier Directory', () => {
   test('should validate required fields before submitting supplier form', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
 
     await page.getByRole('button', { name: 'Add New Supplier' }).click();
     const modal = page.locator('.modal-card');
@@ -147,7 +147,7 @@ test.describe('Supplier Directory', () => {
   test('should create and select custom category inline', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
 
     await page.getByRole('button', { name: 'Add New Supplier' }).click();
     const modal = page.locator('.modal-card');
@@ -168,7 +168,7 @@ test.describe('Supplier Directory', () => {
   test('should cancel inline custom category creation', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
 
     await page.getByRole('button', { name: 'Add New Supplier' }).click();
     const modal = page.locator('.modal-card');
@@ -182,7 +182,7 @@ test.describe('Supplier Directory', () => {
     page.allowConsoleError(/Duplicate phone number|Failed to create supplier|Failed to load resource|Error saving supplier/);
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
 
     // Force supplier POST to 500
     await page.route('**/rest/v1/suppliers*', async (route) => {

@@ -1,3 +1,4 @@
+import useOutsideDismiss from '../hooks/useOutsideDismiss';
 import React, { useState, useEffect } from 'react';
 import { Users, Plus, Search, Filter, Edit2, Phone, Tag, Check, X, Trash2, ChevronDown } from 'lucide-react';
 import { createSupplier, updateSupplier, deleteSupplier, fetchCategories, createCustomCategory, deleteCategory } from '../api';
@@ -26,6 +27,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
   const [customCatName, setCustomCatName] = useState('');
   const [creatingCat, setCreatingCat] = useState(false);
   const [categoryDropdownOpen, setCategoryDropdownOpen] = useState(false);
+  const categoryDropdownRef = useOutsideDismiss(categoryDropdownOpen, () => setCategoryDropdownOpen(false));
   const [deletingSupplierId, setDeletingSupplierId] = useState(null);
   const [showCategoryManager, setShowCategoryManager] = useState(false);
   const [deletingCategory, setDeletingCategory] = useState('');
@@ -315,7 +317,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
                         gap: '0.75rem',
                         padding: '0.75rem 0.85rem',
                         minHeight: '58px',
-                        background: 'rgba(255,255,255,0.035)',
+                        background: 'var(--surface-subtle)',
                         border: '1px solid var(--panel-border)',
                         borderRadius: '10px'
                       }}
@@ -460,12 +462,12 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
       {/* Modal Dialog */}
       {showModal && (
         <div className="modal-backdrop">
-          <div className="modal-card">
+          <div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="supplier-dialog-title">
             <div className="modal-header">
-              <h3 className="modal-title">
+              <h3 id="supplier-dialog-title" className="modal-title">
                 {editingSupplier ? 'Edit Supplier' : 'Add New Supplier'}
               </h3>
-              <button className="btn-icon" onClick={() => setShowModal(false)}>
+              <button type="button" className="btn-icon" aria-label="Close supplier dialog" onClick={() => setShowModal(false)}>
                 <X size={20} />
               </button>
             </div>
@@ -503,10 +505,11 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
                     Categories * (Multi-select categories served)
                   </label>
 
-                  <div style={{ position: 'relative' }}>
+                  <div ref={categoryDropdownRef} style={{ position: 'relative' }}>
                     <button
                       type="button"
                       className="input-field"
+                      aria-expanded={categoryDropdownOpen}
                       onClick={() => setCategoryDropdownOpen((open) => !open)}
                       style={{
                         width: '100%',
@@ -632,7 +635,7 @@ export default function SuppliersView({ suppliers, loading, refreshSuppliers, is
                                   padding: '0.55rem 0.6rem',
                                   border: 0,
                                   borderRadius: '6px',
-                                  background: isSelected ? 'rgba(99, 102, 241, 0.12)' : 'transparent',
+                                  background: isSelected ? 'var(--primary-soft)' : 'transparent',
                                   cursor: 'pointer',
                                   textAlign: 'left'
                                 }}

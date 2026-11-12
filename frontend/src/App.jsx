@@ -27,6 +27,22 @@ function pathOnly(route) {
   return (route || '/').split('?')[0];
 }
 
+const VIEW_LABELS = {
+  dashboard: 'Overview', suppliers: 'Suppliers', create_rfq: 'Create request', rfqs: 'Requests & tracking',
+  quotes_report: 'Quotes & rankings', daily_report: 'Daily reports', conversations: 'Conversations', flags: 'Agent attention',
+};
+
+function WorkspaceFrame({ navbar, title, children }) {
+  return <div className="app-shell">
+    <a className="skip-link" href="#main-content">Skip to content</a>
+    {navbar}
+    <div className="workspace-shell">
+      <div className="workspace-topbar"><div className="workspace-breadcrumb"><span>Workspace</span><span aria-hidden="true">/</span><strong>{title}</strong></div><span className="workspace-date">{new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span></div>
+      <main id="main-content" className="app-container" tabIndex={-1}>{children}</main>
+    </div>
+  </div>;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [selectedRfqId, setSelectedRfqId] = useState(null);
@@ -213,12 +229,9 @@ export default function App() {
 
   if (path === '/team') {
     return (
-      <div className="app-shell">
-        {navbar}
-        <main className="app-container">
-          <TeamSettings navigate={navigate} />
-        </main>
-      </div>
+      <WorkspaceFrame navbar={navbar} title="Team settings">
+        <TeamSettings navigate={navigate} />
+      </WorkspaceFrame>
     );
   }
 
@@ -234,10 +247,7 @@ export default function App() {
 
 
   return (
-    <div className="app-shell">
-      {navbar}
-
-      <main className="app-container">
+    <WorkspaceFrame navbar={navbar} title={VIEW_LABELS[activeTab] || 'Overview'}>
         {profileLoading && <div className="loading-state">Loading profile...</div>}
         {profileLoadError && <div className="msg error">{profileLoadError}</div>}
 
@@ -290,7 +300,6 @@ export default function App() {
         {activeTab === 'flags' && (
           <AgentAttentionView refreshFlagsCount={refreshFlagsCount} />
         )}
-      </main>
-    </div>
+    </WorkspaceFrame>
   );
 }

@@ -15,7 +15,7 @@ test.describe('App Shell & Routing', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/login');
     await expect(page).toHaveURL('/');
-    await expect(page.getByRole('heading', { name: 'Procurement Command Center' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Procurement overview' })).toBeVisible();
 
     await page.goto('/signup');
     await expect(page).toHaveURL('/');
@@ -38,17 +38,17 @@ test.describe('App Shell & Routing', () => {
   test('should handle browser back and forward navigation gracefully', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await expect(page.getByRole('heading', { name: 'Procurement Command Center' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Procurement overview' })).toBeVisible();
 
     // Navigate to team
-    await page.getByRole('button', { name: 'Team' }).click();
+    await page.getByRole('button', { name: 'Team settings' }).click();
     await expect(page).toHaveURL('/team');
     await expect(page.getByRole('heading', { name: 'Team & invites' })).toBeVisible();
 
     // Go back
     await page.goBack();
     await expect(page).toHaveURL('/');
-    await expect(page.getByRole('heading', { name: 'Procurement Command Center' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Procurement overview' })).toBeVisible();
 
     // Go forward
     await page.goForward();

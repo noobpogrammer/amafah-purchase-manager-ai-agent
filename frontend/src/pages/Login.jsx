@@ -40,7 +40,7 @@ export default function Login({ navigate, onLoginSuccess }) {
   return (
     <AuthShell
       title="Welcome back"
-      subtitle="Sign in to open the Procurement Command Center."
+      subtitle="Sign in to your procurement workspace."
       footer={
         <>
           Need an account?{' '}

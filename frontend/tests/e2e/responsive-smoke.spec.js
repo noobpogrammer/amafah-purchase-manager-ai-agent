@@ -19,10 +19,10 @@ test.describe('Responsive Viewports Smoke Checks', () => {
       await expect(page.locator('.brand-logo')).toBeVisible();
 
       // Dashboard content rendered
-      await expect(page.getByRole('heading', { name: 'Procurement Command Center' })).toBeVisible();
+      await expect(page.getByRole('heading', { name: 'Procurement overview' })).toBeVisible();
 
       // Navigate to Suppliers view
-      await page.getByRole('button', { name: 'Suppliers' }).click();
+      await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
       await expect(page.getByRole('heading', { name: 'Supplier Directory' })).toBeVisible();
 
       // Open and close Add Supplier modal

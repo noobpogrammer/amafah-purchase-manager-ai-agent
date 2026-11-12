@@ -1,8 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_SUPABASE_URL) || process.env.VITE_SUPABASE_URL || '';
+const supabaseUrl = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_SUPABASE_URL) || (typeof process !== 'undefined' && process.env?.VITE_SUPABASE_URL) || '';
 // Use the public anon key in frontend code. Do NOT expose service_role keys via VITE_*.
-const supabaseKey = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_SUPABASE_ANON_KEY) || process.env.VITE_SUPABASE_ANON_KEY || '';
+const supabaseKey = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_SUPABASE_ANON_KEY) || (typeof process !== 'undefined' && process.env?.VITE_SUPABASE_ANON_KEY) || '';
 
 let _createdSupabase;
 try {
@@ -36,7 +36,7 @@ try {
 	};
 }
 export let supabase = _createdSupabase;
-export const DEMO_CLIENT_ID = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_DEMO_CLIENT_ID) || process.env.VITE_DEMO_CLIENT_ID || 'd88c52ad-3d0b-42e9-86f1-b9f70018856b';
+export const DEMO_CLIENT_ID = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_DEMO_CLIENT_ID) || (typeof process !== 'undefined' && process.env?.VITE_DEMO_CLIENT_ID) || 'd88c52ad-3d0b-42e9-86f1-b9f70018856b';
 const PRODUCTION_API_URL = 'https://amafah-purchase-manager-ai-agent-production-5d4d.up.railway.app';
 let resolvedApiUrl = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_URL) || (typeof process !== 'undefined' && process.env && process.env.VITE_API_URL) || '';
 if (typeof window !== 'undefined') {

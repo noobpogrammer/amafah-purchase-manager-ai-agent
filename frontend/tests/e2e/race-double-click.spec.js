@@ -19,7 +19,7 @@ test.describe('Double-Click & Race Protection', () => {
     });
 
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
     await page.getByRole('button', { name: 'Add New Supplier' }).click();
 
     const modal = page.locator('.modal-card');
@@ -76,7 +76,7 @@ test.describe('Double-Click & Race Protection', () => {
     });
 
     await page.goto('/');
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
 
     await page.getByRole('button', { name: 'Close RFQ' }).click();
     const yesCloseBtn = page.getByRole('button', { name: 'Yes, Close' });

@@ -15,7 +15,7 @@ test.describe('Error State Matrix & Resilience', () => {
 
     await page.goto('/');
     // Command center still renders safely
-    await expect(page.getByRole('heading', { name: 'Procurement Command Center' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Procurement overview' })).toBeVisible();
     await expect(page.locator('.app-header')).toBeVisible();
   });
 
@@ -32,7 +32,7 @@ test.describe('Error State Matrix & Resilience', () => {
     });
 
     await page.goto('/');
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
     await expect(page.getByRole('heading', { name: 'RFQs & Live Tracking' })).toBeVisible();
   });
 
@@ -68,7 +68,7 @@ test.describe('Error State Matrix & Resilience', () => {
     });
 
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Supplier Directory' })).toBeVisible();
   });
 
@@ -87,7 +87,7 @@ test.describe('Error State Matrix & Resilience', () => {
 
     await setupAuthenticatedSession(page, 'admin', { suppliers: robustSuppliers });
     await page.goto('/');
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
 
     // Table renders Arabic/emoji/escaped HTML safely without crash
     await expect(page.getByText('مؤسسة الأمل للتجارة العامة')).toBeVisible();

@@ -5,7 +5,7 @@ test.describe('Agent Attention & Human Review', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: /Agent Attention/ }).click();
+    await page.getByRole('button', { name: /Agent attention/i }).click();
     await expect(page.getByRole('heading', { name: 'Agent Attention & Human Review' })).toBeVisible();
 
     const flagCard = page.locator('.flagged-item-card').first();
@@ -21,7 +21,7 @@ test.describe('Agent Attention & Human Review', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: /Agent Attention/ }).click();
+    await page.getByRole('button', { name: /Agent attention/i }).click();
 
     const flagCard = page.locator('.flagged-item-card').first();
     const checkbox = flagCard.locator('input[type="checkbox"]');
@@ -40,7 +40,7 @@ test.describe('Agent Attention & Human Review', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: /Agent Attention/ }).click();
+    await page.getByRole('button', { name: /Agent attention/i }).click();
 
     const resolveBtn = page.getByRole('button', { name: 'Mark Resolved' });
     await expect(resolveBtn).toBeVisible();
@@ -54,7 +54,7 @@ test.describe('Agent Attention & Human Review', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: /Agent Attention/ }).click();
+    await page.getByRole('button', { name: /Agent attention/i }).click();
 
     const flagCard = page.locator('.flagged-item-card').first();
     const sendBtn = flagCard.getByRole('button', { name: /Send Instruction & Resolve/i });
@@ -75,7 +75,7 @@ test.describe('Agent Attention & Human Review', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: /Agent Attention/ }).click();
+    await page.getByRole('button', { name: /Agent attention/i }).click();
 
     const historyCard = page.locator('.card').filter({ hasText: 'Resolved Escalation History' });
     await expect(historyCard).toBeVisible();

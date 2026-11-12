@@ -100,8 +100,8 @@ export default function DailyReportView() {
             )}
 
             {errorMessage && (
-              <div className="card alert-banner error-banner" style={{ marginTop: '0.25rem', borderColor: 'var(--color-danger, #ef4444)' }}>
-                <AlertCircle size={20} className="alert-icon" style={{ color: 'var(--color-danger, #ef4444)' }} />
+              <div className="card alert-banner error-banner" style={{ marginTop: '0.25rem', borderColor: 'var(--color-danger, var(--danger))' }}>
+                <AlertCircle size={20} className="alert-icon" style={{ color: 'var(--color-danger, var(--danger))' }} />
                 <div>
                   <strong>Error</strong>
                   <p>{errorMessage}</p>
@@ -111,7 +111,7 @@ export default function DailyReportView() {
 
             {successMessage && (
               <div className="card alert-banner success-banner" style={{ marginTop: '0.25rem' }}>
-                <CheckCircle2 size={20} className="alert-icon" style={{ color: 'var(--color-success, #10b981)' }} />
+                <CheckCircle2 size={20} className="alert-icon" style={{ color: 'var(--success)' }} />
                 <div>
                   <strong>Success</strong>
                   <p>{successMessage}</p>

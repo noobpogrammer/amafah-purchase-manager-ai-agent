@@ -69,7 +69,7 @@ export default function ConversationsView() {
 
       {/* Filter Bar */}
       <div className="filter-bar">
-        <div className="filter-select-wrap" style={{ minWidth: '260px', position: 'relative' }}>
+        <div className="filter-select-wrap" style={{ position: 'relative' }}>
           <Search size={18} className="filter-icon" />
           <input
             type="search"

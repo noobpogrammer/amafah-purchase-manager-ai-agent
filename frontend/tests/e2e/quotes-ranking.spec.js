@@ -5,7 +5,7 @@ test.describe('Quotes Comparison & AI Recommendation Report', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Quotes & AI Ranking' }).click();
+    await page.getByRole('button', { name: 'Quotes & rankings' }).click();
     await expect(page.getByRole('heading', { name: 'Quotes Comparison & AI Recommendation Report' })).toBeVisible();
 
     // Select dropdown
@@ -21,7 +21,7 @@ test.describe('Quotes Comparison & AI Recommendation Report', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Quotes & AI Ranking' }).click();
+    await page.getByRole('button', { name: 'Quotes & rankings' }).click();
 
     // Hero banner check
     const hero = page.locator('.ai-recommendation-hero');
@@ -35,7 +35,7 @@ test.describe('Quotes Comparison & AI Recommendation Report', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Quotes & AI Ranking' }).click();
+    await page.getByRole('button', { name: 'Quotes & rankings' }).click();
 
     const table = page.locator('.data-table');
     await expect(table).toBeVisible();
@@ -57,7 +57,7 @@ test.describe('Quotes Comparison & AI Recommendation Report', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Quotes & AI Ranking' }).click();
+    await page.getByRole('button', { name: 'Quotes & rankings' }).click();
 
     const runBtn = page.getByRole('button', { name: 'Run AI Recommendation' });
     await expect(runBtn).toBeVisible();
@@ -70,7 +70,7 @@ test.describe('Quotes Comparison & AI Recommendation Report', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Quotes & AI Ranking' }).click();
+    await page.getByRole('button', { name: 'Quotes & rankings' }).click();
 
     const breakdownList = page.locator('.ranking-breakdown-list');
     await expect(breakdownList).toBeVisible();

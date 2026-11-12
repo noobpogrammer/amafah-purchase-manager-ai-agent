@@ -246,7 +246,7 @@ export default function RFQDetailView({
         <div>
           <h2 className="view-title">RFQs & Live Tracking</h2>
           <p className="view-description">
-            Monitor supplier response progress live in real-time as the AI agent logs quotes and handles questions.
+            Review quotes, compare supplier replies and follow each request.
           </p>
         </div>
         <div className="flex-items gap-2">
@@ -287,8 +287,8 @@ export default function RFQDetailView({
             </div>
           </div>
 
-          <div style={{ position: 'relative', padding: '0 1rem 0.75rem' }}>
-            <Search size={16} style={{ position: 'absolute', left: '1.75rem', top: '50%', transform: 'translateY(-50%)', opacity: 0.65 }} />
+          <div style={{ position: 'relative', padding: '0 0 0.75rem' }}>
+            <Search size={16} style={{ position: 'absolute', left: '0.75rem', top: '50%', transform: 'translateY(-50%)', opacity: 0.65 }} />
             <input
               type="search"
               className="input-field"
@@ -312,7 +312,9 @@ export default function RFQDetailView({
                 const isClosed = rfq.status === 'closed' || rfq.status === 'cancelled';
 
                 return (
-                  <div
+                  <button
+                    type="button"
+                    aria-pressed={isSelected}
                     key={rfq.id}
                     className={`rfq-item-card ${isSelected ? 'selected' : ''} ${isClosed ? 'dimmed' : ''}`}
                     onClick={() => setSelectedRfqId(rfq.id)}
@@ -336,7 +338,7 @@ export default function RFQDetailView({
                       </span>
                       <ChevronRight size={16} />
                     </div>
-                  </div>
+                  </button>
                 );
               })}
             </div>
@@ -362,12 +364,16 @@ export default function RFQDetailView({
                       ))}
                     </div>
                     <h3 className="rfq-product-title">{detailData.rfq.product_name}</h3>
-                    <p className="rfq-specs-text">
-                      Specs: <strong>{detailData.rfq.specs || 'Standard'}</strong> | Quantity: <strong>{detailData.rfq.quantity || 'N/A'}</strong> | Required Delivery: <strong>{detailData.rfq.required_delivery_days ? `${detailData.rfq.required_delivery_days} days` : 'Not specified'}</strong> | Deadline: <strong>{detailData.rfq.deadline_hours || 24} hours</strong>
-                      {detailData.rfq.last_quote && (
-                        <> | Last Quote: <strong>AED {detailData.rfq.last_quote}</strong> (Target: <strong>AED {detailData.rfq.last_quote}</strong>, Final Tolerance: Up to <strong>AED {Number(detailData.rfq.last_quote) + 2}</strong>)</>
-                      )}
-                    </p>
+                    <dl className="rfq-key-facts">
+                      <div><dt>Quantity</dt><dd>{detailData.rfq.quantity || 'N/A'} units</dd></div>
+                      <div><dt>Delivery</dt><dd>{detailData.rfq.required_delivery_days ? `${detailData.rfq.required_delivery_days} days` : 'Not specified'}</dd></div>
+                      <div><dt>Reply window</dt><dd>{detailData.rfq.deadline_hours || 24} hours</dd></div>
+                    </dl>
+                    <details className="rfq-spec-disclosure" key={`specs-${selectedRfqId}`}>
+                      <summary>Product specifications</summary>
+                      <p className="rfq-specs-text">{detailData.rfq.specs || 'Standard'}</p>
+                      {detailData.rfq.last_quote && <p className="rfq-specs-text">Previous price: AED {detailData.rfq.last_quote}</p>}
+                    </details>
                   </div>
 
                   <div className="rfq-header-actions flex-items gap-2">
@@ -420,7 +426,7 @@ export default function RFQDetailView({
               </div>
 
               {/* View Section Tabs */}
-              <div className="flex-items gap-2 mb-3">
+              <div className="rfq-section-tabs flex-items gap-2">
                 <button
                   className={`btn btn-sm ${activeSection === 'overview' ? 'btn-primary' : 'btn-secondary'}`}
                   onClick={() => setActiveSection('overview')}
@@ -442,152 +448,8 @@ export default function RFQDetailView({
 
               {activeSection === 'overview' && (
                 <>
-                  {/* Negotiation Authority Card */}
-                  <div className="card" style={{ marginBottom: '1.25rem' }}>
-                    <div className="card-header flex-between">
-                      <h4 className="card-title flex-items gap-2" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                        <Sliders size={16} /> Negotiation Authority
-                      </h4>
-                      <span className="badge badge-sm" style={{ textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                        Autonomous Policy Bounds
-                      </span>
-                    </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem', marginTop: '0.75rem' }}>
-                      {/* Price Authority */}
-                      {(() => {
-                        const priceConstraint = (detailData.constraints || []).find((c) => c.dimension === 'price');
-                        const target = priceConstraint?.constraints?.preferred_target ?? detailData.rfq.acceptable_price_min ?? detailData.rfq.last_quote;
-                        const maxPrice = priceConstraint?.constraints?.max ?? detailData.rfq.acceptable_price_max;
-                        return (
-                          <div style={{ padding: '0.75rem', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
-                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase' }}>Price</div>
-                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
-                              {target ? `Target: AED ${target}` : 'No target set'}
-                            </div>
-                            <div style={{ fontSize: '0.825rem', color: '#475569' }}>
-                              {maxPrice ? `Max: AED ${maxPrice}` : 'Max: Not capped'}
-                            </div>
-                            <span className="badge badge-status responded" style={{ marginTop: '0.4rem', display: 'inline-block' }}>
-                              Authorized Range
-                            </span>
-                          </div>
-                        );
-                      })()}
-
-                      {/* Quantity Authority */}
-                      {(() => {
-                        const qtyConstraint = (detailData.constraints || []).find((c) => c.dimension === 'quantity');
-                        const isAuth = qtyConstraint?.status === 'authorized';
-                        const c = qtyConstraint?.constraints || {};
-                        return (
-                          <div style={{ padding: '0.75rem', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
-                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase' }}>Quantity</div>
-                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
-                              {isAuth
-                                ? `Flexible: ${c.min ?? 'Min'} - ${c.max ?? 'Max'} units`
-                                : `Fixed at ${detailData.rfq.quantity ?? 'Standard'}`}
-                            </div>
-                            <div style={{ fontSize: '0.825rem', color: '#475569' }}>
-                              {isAuth ? 'Trade-offs permitted' : 'Trade-offs require approval'}
-                            </div>
-                            <span className={`badge ${isAuth ? 'badge-status responded' : 'badge-status sent'}`} style={{ marginTop: '0.4rem', display: 'inline-block' }}>
-                              {isAuth ? 'Authorized' : 'Fixed'}
-                            </span>
-                          </div>
-                        );
-                      })()}
-
-                      {/* Delivery Authority */}
-                      {(() => {
-                        const delConstraint = (detailData.constraints || []).find((c) => c.dimension === 'delivery');
-                        const isAuth = delConstraint?.status === 'authorized';
-                        const maxDays = delConstraint?.constraints?.max_days;
-                        const reqDays = detailData.rfq.required_delivery_days || delConstraint?.constraints?.required_days;
-                        return (
-                          <div style={{ padding: '0.75rem', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
-                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase' }}>Delivery Timing</div>
-                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
-                              {isAuth && maxDays
-                                ? `Flexible up to ${maxDays} days`
-                                : (reqDays ? `Fixed at ${reqDays} days` : 'Not specified / Fixed')}
-                            </div>
-                            <div style={{ fontSize: '0.825rem', color: '#475569' }}>
-                              {isAuth ? `Max: ${maxDays} days acceptable` : (reqDays ? `Required: ${reqDays} days` : 'Baseline not specified')}
-                            </div>
-                            <span className={`badge ${isAuth ? 'badge-status responded' : 'badge-status sent'}`} style={{ marginTop: '0.4rem', display: 'inline-block' }}>
-                              {isAuth ? 'Authorized' : 'Fixed'}
-                            </span>
-                          </div>
-                        );
-                      })()}
-
-                      {/* Specification Authority */}
-                      {(() => {
-                        const specConstraint = (detailData.constraints || []).find((c) => c.dimension === 'specification');
-                        const isAuth = specConstraint?.status === 'authorized';
-                        const allowed = specConstraint?.constraints?.allowed_alternatives;
-                        return (
-                          <div style={{ padding: '0.75rem', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
-                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase' }}>Specification</div>
-                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
-                              {isAuth ? (allowed ? `Allowed: ${allowed}` : 'Flexible') : 'Fixed'}
-                            </div>
-                            <div style={{ fontSize: '0.825rem', color: '#475569', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {isAuth ? allowed || 'Substitutes allowed' : 'Substitutes require approval'}
-                            </div>
-                            <span className={`badge ${isAuth ? 'badge-status responded' : 'badge-status sent'}`} style={{ marginTop: '0.4rem', display: 'inline-block' }}>
-                              {isAuth ? 'Authorized' : 'Fixed'}
-                            </span>
-                          </div>
-                        );
-                      })()}
-                    </div>
-                  </div>
-
-                  {/* Supplier Response Tracking Table */}
-                  <div className="card">
-                    <div className="card-header flex-between">
-                      <h4 className="card-title">Supplier Progress ({detailData.suppliers.length} Matched)</h4>
-                      <span className="live-tag"><span className="pulse-dot"></span> Live Updates</span>
-                    </div>
-
-                    {detailData.suppliers.length === 0 ? (
-                      <div className="empty-state">No suppliers matched for this RFQ category.</div>
-                    ) : (
-                      <table className="data-table">
-                        <thead>
-                          <tr>
-                            <th>Supplier Name</th>
-                            <th>Phone</th>
-                            <th>Status</th>
-                            <th>Sent At</th>
-                            <th>Reminders</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {detailData.suppliers.map((item) => {
-                            const supp = item.suppliers;
-                            return (
-                              <tr key={item.id}>
-                                <td><strong>{supp?.name || 'Supplier'}</strong></td>
-                                <td>{supp?.phone_number}</td>
-                                <td>{getSupplierStatusBadge(item)}</td>
-                                <td>
-                                  {item.delivery_sent_at
-                                    ? new Date(item.delivery_sent_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                                    : '-'}
-                                </td>
-                                <td>{item.reminder_count} reminders</td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-
                   {/* Received Quotes Summary */}
-                  <div className="card">
+                  <section className="card recorded-quotes" aria-label="Recorded quotes">
                     <div className="card-header">
                       <h4 className="card-title">Recorded Quotes ({detailData.quotes.length})</h4>
                     </div>
@@ -631,15 +493,158 @@ export default function RFQDetailView({
                               </div>
                               <div className="quote-body">
                                 <p><strong>Delivery:</strong> {q.delivery_time || '-'}</p>
-                                <p><strong>Notes:</strong> {q.quality_notes || '-'}</p>
-                                <p className="raw-msg"><em>"{q.raw_message}"</em></p>
+                                {(q.quality_notes || q.raw_message) && <details className="quote-extra">
+                                  <summary>Notes & supplier message</summary>
+                                  {q.quality_notes && <p><strong>Notes:</strong> {q.quality_notes}</p>}
+                                  {q.raw_message && <p className="raw-msg">{q.raw_message}</p>}
+                                </details>}
                               </div>
                             </div>
                           );
                         })}
                       </div>
                     )}
-                  </div>
+                  </section>
+                  {/* Negotiation Authority Card */}
+                  <details className="card rfq-disclosure" key={`authority-${selectedRfqId}`}>
+                    <summary className="rfq-disclosure-summary">
+                      <span className="disclosure-title"><Sliders size={16} /> Negotiation authority</span>
+                      <span className="disclosure-hint">Price, quantity, delivery & alternatives</span>
+                    </summary>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem', marginTop: '0.75rem' }}>
+                      {/* Price Authority */}
+                      {(() => {
+                        const priceConstraint = (detailData.constraints || []).find((c) => c.dimension === 'price');
+                        const target = priceConstraint?.constraints?.preferred_target ?? detailData.rfq.acceptable_price_min ?? detailData.rfq.last_quote;
+                        const maxPrice = priceConstraint?.constraints?.max ?? detailData.rfq.acceptable_price_max;
+                        return (
+                          <div style={{ padding: '0.75rem', background: 'var(--surface-subtle)', borderRadius: '6px', border: '1px solid var(--panel-border)' }}>
+                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Price</div>
+                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
+                              {target ? `Target: AED ${target}` : 'No target set'}
+                            </div>
+                            <div style={{ fontSize: '0.825rem', color: 'var(--text-muted)' }}>
+                              {maxPrice ? `Max: AED ${maxPrice}` : 'Max: Not capped'}
+                            </div>
+                            <span className="badge badge-status responded" style={{ marginTop: '0.4rem', display: 'inline-block' }}>
+                              Authorized Range
+                            </span>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Quantity Authority */}
+                      {(() => {
+                        const qtyConstraint = (detailData.constraints || []).find((c) => c.dimension === 'quantity');
+                        const isAuth = qtyConstraint?.status === 'authorized';
+                        const c = qtyConstraint?.constraints || {};
+                        return (
+                          <div style={{ padding: '0.75rem', background: 'var(--surface-subtle)', borderRadius: '6px', border: '1px solid var(--panel-border)' }}>
+                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Quantity</div>
+                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
+                              {isAuth
+                                ? `Flexible: ${c.min ?? 'Min'} - ${c.max ?? 'Max'} units`
+                                : `Fixed at ${detailData.rfq.quantity ?? 'Standard'}`}
+                            </div>
+                            <div style={{ fontSize: '0.825rem', color: 'var(--text-muted)' }}>
+                              {isAuth ? 'Trade-offs permitted' : 'Trade-offs require approval'}
+                            </div>
+                            <span className={`badge ${isAuth ? 'badge-status responded' : 'badge-status sent'}`} style={{ marginTop: '0.4rem', display: 'inline-block' }}>
+                              {isAuth ? 'Authorized' : 'Fixed'}
+                            </span>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Delivery Authority */}
+                      {(() => {
+                        const delConstraint = (detailData.constraints || []).find((c) => c.dimension === 'delivery');
+                        const isAuth = delConstraint?.status === 'authorized';
+                        const maxDays = delConstraint?.constraints?.max_days;
+                        const reqDays = detailData.rfq.required_delivery_days || delConstraint?.constraints?.required_days;
+                        return (
+                          <div style={{ padding: '0.75rem', background: 'var(--surface-subtle)', borderRadius: '6px', border: '1px solid var(--panel-border)' }}>
+                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Delivery Timing</div>
+                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
+                              {isAuth && maxDays
+                                ? `Flexible up to ${maxDays} days`
+                                : (reqDays ? `Fixed at ${reqDays} days` : 'Not specified / Fixed')}
+                            </div>
+                            <div style={{ fontSize: '0.825rem', color: 'var(--text-muted)' }}>
+                              {isAuth ? `Max: ${maxDays} days acceptable` : (reqDays ? `Required: ${reqDays} days` : 'Baseline not specified')}
+                            </div>
+                            <span className={`badge ${isAuth ? 'badge-status responded' : 'badge-status sent'}`} style={{ marginTop: '0.4rem', display: 'inline-block' }}>
+                              {isAuth ? 'Authorized' : 'Fixed'}
+                            </span>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Specification Authority */}
+                      {(() => {
+                        const specConstraint = (detailData.constraints || []).find((c) => c.dimension === 'specification');
+                        const isAuth = specConstraint?.status === 'authorized';
+                        const allowed = specConstraint?.constraints?.allowed_alternatives;
+                        return (
+                          <div style={{ padding: '0.75rem', background: 'var(--surface-subtle)', borderRadius: '6px', border: '1px solid var(--panel-border)' }}>
+                            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Specification</div>
+                            <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.25rem' }}>
+                              {isAuth ? (allowed ? `Allowed: ${allowed}` : 'Flexible') : 'Fixed'}
+                            </div>
+                            <div style={{ fontSize: '0.825rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {isAuth ? allowed || 'Substitutes allowed' : 'Substitutes require approval'}
+                            </div>
+                            <span className={`badge ${isAuth ? 'badge-status responded' : 'badge-status sent'}`} style={{ marginTop: '0.4rem', display: 'inline-block' }}>
+                              {isAuth ? 'Authorized' : 'Fixed'}
+                            </span>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  </details>
+
+                  {/* Supplier Response Tracking Table */}
+                  <details className="card rfq-disclosure" key={`suppliers-${selectedRfqId}`}>
+                    <summary className="rfq-disclosure-summary">
+                      <span className="disclosure-title">Supplier progress <span className="badge badge-category">{detailData.suppliers.length} matched</span></span>
+                      <span className="disclosure-hint">Delivery status & reminders</span>
+                    </summary>
+
+                    {detailData.suppliers.length === 0 ? (
+                      <div className="empty-state">No suppliers matched for this RFQ category.</div>
+                    ) : (
+                      <div className="table-scroll" role="region" aria-label="RFQ supplier details" tabIndex={0}><table className="data-table">
+                        <thead>
+                          <tr>
+                            <th>Supplier Name</th>
+                            <th>Phone</th>
+                            <th>Status</th>
+                            <th>Sent At</th>
+                            <th>Reminders</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {detailData.suppliers.map((item) => {
+                            const supp = item.suppliers;
+                            return (
+                              <tr key={item.id}>
+                                <td><strong>{supp?.name || 'Supplier'}</strong></td>
+                                <td>{supp?.phone_number}</td>
+                                <td>{getSupplierStatusBadge(item)}</td>
+                                <td>
+                                  {item.delivery_sent_at
+                                    ? new Date(item.delivery_sent_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                                    : '-'}
+                                </td>
+                                <td>{item.reminder_count} reminders</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table></div>
+                    )}
+                  </details>
+
                 </>
               )}
 
@@ -681,7 +686,7 @@ export default function RFQDetailView({
                             key={ev.id || idx}
                             className={`timeline-item ${isRejected ? 'timeline-rejected' : ''} ${isDeliveryIssue ? 'timeline-delivery-issue' : ''}`}
                             style={{
-                              borderLeft: isRejected ? '3px solid #ef4444' : isDeliveryIssue ? '3px solid #f59e0b' : '3px solid #3b82f6',
+                              borderLeft: isRejected ? '3px solid var(--danger)' : isDeliveryIssue ? '3px solid var(--warning)' : '3px solid var(--primary)',
                               paddingLeft: '1.25rem',
                               marginBottom: '1.5rem',
                               position: 'relative'
@@ -704,11 +709,11 @@ export default function RFQDetailView({
                               )}
                             </div>
 
-                            <div style={{ fontWeight: 600, fontSize: '0.95rem', color: isRejected ? '#dc2626' : 'inherit' }}>
+                            <div style={{ fontWeight: 600, fontSize: '0.95rem', color: isRejected ? 'var(--danger)' : 'inherit' }}>
                               {ev.title}
                             </div>
 
-                            <div style={{ fontSize: '0.875rem', color: '#4b5563', marginTop: '0.2rem', lineHeight: '1.4' }}>
+                            <div style={{ fontSize: '0.875rem', color: 'var(--text-muted)', marginTop: '0.2rem', lineHeight: '1.4' }}>
                               {ev.summary}
                             </div>
 
@@ -727,14 +732,14 @@ export default function RFQDetailView({
                                 {isExpanded && (
                                   <pre
                                     style={{
-                                      background: '#f8fafc',
-                                      border: '1px solid #e2e8f0',
+                                      background: 'var(--surface-subtle)',
+                                      border: '1px solid var(--panel-border)',
                                       borderRadius: '6px',
                                       padding: '0.6rem',
                                       fontSize: '0.75rem',
                                       marginTop: '0.4rem',
                                       overflowX: 'auto',
-                                      color: '#1e293b'
+                                      color: 'var(--text-main)'
                                     }}
                                   >
                                     {JSON.stringify(ev.details, null, 2)}

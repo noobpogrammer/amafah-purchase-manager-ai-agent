@@ -5,7 +5,7 @@ test.describe('RFQs & Live Tracking', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
     await expect(page.getByRole('heading', { name: 'RFQs & Live Tracking' })).toBeVisible();
 
     const pollingBtn = page.getByRole('button', { name: /Live Polling/i });
@@ -23,7 +23,7 @@ test.describe('RFQs & Live Tracking', () => {
   test('should filter RFQs by All, Active, and Closed tabs', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
 
     // Default All: 2 items
     const rfqList = page.locator('.rfq-list');
@@ -43,13 +43,14 @@ test.describe('RFQs & Live Tracking', () => {
   test('should load RFQ details when clicking sidebar card', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
 
     // Click on active RFQ
     await page.locator('.rfq-item-card').filter({ hasText: 'Copper Water Pipe' }).click();
 
     // Check header specs
     await expect(page.locator('.rfq-product-title')).toHaveText('Copper Water Pipe 1/2 Inch');
+    await page.locator('.rfq-disclosure').filter({ hasText: 'Supplier progress' }).locator('summary').click();
     await expect(page.locator('.data-table').getByText('Gulf Plumbing Solutions')).toBeVisible();
 
     // Check quotes summary
@@ -60,7 +61,7 @@ test.describe('RFQs & Live Tracking', () => {
   test('should navigate to Quotes Report view from detail header', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
 
     await page.getByRole('button', { name: 'Quotes Report' }).click();
     await expect(page.getByRole('heading', { name: 'Quotes Comparison & AI Recommendation Report' })).toBeVisible();
@@ -69,7 +70,7 @@ test.describe('RFQs & Live Tracking', () => {
   test('should trigger AI ranking and refresh data', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
 
     const rankBtn = page.getByRole('button', { name: 'Trigger AI Ranking' });
     await expect(rankBtn).toBeVisible();
@@ -82,7 +83,7 @@ test.describe('RFQs & Live Tracking', () => {
   test('should show confirmation prompt before closing RFQ', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
 
     // Click Close RFQ
     await page.getByRole('button', { name: 'Close RFQ' }).click();
@@ -97,7 +98,7 @@ test.describe('RFQs & Live Tracking', () => {
   test('should close RFQ when confirming close action', async ({ page }) => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
 
     await page.getByRole('button', { name: 'Close RFQ' }).click();
     await page.getByRole('button', { name: 'Yes, Close' }).click();

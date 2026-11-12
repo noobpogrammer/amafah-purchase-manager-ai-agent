@@ -28,15 +28,15 @@ export default function DashboardView({ metrics, loading, setActiveTab, setSelec
     <div className="view-container">
       <div className="view-header">
         <div>
-          <h2 className="view-title">Procurement Command Center</h2>
+          <h2 className="view-title">Procurement overview</h2>
           <p className="view-description">
-            Live overview of active RFQs, supplier response tracking, AI quote ranking, and human escalation tasks.
+            Your buying requests, supplier quotes and decisions, all in one place.
           </p>
         </div>
         <div className="action-button-group">
           <button className="btn btn-primary" onClick={() => setActiveTab('create_rfq')}>
             <PlusCircle size={18} />
-            <span>Create New RFQ</span>
+            <span>Create request</span>
           </button>
         </div>
       </div>
@@ -46,8 +46,8 @@ export default function DashboardView({ metrics, loading, setActiveTab, setSelec
           <div className="alert-content">
             <AlertTriangle size={20} className="alert-icon" />
             <div>
-              <strong>{pendingFlags} Action Item{pendingFlags > 1 ? 's' : ''} Require Human Review</strong>
-              <p>The AI agent encountered queries or contradictions requiring procurement decision.</p>
+              <strong>{pendingFlags} item{pendingFlags > 1 ? 's' : ''} {pendingFlags > 1 ? 'need' : 'needs'} your attention</strong>
+              <p>A few items need your decision before the agent can continue.</p>
             </div>
           </div>
           <button className="btn btn-secondary btn-sm" onClick={() => setActiveTab('flags')}>
@@ -58,85 +58,85 @@ export default function DashboardView({ metrics, loading, setActiveTab, setSelec
 
       {/* Metric Grid */}
       <div className="metrics-grid">
-        <div className="metric-card" onClick={() => setActiveTab('rfqs')}>
+        <button type="button" className="metric-card" onClick={() => setActiveTab('rfqs')}>
           <div className="metric-header">
             <span className="metric-label">Active RFQs</span>
             <div className="metric-icon-bg icon-blue"><FileText size={20} /></div>
           </div>
           <div className="metric-value">{activeRfqs}</div>
           <div className="metric-footer">{totalRfqs} total RFQs created</div>
-        </div>
+        </button>
 
-        <div className="metric-card" onClick={() => setActiveTab('suppliers')}>
+        <button type="button" className="metric-card" onClick={() => setActiveTab('suppliers')}>
           <div className="metric-header">
-            <span className="metric-label">Registered Suppliers</span>
+            <span className="metric-label">Supplier network</span>
             <div className="metric-icon-bg icon-green"><Users size={20} /></div>
           </div>
           <div className="metric-value">{totalSuppliers}</div>
-          <div className="metric-footer">Categorized for auto-matching</div>
-        </div>
+          <div className="metric-footer">Ready to match with new requests</div>
+        </button>
 
-        <div className="metric-card" onClick={() => setActiveTab('quotes_report')}>
+        <button type="button" className="metric-card" onClick={() => setActiveTab('quotes_report')}>
           <div className="metric-header">
             <span className="metric-label">Quotes Received</span>
             <div className="metric-icon-bg icon-purple"><CheckCircle2 size={20} /></div>
           </div>
           <div className="metric-value">{totalQuotes}</div>
-          <div className="metric-footer">AI recorded quotes across RFQs</div>
-        </div>
+          <div className="metric-footer">Offers across your buying requests</div>
+        </button>
 
-        <div className="metric-card" onClick={() => setActiveTab('flags')}>
+        <button type="button" className="metric-card" onClick={() => setActiveTab('flags')}>
           <div className="metric-header">
-            <span className="metric-label">Pending Agent Flags</span>
+            <span className="metric-label">Needs attention</span>
             <div className="metric-icon-bg icon-amber"><AlertTriangle size={20} /></div>
           </div>
           <div className="metric-value">{pendingFlags}</div>
-          <div className="metric-footer">Human-in-the-loop tasks</div>
-        </div>
+          <div className="metric-footer">Decisions waiting for your review</div>
+        </button>
       </div>
 
       {/* Quick Action Navigation Panels */}
       <div className="dashboard-grid">
         <div className="card">
           <div className="card-header">
-            <h3 className="card-title">Demo Flow Shortcuts</h3>
+            <h3 className="card-title">Your next steps</h3>
           </div>
           <div className="workflow-steps">
-            <div className="workflow-step" onClick={() => setActiveTab('suppliers')}>
+            <button type="button" className="workflow-step" onClick={() => setActiveTab('suppliers')}>
               <div className="step-number">1</div>
               <div className="step-info">
-                <strong>Manage Suppliers</strong>
-                <p>Register suppliers with multi-category tags (Electronics, Hardware, etc.)</p>
+                <strong>Manage your suppliers</strong>
+                <p>Organize contacts and categories for the right match.</p>
               </div>
               <ArrowRight size={16} />
-            </div>
+            </button>
 
-            <div className="workflow-step" onClick={() => setActiveTab('create_rfq')}>
+            <button type="button" className="workflow-step" onClick={() => setActiveTab('create_rfq')}>
               <div className="step-number">2</div>
               <div className="step-info">
-                <strong>Launch RFQ & Auto-Match</strong>
-                <p>Submit product category RFQ; auto-match suppliers & queue WhatsApp messages</p>
+                <strong>Send a buying request</strong>
+                <p>Set your requirements and invite matched suppliers.</p>
               </div>
               <ArrowRight size={16} />
-            </div>
+            </button>
 
-            <div className="workflow-step" onClick={() => setActiveTab('rfqs')}>
+            <button type="button" className="workflow-step" onClick={() => setActiveTab('rfqs')}>
               <div className="step-number">3</div>
               <div className="step-info">
-                <strong>Track Live Status</strong>
-                <p>Watch supplier statuses move from 'sent' to 'responded' / 'clarifying'</p>
+                <strong>Follow each request</strong>
+                <p>See replies, quotations and outstanding questions.</p>
               </div>
               <ArrowRight size={16} />
-            </div>
+            </button>
 
-            <div className="workflow-step" onClick={() => setActiveTab('quotes_report')}>
+            <button type="button" className="workflow-step" onClick={() => setActiveTab('quotes_report')}>
               <div className="step-number">4</div>
               <div className="step-info">
-                <strong>AI Quote Ranking Report</strong>
-                <p>View AI comparative analysis, recommended best supplier, and price evaluation</p>
+                <strong>Compare your offers</strong>
+                <p>Review prices, delivery and supplier recommendations.</p>
               </div>
               <ArrowRight size={16} />
-            </div>
+            </button>
           </div>
         </div>
 
@@ -148,7 +148,7 @@ export default function DashboardView({ metrics, loading, setActiveTab, setSelec
               <span>Recent WhatsApp Activity</span>
             </h3>
             <button className="btn btn-text btn-sm" onClick={() => setActiveTab('conversations')}>
-              View All Logs
+              View conversations
             </button>
           </div>
           <div className="activity-feed">

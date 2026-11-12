@@ -5,7 +5,7 @@ test.describe('WhatsApp Logs & Conversation Transcripts', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'WhatsApp Logs' }).click();
+    await page.getByRole('button', { name: 'Conversations' }).click();
     await expect(page.getByRole('heading', { name: 'WhatsApp Audit Logs & Conversation Transcripts' })).toBeVisible();
 
     const suppFilter = page.locator('.filter-bar select').first();
@@ -23,7 +23,7 @@ test.describe('WhatsApp Logs & Conversation Transcripts', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'WhatsApp Logs' }).click();
+    await page.getByRole('button', { name: 'Conversations' }).click();
 
     const rfqFilter = page.locator('.filter-bar select').nth(1);
     await expect(rfqFilter).toBeVisible();
@@ -37,7 +37,7 @@ test.describe('WhatsApp Logs & Conversation Transcripts', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'WhatsApp Logs' }).click();
+    await page.getByRole('button', { name: 'Conversations' }).click();
 
     const refreshBtn = page.getByRole('button', { name: 'Refresh Log' });
     await expect(refreshBtn).toBeVisible();
@@ -50,7 +50,7 @@ test.describe('WhatsApp Logs & Conversation Transcripts', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'WhatsApp Logs' }).click();
+    await page.getByRole('button', { name: 'Conversations' }).click();
 
     // Outbound bubble
     const outbound = page.locator('.message-bubble-wrapper.outbound');
@@ -69,7 +69,7 @@ test.describe('WhatsApp Logs & Conversation Transcripts', () => {
     await setupAuthenticatedSession(page, 'admin', { messages: [] });
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'WhatsApp Logs' }).click();
+    await page.getByRole('button', { name: 'Conversations' }).click();
     await expect(page.getByText('No WhatsApp Messages Logged')).toBeVisible();
   });
 });

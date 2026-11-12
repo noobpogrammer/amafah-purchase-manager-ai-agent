@@ -6,12 +6,12 @@ test.describe('Navbar & Navigation Controls', () => {
     await page.goto('/');
 
     // Switch to suppliers tab first
-    await page.getByRole('button', { name: 'Suppliers' }).click();
+    await page.getByRole('button', { name: 'Suppliers', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Supplier Directory' })).toBeVisible();
 
     // Click Brand logo
     await page.locator('.brand-logo').click();
-    await expect(page.getByRole('heading', { name: 'Procurement Command Center' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Procurement overview' })).toBeVisible();
   });
 
   test('should switch active tab and view when clicking navigation items', async ({ page }) => {
@@ -20,20 +20,20 @@ test.describe('Navbar & Navigation Controls', () => {
 
     const tabs = [
       { name: 'Suppliers', heading: 'Supplier Directory', exact: false },
-      { name: 'Create RFQ', heading: 'Launch Request for Quote (RFQ)', exact: false },
-      { name: 'RFQs & Tracking', heading: 'RFQs & Live Tracking', exact: false },
-      { name: 'Quotes & AI Ranking', heading: 'Quotes Comparison & AI Recommendation Report', exact: false },
-      { name: 'Daily Report', heading: 'Daily Procurement Report', exact: true },
-      { name: 'WhatsApp Logs', heading: 'WhatsApp Audit Logs & Conversation Transcripts', exact: false },
+      { name: 'Create request', heading: 'Launch Request for Quote (RFQ)', exact: false },
+      { name: 'Requests & tracking', heading: 'RFQs & Live Tracking', exact: false },
+      { name: 'Quotes & rankings', heading: 'Quotes Comparison & AI Recommendation Report', exact: false },
+      { name: 'Daily reports', heading: 'Daily Procurement Report', exact: true },
+      { name: 'Conversations', heading: 'WhatsApp Audit Logs & Conversation Transcripts', exact: false },
       { name: 'Agent Attention', heading: 'Agent Attention & Human Review', exact: false },
-      { name: 'Dashboard', heading: 'Procurement Command Center', exact: false },
+      { name: 'Overview', heading: 'Procurement overview', exact: false },
     ];
 
     for (const tab of tabs) {
-      const btn = page.locator('.nav-menu').getByRole('button', { name: new RegExp(tab.name, 'i') });
+      const btn = tab.name === 'Create request' ? page.locator('.sidebar-create') : page.locator('.nav-menu').getByRole('button', { name: new RegExp(tab.name, 'i') });
       await btn.click();
       await expect(page.getByRole('heading', { name: tab.heading, exact: tab.exact })).toBeVisible();
-      await expect(btn).toHaveClass(/active/);
+      await expect(btn).toHaveClass(tab.name === 'Create request' ? /selected/ : /active/);
     }
   });
 
@@ -41,7 +41,7 @@ test.describe('Navbar & Navigation Controls', () => {
     // 1. With 1 pending flag (default mock data has 1 pending flag)
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
-    const flagBtn = page.locator('.nav-menu').getByRole('button', { name: /Agent Attention/ });
+    const flagBtn = page.locator('.nav-menu').getByRole('button', { name: /Agent attention/i });
     await expect(flagBtn.locator('.nav-badge')).toHaveText('1');
 
     // 2. With 0 flags
@@ -78,7 +78,7 @@ test.describe('Navbar & Navigation Controls', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'Team' }).click();
+    await page.getByRole('button', { name: 'Team settings' }).click();
     await expect(page).toHaveURL('/team');
     await expect(page.getByRole('heading', { name: 'Team & invites' })).toBeVisible();
   });

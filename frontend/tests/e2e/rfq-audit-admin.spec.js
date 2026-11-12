@@ -5,7 +5,7 @@ test.describe('RFQ Admin Activity & Audit Log', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
     await expect(page.getByRole('heading', { name: 'RFQs & Live Tracking' })).toBeVisible();
 
     const activityTabBtn = page.getByRole('button', { name: /Activity & Audit Log/i });
@@ -27,7 +27,7 @@ test.describe('RFQ Admin Activity & Audit Log', () => {
     await setupAuthenticatedSession(page, 'member');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
     await expect(page.getByRole('heading', { name: 'RFQs & Live Tracking' })).toBeVisible();
 
     // Member must NOT see the Admin Activity & Audit Log tab
@@ -38,7 +38,7 @@ test.describe('RFQ Admin Activity & Audit Log', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
     await page.getByRole('button', { name: /Activity & Audit Log/i }).click();
 
     // Find first toggle button
@@ -62,7 +62,7 @@ test.describe('RFQ Admin Activity & Audit Log', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
     await page.getByRole('button', { name: /Activity & Audit Log/i }).click();
 
     const refreshBtn = page.locator('.card-header').getByRole('button', { name: /Refresh/i });
@@ -76,7 +76,7 @@ test.describe('RFQ Admin Activity & Audit Log', () => {
     await setupAuthenticatedSession(page, 'admin');
     await page.goto('/');
 
-    await page.getByRole('button', { name: 'RFQs & Tracking' }).click();
+    await page.getByRole('button', { name: 'Requests & tracking' }).click();
 
     // Mock activity endpoint 403
     await page.route('**/rfq/*/activity', async (route) => {
