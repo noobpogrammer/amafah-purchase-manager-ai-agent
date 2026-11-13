@@ -3,6 +3,7 @@ Supabase data access layer. Plain env-var config so credentials can be
 plugged in whenever the Supabase project is ready.
 """
 
+from commercial_policy import resolve_offers, price_policy
 import logging
 import math
 import os
@@ -1159,52 +1160,8 @@ def update_message_related_rfq(message_id: str, rfq_id: str):
 
 def _build_effective_quotes_from_history(rows: list[dict], include_unavailable: bool = False) -> list[dict]:
     """Collapse immutable quote history into current effective supplier offers."""
-    grouped = {}
-    for q in (rows or []):
-        supplier_id = q.get("supplier_id")
-        if not supplier_id:
-            continue
-        variant_key = (q.get("variant_label") or "").strip().casefold()
-        grouped.setdefault((supplier_id, variant_key), []).append(q)
-
-    effective_quotes = []
-    for _key, history in grouped.items():
-        if not history:
-            continue
-
-        # Caller provides newest-first rows.
-        latest = dict(history[0])
-
-        if not latest.get("delivery_time"):
-            prior_delivery = next(
-                (row.get("delivery_time") for row in history[1:] if row.get("delivery_time")),
-                None,
-            )
-            if prior_delivery:
-                latest["delivery_time"] = prior_delivery
-                latest["delivery_inherited"] = True
-
-        if not latest.get("quality_notes"):
-            prior_quality = next(
-                (row.get("quality_notes") for row in history[1:] if row.get("quality_notes")),
-                None,
-            )
-            if prior_quality:
-                latest["quality_notes"] = prior_quality
-                latest["quality_notes_inherited"] = True
-
-        latest["revision_count"] = len(history)
-
-        if include_unavailable:
-            effective_quotes.append(latest)
-        elif latest.get("is_available", True) is True and latest.get("price") is not None:
-            effective_quotes.append(latest)
-
-    effective_quotes.sort(
-        key=lambda q: (q.get("created_at") or "", str(q.get("id") or "")),
-        reverse=True,
-    )
-    return effective_quotes
+    offers = resolve_offers(rows or [])
+    return [q for q in offers if include_unavailable or (q.get('is_available', True) and q.get('price') is not None)]
 
 
 def supplier_has_accepted_quote(rfq_id: str, supplier_id: str) -> bool:
@@ -1414,9 +1371,9 @@ def build_negotiation_price_context(
       2. historical last_quote — fallback when no acceptable minimum is configured
       3. acceptable_price_max — final fallback target
 
-    Final tolerance ceiling:
-      - acceptable_price_max + tolerance_aed when max exists
-      - otherwise preferred_target + tolerance_aed
+    Price ceiling:
+      - explicit acceptable_price_max unchanged
+      - last_quote + AED 5 only when both explicit limits are absent
 
     A quote above the preferred target should be negotiated toward the target while
     attempts remain, even when the quote is already inside the broad acceptable range.
@@ -1456,8 +1413,7 @@ def build_negotiation_price_context(
     else:
         return None
 
-    ceiling_base = max_p if max_p is not None else preferred_target
-    tolerated_final_ceiling = round(ceiling_base + tolerance, 2)
+    tolerated_final_ceiling = price_policy({'acceptable_price_min': min_p, 'acceptable_price_max': max_p, 'last_quote': last_p})['acceptable_max']
 
     return {
         "current_quote": current,
@@ -1466,9 +1422,9 @@ def build_negotiation_price_context(
         "last_quote": last_p,
         "preferred_target": preferred_target,
         "target_source": target_source,
-        "tolerance_aed": tolerance,
+        "tolerance_aed": 5.0 if min_p is None and max_p is None and last_p is not None else 0.0,
         "tolerated_final_ceiling": tolerated_final_ceiling,
-        "within_tolerance": current <= tolerated_final_ceiling,
+        "within_tolerance": tolerated_final_ceiling is not None and current <= tolerated_final_ceiling,
         "at_or_below_target": current <= preferred_target,
         "should_negotiate": current > preferred_target,
         "price_position": classify_price_position(current, min_p, max_p),
@@ -1709,7 +1665,7 @@ def resume_negotiation_session(
 ) -> dict | None:
     """
     Resumes a paused negotiation session (e.g. from awaiting_authorization or awaiting_human_review back to active).
-    Validates tenant isolation, matching RFQ and supplier, that RFQ is active and deadline has not passed.
+    Validates tenant isolation, matching RFQ/supplier and active RFQ. Existing paused negotiations may resume after the quote deadline.
     Preserves all negotiation history, attempt counts, offers, and strategy states.
     """
     if not session_id or not client_id or not rfq_id or not supplier_id:
@@ -1720,14 +1676,6 @@ def resume_negotiation_session(
         rfq = get_rfq_by_id(rfq_id)
         if not rfq or rfq.get("status") != "active":
             return None
-        if rfq.get("due_by"):
-            try:
-                due_dt = datetime.fromisoformat(str(rfq["due_by"]).replace("Z", "+00:00"))
-                if due_dt <= datetime.now(timezone.utc):
-                    return None
-            except Exception:
-                pass
-
         # 2. Get session and verify status and ownership
         session = get_negotiation_session_by_id(
             session_id=session_id,
@@ -2193,8 +2141,8 @@ def build_historical_price_context(last_quote: float = None, current_quote: floa
     Deterministically computes trusted historical price comparison metrics.
     Used only as a historical fallback when no acceptable minimum is configured.
     preferred_target = last_quote
-    tolerance_aed = AED 3.0
-    tolerated_final_ceiling = last_quote + AED 3.0
+    tolerance_aed = AED 5.0
+    tolerated_final_ceiling = last_quote + AED 5.0 (last-quote-only policy)
     """
     if last_quote is None or current_quote is None:
         return None
@@ -2205,7 +2153,7 @@ def build_historical_price_context(last_quote: float = None, current_quote: floa
             return None
         diff_aed = round(cq - lq, 2)
         diff_pct = round(((cq - lq) / lq) * 100.0, 4) if lq > 0 else 0.0
-        tolerance_aed = PRICE_TOLERANCE_AED
+        tolerance_aed = 5.0
         tolerated_ceiling = round(lq + tolerance_aed, 2)
         within_tolerance = bool(cq <= tolerated_ceiling)
         at_or_below_target = bool(cq <= lq)

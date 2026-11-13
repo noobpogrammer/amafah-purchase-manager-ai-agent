@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { fetchMessages, fetchSuppliers, fetchRFQs, formatRfqDropdownLabel } from '../api';
 import { MessageSquare, Phone, Filter, Clock, Bot, User, Search } from 'lucide-react';
 
@@ -12,6 +12,10 @@ export default function ConversationsView() {
   const [selectedRfqId, setSelectedRfqId] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
 
+  const transcriptRequest = useRef(0);
+  const filterRef = useRef('');
+  filterRef.current = `${selectedSupplierId}:${selectedRfqId}`;
+  const [transcriptError, setTranscriptError] = useState(null);
   useEffect(() => {
     async function loadFilterOptions() {
       try {
@@ -29,14 +33,16 @@ export default function ConversationsView() {
   }, []);
 
   const loadTranscript = async () => {
-    setLoading(true);
+    const requestId = ++transcriptRequest.current;
+    const filter = `${selectedSupplierId}:${selectedRfqId}`;
+    setLoading(true); setTranscriptError(null); setMessages([]);
     try {
       const data = await fetchMessages(selectedSupplierId || null, selectedRfqId || null);
-      setMessages(data);
+      if (requestId === transcriptRequest.current && filterRef.current === filter) setMessages(data);
     } catch (err) {
-      console.error('Error loading transcript:', err);
+      if (requestId === transcriptRequest.current && filterRef.current === filter) setTranscriptError(err.message || 'Could not load conversations');
     } finally {
-      setLoading(false);
+      if (requestId === transcriptRequest.current && filterRef.current === filter) setLoading(false);
     }
   };
 
@@ -119,7 +125,7 @@ export default function ConversationsView() {
 
       {/* Transcript Feed Container */}
       <div className="card chat-transcript-card">
-        {loading ? (
+        {transcriptError ? <div className="error-alert" role="alert">{transcriptError}</div> : loading ? (
           <div className="loading-state">Loading WhatsApp transcript history...</div>
         ) : filteredMessages.length === 0 ? (
           <div className="empty-state">
@@ -153,6 +159,7 @@ export default function ConversationsView() {
 
                     <div className="message-text-body">{msg.body}</div>
 
+                    {!isInbound && msg.status && <span className="badge badge-category">{{queued:'Queued for sending',sending:'Sending',sent:'Sent',failed:'Sending failed',unknown:'Delivery uncertain — check before retrying'}[msg.status] || msg.status}</span>}
                     <div className="message-time">
                       <Clock size={11} />
                       {new Date(msg.created_at).toLocaleString([], {

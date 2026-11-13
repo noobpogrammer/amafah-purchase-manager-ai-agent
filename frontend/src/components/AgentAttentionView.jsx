@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { fetchFlags, resolveFlag, respondToFlag, authorizeNegotiationTradeoff, resolveFinalQuoteDecision } from '../api';
+import { fetchFlags, verifyPriceComparison, resolveFlag, respondToFlag, authorizeNegotiationTradeoff, resolveFinalQuoteDecision } from '../api';
 import { AlertTriangle, CheckCircle2, Phone, Clock, FileText, Check, Send, Sliders, ShieldCheck, XCircle } from 'lucide-react';
 
 export default function AgentAttentionView({ refreshFlagsCount }) {
@@ -36,6 +36,13 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
     const timer = setInterval(() => loadFlags(true), 5000);
     return () => clearInterval(timer);
   }, [hasProcessingInstructions]);
+
+  const handleVerifyPrice = async (flagId) => {
+    setResolvingId(flagId);
+    try { await verifyPriceComparison(flagId); await loadFlags(); }
+    catch (error) { alert(error.message); }
+    finally { setResolvingId(null); }
+  };
 
   const handleResolve = async (flagId) => {
     setResolvingId(flagId);
@@ -225,6 +232,7 @@ export default function AgentAttentionView({ refreshFlagsCount }) {
                         {getCategoryBadge(flag.category, meta)}
                       </div>
 
+                      {flag.category === 'price_anomaly' && <div className="error-alert"><p>Check the unit/pack size, currency, specifications and previous price before continuing. Verification does not raise the buying limit.</p><button className="btn btn-secondary" disabled={resolvingId === flag.id} onClick={() => handleVerifyPrice(flag.id)}>I verified this price comparison</button></div>}
                       {isFinalQuote && (
                         <div className="tradeoff-proposal-box" style={{ borderColor: 'var(--success)' }}>
                           <div className="tradeoff-proposal-title">

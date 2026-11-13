@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { fetchRFQs, fetchRFQDetail, triggerAIRanking, formatRfqDropdownLabel } from '../api';
 import { Sparkles, Trophy, CheckCircle, BarChart3, AlertCircle, Clock, ChevronDown, ChevronUp, Search } from 'lucide-react';
 
@@ -8,6 +8,10 @@ const formatCurrencyInText = (text) => {
 };
 
 export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
+  const reportRequest = useRef(0);
+  const selectionRef = useRef(selectedRfqId);
+  selectionRef.current = selectedRfqId;
+  const [reportError, setReportError] = useState(null);
   const [rfqs, setRfqs] = useState([]);
   const [reportData, setReportData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -38,14 +42,15 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
   useEffect(() => {
     async function loadReport() {
       if (!selectedRfqId) return;
-      setLoading(true);
+      const requestId = ++reportRequest.current;
+      setLoading(true); setReportError(null); setReportData(null);
       try {
         const data = await fetchRFQDetail(selectedRfqId);
-        setReportData(data);
+        if (requestId === reportRequest.current && selectionRef.current === selectedRfqId) setReportData(data);
       } catch (err) {
-        console.error('Error loading report:', err);
+        if (requestId === reportRequest.current && selectionRef.current === selectedRfqId) setReportError(err.message || 'Could not load report');
       } finally {
-        setLoading(false);
+        if (requestId === reportRequest.current && selectionRef.current === selectedRfqId) setLoading(false);
       }
     }
     loadReport();
@@ -57,7 +62,7 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
     try {
       await triggerAIRanking(selectedRfqId);
       const updated = await fetchRFQDetail(selectedRfqId);
-      setReportData(updated);
+      if (selectionRef.current === selectedRfqId) setReportData(updated);
     } catch (err) {
       console.error(err);
       alert('Ranking calculation failed: ' + err.message);
@@ -124,7 +129,8 @@ export default function QuotesReportView({ selectedRfqId, setSelectedRfqId }) {
             Evaluates price, delivery speed, and quality notes across commercial offers to recommend the optimal choice.
           </p>
         </div>
-        {/* RFQ Search + Switcher */}
+        {reportError && <div className="error-alert" role="alert">{reportError}</div>}
+      {/* RFQ Search + Switcher */}
         <div className="rfq-select-dropdown">
           <label className="form-label">Search / Select RFQ:</label>
           <div style={{ position: 'relative', marginBottom: '0.4rem' }}>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { fetchRFQs, fetchRFQDetail, triggerAIRanking, closeRFQ, fetchRFQActivity } from '../api';
 import { ensureProfile } from '../lib/ensureProfile';
 import {
@@ -31,6 +31,11 @@ export default function RFQDetailView({
   setActiveTab,
   refreshTrigger
 }) {
+  const detailRequest = useRef(0);
+  const activityRequest = useRef(0);
+  const selectionRef = useRef(selectedRfqId);
+  selectionRef.current = selectedRfqId;
+  const [detailError, setDetailError] = useState(null);
   const [rfqs, setRfqs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [detailData, setDetailData] = useState(null);
@@ -79,30 +84,35 @@ export default function RFQDetailView({
   // Load selected RFQ detail
   const loadRFQDetail = async (rfqId) => {
     if (!rfqId) return;
+    const requestId = ++detailRequest.current;
     setDetailLoading(true);
+    setDetailError(null);
     try {
       const data = await fetchRFQDetail(rfqId);
-      setDetailData(data);
+      if (requestId === detailRequest.current && selectionRef.current === rfqId) setDetailData(data);
     } catch (err) {
-      console.error('Error fetching RFQ detail:', err);
+      if (requestId === detailRequest.current && selectionRef.current === rfqId) {
+        setDetailData(null); setDetailError(err.message || 'Could not load this request.');
+      }
     } finally {
-      setDetailLoading(false);
+      if (requestId === detailRequest.current && selectionRef.current === rfqId) setDetailLoading(false);
     }
   };
 
   // Load Activity timeline
   const loadActivity = async (rfqId) => {
     if (!rfqId) return;
+    const requestId = ++activityRequest.current;
     setActivityLoading(true);
     setActivityError(null);
     try {
       const res = await fetchRFQActivity(rfqId);
-      setActivityData(res?.activity || []);
+      if (requestId === activityRequest.current && selectionRef.current === rfqId) setActivityData(res?.activity || []);
     } catch (err) {
       console.error('Error fetching RFQ activity:', err);
-      setActivityError(err.message || 'Failed to load activity');
+      if (requestId === activityRequest.current && selectionRef.current === rfqId) setActivityError(err.message || 'Failed to load activity');
     } finally {
-      setActivityLoading(false);
+      if (requestId === activityRequest.current && selectionRef.current === rfqId) setActivityLoading(false);
     }
   };
 
@@ -347,7 +357,7 @@ export default function RFQDetailView({
 
         {/* Right Detail & Live Status Tracking */}
         <div className="rfq-main-content">
-          {detailLoading && !detailData ? (
+          {detailError ? <div className="card error-alert" role="alert">{detailError}</div> : (detailLoading && !detailData) || (selectedRfqId && detailData?.rfq?.id !== selectedRfqId) ? (
             <div className="card loading-card">Loading RFQ tracking data...</div>
           ) : !detailData ? (
             <div className="card empty-card">Select an RFQ to view live supplier status.</div>
@@ -515,8 +525,8 @@ export default function RFQDetailView({
                       {/* Price Authority */}
                       {(() => {
                         const priceConstraint = (detailData.constraints || []).find((c) => c.dimension === 'price');
-                        const target = priceConstraint?.constraints?.preferred_target ?? detailData.rfq.acceptable_price_min ?? detailData.rfq.last_quote;
-                        const maxPrice = priceConstraint?.constraints?.max ?? detailData.rfq.acceptable_price_max;
+                        const target = detailData.rfq.negotiation_price_policy?.preferred_target ?? priceConstraint?.constraints?.preferred_target ?? detailData.rfq.acceptable_price_min ?? detailData.rfq.last_quote;
+                        const maxPrice = detailData.rfq.negotiation_price_policy?.acceptable_max ?? priceConstraint?.constraints?.max ?? detailData.rfq.acceptable_price_max;
                         return (
                           <div style={{ padding: '0.75rem', background: 'var(--surface-subtle)', borderRadius: '6px', border: '1px solid var(--panel-border)' }}>
                             <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Price</div>

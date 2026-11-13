@@ -240,54 +240,20 @@ export async function fetchRFQDetail(rfqId) {
   // per supplier + variant to comparison/ranking UI. A terse revision that only
   // changes price inherits previously persisted delivery/quality terms.
   const quoteHistory = quotesRes.data || [];
-  const groupedQuotes = new Map();
-
-  quoteHistory.forEach((quote) => {
-    if (!quote?.supplier_id) return;
-    const variantKey = (quote.variant_label || '').trim().toLowerCase();
-    const key = `${quote.supplier_id}::${variantKey}`;
-    if (!groupedQuotes.has(key)) groupedQuotes.set(key, []);
-    groupedQuotes.get(key).push(quote);
-  });
-
-  const effectiveQuotes = [];
-  const supplierLifecycle = new Map(suppliers.map((supplier) => [supplier.supplier_id, supplier]));
-  groupedQuotes.forEach((history) => {
-    if (!history.length) return;
-    const latest = { ...history[0] };
-
-    if (!latest.delivery_time) {
-      const prior = history.slice(1).find((q) => q.delivery_time);
-      if (prior) {
-        latest.delivery_time = prior.delivery_time;
-        latest.delivery_inherited = true;
-      }
-    }
-
-    if (!latest.quality_notes) {
-      const prior = history.slice(1).find((q) => q.quality_notes);
-      if (prior) {
-        latest.quality_notes = prior.quality_notes;
-        latest.quality_notes_inherited = true;
-      }
-    }
-
-    latest.revision_count = history.length;
-    const lifecycle = supplierLifecycle.get(latest.supplier_id);
-    latest.commercial_state = lifecycle?.commercial_state || 'unaccepted';
-    latest.is_pending_revision = latest.commercial_state === 'revision_pending'
-      && lifecycle?.pending_revision_quote_id === latest.id;
-    latest.is_current_accepted = latest.is_current_accepted === true
-      && latest.commercial_state === 'accepted'
-      && lifecycle?.current_accepted_quote_id === latest.id;
-
-    if (latest.is_available !== false && latest.price !== null && latest.price !== undefined) {
-      effectiveQuotes.push(latest);
-    }
+  const resolvedResponse = await authorizedFetch(`/rfq/${encodeURIComponent(rfqId)}/current-offers`);
+  if (!resolvedResponse.ok) throw new Error('Could not load the current supplier offers.');
+  const { offers, price_policy: pricePolicy } = await resolvedResponse.json();
+  const supplierLifecycle = new Map(suppliers.map(supplier => [supplier.supplier_id, supplier]));
+  const effectiveQuotes = (offers || []).map(offer => {
+    const lifecycle = supplierLifecycle.get(offer.supplier_id);
+    const state = lifecycle?.commercial_state || 'unaccepted';
+    return { ...offer, commercial_state: state,
+      is_pending_revision: state === 'revision_pending' && lifecycle?.pending_revision_quote_id === offer.id,
+      is_current_accepted: offer.is_current_accepted === true && state === 'accepted' && lifecycle?.current_accepted_quote_id === offer.id };
   });
 
   return {
-    rfq: rfqRes.data,
+    rfq: { ...rfqRes.data, negotiation_price_policy: pricePolicy },
     suppliers,
     quotes: effectiveQuotes,
     quoteHistory,
@@ -649,4 +615,10 @@ export async function resolveFinalQuoteDecision(flagId, decision) {
     throw new Error(errData.detail || 'Failed to resolve final quote decision');
   }
   return await response.json();
+}
+
+export async function verifyPriceComparison(flagId) {
+  const response = await authorizedFetch(`/flags/${encodeURIComponent(flagId)}/verify-price`, {method:'POST'});
+  if (!response.ok) throw new Error((await response.json()).detail || 'Could not verify price comparison');
+  return response.json();
 }

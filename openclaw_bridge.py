@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 import db
 import negotiation_engine
+from commercial_policy import price_policy, price_anomaly, validate_terms, apply_constraints
 import requests
 from supplier_message_planner import validate_multi_rfq_quotes, AmbiguousSupplierQuote
 
@@ -875,6 +876,35 @@ def validate_rfq_mapping(
             "candidates": options}
 
 
+def _current_offer(rfq_id, supplier_id, quote_id=None):
+    offers = [q for q in db.get_quotes_for_rfq(rfq_id) if q.get("supplier_id") == supplier_id]
+    if quote_id:
+        return next((q for q in offers if str(q["id"]) == str(quote_id)), None)
+    return offers[0] if len(offers) == 1 else None
+
+
+def _flag_price_anomaly(client_id, supplier_id, rfq, offer):
+    if not price_anomaly(rfq, offer):
+        return False
+    verified = (db.supabase.table("flagged_for_review").select("metadata")
+                .eq("client_id", client_id).eq("supplier_id", supplier_id).eq("rfq_id", rfq["id"])
+                .eq("category", "price_anomaly").eq("status", "resolved").execute()).data or []
+    if any((item.get("metadata") or {}).get("price_verified") is True
+           and str((item.get("metadata") or {}).get("quote_id")) == str(offer.get("id"))
+           and (item.get("metadata") or {}).get("price") == offer.get("price") for item in verified):
+        return False
+    existing = (db.supabase.table("flagged_for_review").select("id")
+                .eq("client_id", client_id).eq("supplier_id", supplier_id)
+                .eq("rfq_id", rfq["id"]).eq("category", "price_anomaly")
+                .eq("status", "pending").limit(1).execute())
+    if not existing.data:
+        db.flag_for_human_review(client_id, supplier_id, rfq["id"],
+            reason="Quote is at least 3 times the last unit price. Verify product, unit/pack size, currency and historical price.",
+            category="price_anomaly", raw_message=offer.get("raw_message") or "",
+            metadata={"quote_id": offer.get("id"), "last_quote": rfq.get("last_quote"), "price": offer.get("price")})
+    return True
+
+
 @router.post("/negotiation-context")
 def negotiation_context(
     req: NegotiationContextRequest,
@@ -903,6 +933,7 @@ def negotiation_context(
             "product_name": rfq.get("product_name"),
             "specs": rfq.get("specs"),
             "quantity": rfq.get("quantity"),
+            "last_quote": rfq.get("last_quote"),
             "acceptable_price_min": rfq.get("acceptable_price_min"),
             "acceptable_price_max": rfq.get("acceptable_price_max"),
             "required_delivery_days": rfq.get("required_delivery_days"),
@@ -915,9 +946,11 @@ def negotiation_context(
         },
         "quotes": quotes_res.data or [],
         "supplier_invitation_scope": {"mode": bundle["mode"], "rfq_ids": bundle["rfq_ids"]},
+        "price_policy": price_policy(rfq),
+        "current_offers": [q for q in db.get_quotes_for_rfq(req.rfq_id) if q.get("supplier_id") == req.supplier_id],
         "historical_price_benchmarks": _historical_price_benchmarks(req.client_id, rfq),
         "historical_benchmarks_are_advisory_only": True,
-        "acceptance_requires_current_rfq_maximum_or_human_approval": True,
+        "acceptance_requires_current_price_authority": True,
         "active_negotiation_session": active_session,
         "constraints": constraints,
         "max_attempts": 10,
@@ -1031,9 +1064,15 @@ def review_commercial_action(
             raise HTTPException(status_code=422, detail="Invalid counter values")
     rfq = None
     active_session = None
+    effective_offer = None
+    negotiation_mode = None
     if req.rfq_id:
         rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
         _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id, req.reply_to_message_id)
+        rfq = apply_constraints(rfq, db.get_rfq_negotiation_constraints(req.client_id, req.rfq_id))
+        policy = price_policy(rfq)
+        rfq["acceptable_price_max"] = policy["acceptable_max"]
+        effective_offer = _current_offer(req.rfq_id, req.supplier_id, req.quote_id)
         active_session = db.get_active_negotiation_session(
             req.client_id,
             req.rfq_id,
@@ -1055,6 +1094,12 @@ def review_commercial_action(
         outcome = "APPROVE"
         feedback = "No RFQ-scoped hard-boundary violation detected."
         adjusted = None
+
+    if outcome == "APPROVE" and action in {"counter", "counteroffer", "negotiate", "accept", "confirm", "award", "accept_quote"}:
+        if not effective_offer:
+            outcome, feedback = "RETRY", "Select the exact current offer quote_id; do not guess between variants or use a superseded quote."
+        elif _flag_price_anomaly(req.client_id, req.supplier_id, rfq, effective_offer):
+            outcome, feedback = "ESCALATE", "Unusual price difference: verify units, product and last price before further negotiation."
 
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and rfq.get("acceptable_price_max") is None:
         outcome, feedback = "ESCALATE", "Current RFQ has no authorized maximum; historical benchmarks cannot approve acceptance."
@@ -1108,17 +1153,7 @@ def review_commercial_action(
                             "Reconsider the strategy using that boundary."
                         )
 
-                    latest_quote_res = (
-                        db.supabase.table("quotes")
-                        .select("id,price,quantity,delivery_time,created_at")
-                        .eq("rfq_id", req.rfq_id)
-                        .eq("supplier_id", req.supplier_id)
-                        .eq("is_available", True)
-                        .order("created_at", desc=True)
-                        .limit(1)
-                        .execute()
-                    )
-                    latest_quote = latest_quote_res.data[0] if latest_quote_res.data else None
+                    latest_quote = effective_offer
                     if outcome == "APPROVE" and not latest_quote:
                         outcome = "RETRY"
                         feedback = (
@@ -1133,6 +1168,25 @@ def review_commercial_action(
                                 "Do not negotiate upward against the buyer. Choose another strategy or price."
                             )
 
+    if outcome == "APPROVE" and action in {"counter", "counteroffer", "negotiate"} and effective_offer:
+        if positive_target := price_policy(rfq).get("preferred_target"):
+            if float(effective_offer["price"]) <= positive_target:
+                used = (db.supabase.table("commercial_action_intents").select("id,consumed_at")
+                        .eq("client_id", req.client_id).eq("supplier_id", req.supplier_id)
+                        .eq("rfq_id", req.rfq_id).eq("outcome", "APPROVE")
+                        .contains("guard_snapshot", {"negotiation_mode": "extra_savings"}).limit(1).execute())
+                if any(row.get("consumed_at") for row in (used.data or [])):
+                    outcome, feedback = "REJECT", "The one extra-saving request was already used. Evaluate closing the current offer; do not keep lowering the goal."
+                else:
+                    negotiation_mode = "extra_savings"
+
+    if outcome == "APPROVE" and action in {"counter", "counteroffer", "negotiate"}:
+        previous_actions = (db.supabase.table("commercial_action_intents").select("id,consumed_at")
+            .eq("client_id", req.client_id).eq("supplier_id", req.supplier_id).eq("rfq_id", req.rfq_id)
+            .eq("outcome", "APPROVE").in_("action_type", ["counter", "counteroffer", "negotiate"]).execute()).data or []
+        if sum(bool(row.get("consumed_at")) for row in previous_actions) >= negotiation_engine.MAX_NEGOTIATION_ATTEMPTS:
+            outcome, feedback = "ESCALATE", "Negotiation round limit reached. Request human review rather than looping."
+
     # Quantity changes require explicit flexibility/authorization.
     if outcome == "APPROVE" and rfq and proposal.get("quantity") is not None:
         try:
@@ -1145,7 +1199,7 @@ def review_commercial_action(
             if requested_q is not None and q != requested_q:
                 allowed = bool(rfq.get("quantity_flexible"))
                 qmax = rfq.get("quantity_max")
-                if not allowed or (qmax is not None and q > int(qmax)):
+                if not allowed or (qmax is not None and q > int(qmax)) or (rfq.get("quantity_min") is not None and q < int(rfq["quantity_min"])):
                     outcome = "ESCALATE"
                     feedback = "The proposed quantity differs from the RFQ and is outside explicit autonomous authority."
 
@@ -1179,13 +1233,13 @@ def review_commercial_action(
             qres = (db.supabase.table("quotes").select("*")
                     .eq("id", req.quote_id).eq("rfq_id", req.rfq_id)
                     .eq("supplier_id", req.supplier_id).limit(1).execute())
-            q = (qres.data or [None])[0]
+            q = effective_offer
             if not q or not q.get("is_available") or q.get("price") is None:
-                outcome, feedback = "REJECT", "Supplier quote is missing or unavailable."
-            elif (float(proposal["price"]) != float(q["price"])
-                  or int(proposal["quantity"]) != int(q.get("quantity") or rfq["quantity"])
-                  or int(proposal["delivery_days"]) != int(rfq.get("required_delivery_days") or proposal["delivery_days"])):
-                outcome, feedback = "REJECT", "Acceptance terms do not match persisted quote or required delivery."
+                outcome, feedback = "REJECT", "Supplier quote is missing, superseded or unavailable."
+            elif float(proposal["price"]) != float(q["price"]):
+                outcome, feedback = "REJECT", "Acceptance price differs from the current offer."
+            elif validate_terms(rfq, q, proposal):
+                outcome, feedback = "RETRY", validate_terms(rfq, q, proposal)
             else:
                 approved_text = (f"Confirmed — AED {float(proposal['price']):g} per unit "
                                  f"for {proposal['quantity']} pieces, delivery within "
@@ -1240,6 +1294,9 @@ def review_commercial_action(
             "proposal": proposal,
             "guard_snapshot": {
                 "assessment": req.assessment,
+                "current_offer": effective_offer,
+                "negotiation_mode": negotiation_mode,
+                "price_policy": price_policy(rfq) if rfq else None,
                 "rfq_status": rfq.get("status") if rfq else None,
                 "acceptable_price_max": rfq.get("acceptable_price_max") if rfq else None,
             },
@@ -1932,7 +1989,8 @@ def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header
     )
     if not rows:
         raise HTTPException(status_code=409, detail="Quote was not recorded.")
-    return {"recorded": True, "quotes": rows, "workflow": {
+    flagged = any(_flag_price_anomaly(req.client_id, req.supplier_id, linked, row) for row in rows)
+    return {"recorded": True, "quotes": rows, "price_anomaly": flagged, "workflow": {
         "next_action": "evaluate_negotiation",
         "guidance": "Saving is not the end of handling. Compare each saved offer with current RFQ terms. "
                     "For a negotiable offer above authority, seek a better offer; being above budget alone "
@@ -2174,52 +2232,26 @@ def accept_negotiated_quote(
         raise HTTPException(status_code=409, detail="Acceptance requires approved commercial review ID.")
     if not req.quote_id:
         raise HTTPException(status_code=422, detail="Acceptance requires an exact persisted quote_id.")
-    quote_res = (
-        db.supabase.table("quotes").select("id,price,quantity,is_available")
-        .eq("id", req.quote_id).eq("rfq_id", req.rfq_id)
-        .eq("supplier_id", req.supplier_id).limit(1).execute()
-    )
-    quote = quote_res.data[0] if quote_res.data else None
-    if not quote or not quote.get("is_available") or quote.get("price") is None:
-        raise HTTPException(status_code=409, detail="Quote is not available for acceptance.")
-    price_cap = rfq.get("acceptable_price_max")
-    if price_cap is None:
-        raise HTTPException(status_code=409,
-            detail="Current RFQ has no authorized maximum. Historical pricing is advisory; human approval is required.")
-    if price_cap is not None and float(quote["price"]) > float(price_cap):
-        raise HTTPException(status_code=409, detail="Quote exceeds buyer-approved maximum; human override required.")
-    if req.price is not None and float(req.price) != float(quote["price"]):
-        raise HTTPException(status_code=409, detail="Acceptance price differs from persisted quote.")
-    authorized_quantity = rfq.get("quantity")
-    if authorized_quantity is not None and quote.get("quantity") is not None:
-        if int(quote["quantity"]) != int(authorized_quantity):
-            raise HTTPException(status_code=409, detail="Quote quantity differs from RFQ; human approval required.")
-
-    claim = db.supabase.rpc("claim_quote_acceptance_approval", {
-        "p_approval_id": req.approval_id,
-        "p_client_id": req.client_id,
-        "p_supplier_id": req.supplier_id,
-        "p_rfq_id": req.rfq_id,
-        "p_quote_id": req.quote_id,
+    rfq = apply_constraints(rfq, db.get_rfq_negotiation_constraints(req.client_id, req.rfq_id))
+    offer = _current_offer(req.rfq_id, req.supplier_id, req.quote_id)
+    if not offer:
+        raise HTTPException(status_code=409, detail="Select the current offer; this quote is superseded or ambiguous.")
+    policy = price_policy(rfq)
+    if policy["acceptable_max"] is None or float(offer["price"]) > policy["acceptable_max"]:
+        raise HTTPException(status_code=409, detail="Offer is outside buyer price authority.")
+    if req.price is not None and float(req.price) != float(offer["price"]):
+        raise HTTPException(status_code=409, detail="Acceptance price differs from current offer.")
+    if req.quantity is not None and req.quantity != offer.get("quantity"):
+        raise HTTPException(status_code=409, detail="Acceptance quantity differs from current offer.")
+    result = db.supabase.rpc("accept_resolved_quote", {
+        "p_approval_id": req.approval_id, "p_client_id": req.client_id,
+        "p_supplier_id": req.supplier_id, "p_rfq_id": req.rfq_id,
+        "p_quote_id": req.quote_id, "p_offer": offer,
+        "p_accepted_by": req.accepted_by,
     }).execute()
-    if not claim.data:
-        raise HTTPException(status_code=409, detail="Acceptance approval invalid, expired, mismatched, or already consumed.")
-
-    accepted = db.accept_recorded_quote(
-        req.client_id,
-        req.rfq_id,
-        req.supplier_id,
-        price=req.price,
-        quantity=req.quantity,
-        accepted_by=req.accepted_by,
-        quote_id=req.quote_id,
-    )
-    if not accepted:
-        raise HTTPException(
-            status_code=409,
-            detail="Quote cannot be accepted: no matching persisted quote or no valid in-flight negotiation.",
-        )
-    return {"accepted": True, "quote": accepted}
+    if not result.data:
+        raise HTTPException(status_code=409, detail="Approval or offer changed, expired, or is outside authority. Review again.")
+    return {"accepted": True, "quote": offer, "progress": {"deal": "accepted", "negotiation": "completed", "confirmation": "pending"}}
 
 
 @router.post("/prepare-outbound-delivery")

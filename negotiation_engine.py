@@ -10,6 +10,7 @@ Implements:
 6. Structured preflight preparation
 """
 
+from commercial_policy import price_policy
 import os
 import re
 from typing import Dict, Any, Optional, Tuple
@@ -59,29 +60,12 @@ def compute_target_hierarchy(
     3. acceptable_price_max = fallback target only when neither of the above exists
 
     IMPORTANT:
-    - acceptable_price_max is the ONLY hard buyer-authorized ceiling.
+    - Explicit limits take priority over the last-quote-only allowance.
     - last_quote is historical guidance, not permission to pay above it.
-    - no synthetic "last_quote + tolerance" hard ceiling is created.
+    - last_quote-only RFQs use the standing last_quote + AED 5 allowance.
     """
-    preferred_target = None
-    if acceptable_price_min is not None and acceptable_price_min > 0:
-        preferred_target = float(acceptable_price_min)
-    elif last_quote is not None and last_quote > 0:
-        preferred_target = float(last_quote)
-    elif acceptable_price_max is not None and acceptable_price_max > 0:
-        preferred_target = float(acceptable_price_max)
-
-    acc_max = float(acceptable_price_max) if acceptable_price_max is not None and acceptable_price_max > 0 else None
-
-    # Keep the legacy field name for persisted-session compatibility, but its
-    # value is now exactly the explicit buyer-authorized maximum (or null).
-    tolerated_ceiling = acc_max
-
-    return {
-        "preferred_target": preferred_target,
-        "acceptable_max": acc_max,
-        "tolerated_final_ceiling": tolerated_ceiling,
-    }
+    policy = price_policy({'acceptable_price_min': acceptable_price_min, 'acceptable_price_max': acceptable_price_max, 'last_quote': last_quote})
+    return {**policy, 'tolerated_final_ceiling': policy['acceptable_max']}
 
 
 def classify_supplier_movement(
@@ -195,6 +179,10 @@ def build_allowed_counter_range(
     # ask below the supplier's own price. On subsequent turns, hold that stretch
     # counter unless the supplier accepts it or explicitly declares final.
     if latest_supplier_offer <= preferred_target:
+        if attempt_count > 0 or latest_agent_counter is not None:
+            return {"allowed_counter_min": None, "allowed_counter_max": None, "recommended_anchor": None,
+                    "can_concede": False, "selected_strategy": "ACKNOWLEDGE_AND_STOP",
+                    "reason_code": "EXTRA_SAVINGS_ASK_ALREADY_USED", "should_counter": False}
         if latest_agent_counter is not None and latest_agent_counter < latest_supplier_offer:
             stretch = round(float(latest_agent_counter), 2)
         else:

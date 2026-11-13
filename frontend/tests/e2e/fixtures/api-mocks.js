@@ -564,6 +564,10 @@ export async function setupAppMocks(page, options = {}) {
       throw new Error(`Missing API fixture: ${new URL(url).pathname}`);
     }
 
+    if (/\/rfq\/[^/]+\/current-offers/.test(url)) {
+      const rfqId = url.match(/\/rfq\/([^/]+)/)[1];
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({offers: quotes.filter(q => q.rfq_id === rfqId)}) });
+    }
     // Pass through static assets, HTML, JS, CSS
     return route.continue();
   });

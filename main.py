@@ -32,6 +32,7 @@ import logging
 from auth import get_current_user, verify_jwt
 import openclaw_bridge
 from negotiation_engine import MAX_NEGOTIATION_ATTEMPTS
+from commercial_policy import price_policy, apply_constraints
 import negotiation_engine
 from openclaw_bridge import router as openclaw_router
 from supplier_message_planner import BundleItem, plan_supplier_bundles, format_supplier_bundle
@@ -430,6 +431,16 @@ async def enqueue_message(
             logger.warning("[OpenClaw Outbound] Message %s was not claimable; skipping duplicate send.", message_log_id)
             return False
     try:
+        if rfq_id and supplier_id:
+            notice_rfq = db.get_rfq_by_id(rfq_id)
+            if not notice_rfq:
+                raise RuntimeError("Cannot authorize notice without an RFQ")
+            db.supabase.table("commercial_action_intents").insert({
+                "client_id": notice_rfq["client_id"], "supplier_id": supplier_id, "rfq_id": rfq_id,
+                "action_type": "system_notice", "attempt_number": 1, "proposal": {},
+                "guard_snapshot": {"issued_by": "backend"}, "outcome": "APPROVE",
+                "approved_message": message,
+            }).execute()
         payload = await run_in_threadpool(send_via_openclaw_whatsapp, phone_number, message)
         message_id = payload.get("message_id")
         if message_log_id:
@@ -1934,6 +1945,31 @@ async def authorize_negotiation_tradeoff_endpoint(
         "outbound_sent": outbound_sent,
         "session_id": resumed_session.get("id") if resumed_session else None,
     }
+
+
+@app.post("/flags/{flag_id}/verify-price")
+async def verify_price_comparison(flag_id: str, current_user=Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin verification required")
+    client_id = current_user.get("client_id")
+    flag = db.get_flag_by_id(flag_id, client_id)
+    if not flag or flag.get("category") != "price_anomaly":
+        raise HTTPException(status_code=404, detail="Price anomaly not found")
+    metadata = dict(flag.get("metadata") or {})
+    offer = openclaw_bridge._current_offer(flag["rfq_id"], flag["supplier_id"], metadata.get("quote_id"))
+    if not offer or offer.get("price") != metadata.get("price"):
+        raise HTTPException(status_code=409, detail="Offer changed; review the current quotation")
+    metadata.update(price_verified=True, verified_by=current_user.get("id") or current_user.get("user_id"))
+    db.supabase.table("flagged_for_review").update({"metadata": metadata, "status": "resolved"}).eq("id", flag_id).eq("client_id", client_id).execute()
+    return {"verified": True, "guidance": "Price comparison verified. Buyer spending limits still apply; resume via operator instructions."}
+
+
+@app.get("/rfq/{rfq_id}/current-offers")
+async def current_offers_endpoint(rfq_id: str, current_user=Depends(get_current_user)):
+    rfq = db.get_rfq_by_id(rfq_id)
+    if not rfq or rfq.get("client_id") != current_user.get("client_id"):
+        raise HTTPException(status_code=404, detail="RFQ not found")
+    return {"rfq_id": rfq_id, "offers": db.get_quotes_for_rfq(rfq_id), "price_policy": price_policy(apply_constraints(rfq, db.get_rfq_negotiation_constraints(current_user.get("client_id"), rfq_id)))}
 
 
 @app.get("/rfq/{rfq_id}/constraints")
