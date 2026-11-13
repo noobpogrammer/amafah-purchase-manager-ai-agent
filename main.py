@@ -1299,6 +1299,11 @@ async def send_bulk_rfq_bundles(client_id: str, supplier_items: dict) -> dict:
                 log_id = db.log_message(client_id, supplier_id, "outbound", message, related_rfq_id=batch[0].rfq_id)
                 if not log_id:
                     raise RuntimeError("Failed to record outbound bundle message.")
+                # The final send guard requires both the bundle and every linked
+                # item to be in flight. Never expose a partially claimed bundle.
+                claimed_items = db.supabase.table("supplier_message_bundle_items").update({"status": "processing"}).eq("bundle_id", bundle_id).eq("status", "pending").execute()
+                if len(claimed_items.data or []) != len(linked_items):
+                    raise RuntimeError("Incomplete bundle item claim; refusing WhatsApp send.")
                 db.supabase.table("supplier_message_bundles").update({"status": "processing"}).eq("id", bundle_id).execute()
                 sent = await enqueue_message(phone, message, supplier_id=supplier_id, message_log_id=log_id)
                 if not sent:
