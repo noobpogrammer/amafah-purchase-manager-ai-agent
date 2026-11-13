@@ -47,6 +47,13 @@ begin
  select count(*) into n from public.claim_commercial_message_approval(c,s,'Confirmed verification offer');
  if n<>1 then raise exception 'Authorized flexible confirmation rejected'; end if;
 
+ -- The AI-led path must create an in-flight session without the legacy decision tool.
+ delete from public.negotiation_sessions where rfq_id=r;
+ update public.rfqs set due_by=now()+interval '1 hour' where id=r;
+ insert into public.commercial_action_intents(client_id,supplier_id,rfq_id,quote_id,action_type,proposal,guard_snapshot,outcome,approved_message)
+ values(c,s,r,newq,'counter','{"price":10,"quantity":10,"delivery_days":2}',jsonb_build_object('current_offer',offer,'price_policy','{"preferred_target":12,"acceptable_max":17}'::jsonb),'APPROVE','Counter verification offer');
+ select count(*) into n from public.claim_commercial_message_approval(c,s,'Counter verification offer');
+ if n<>1 or not exists(select 1 from public.negotiation_sessions where rfq_id=r and status='active' and latest_agent_counter=10) then raise exception 'AI-led counter did not create a negotiation'; end if;
  -- Finalized RFQ notices still require a backend-issued exact authorization.
  update public.rfqs set status='closed' where id=r;
  insert into public.commercial_action_intents(client_id,supplier_id,rfq_id,action_type,proposal,guard_snapshot,outcome,approved_message)
