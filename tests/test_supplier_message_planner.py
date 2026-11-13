@@ -26,6 +26,7 @@ class SupplierMessagePlannerTests(unittest.TestCase):
             BundleItem("a", "Noora Brush", 24, deadline_hours=24),
             BundleItem("b", "PVC Pipe", 12),
         ])
+        self.assertNotIn("Ref:", msg)
         self.assertIn("1. Noora Brush", msg)
         self.assertIn("2. PVC Pipe", msg)
         self.assertIn("You can reply naturally", msg)

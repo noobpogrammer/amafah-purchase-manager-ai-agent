@@ -1221,6 +1221,9 @@ def review_commercial_action(
 
     # Commercial evaluator checks typed action data only, never LLM prose.
     # Hard boundaries above remain authoritative.
+    product_name = " ".join(str((rfq or {}).get("product_name") or "requested item").split())
+    variant = " ".join(str((effective_offer or {}).get("variant_label") or "").split())
+    item_name = f"{product_name} ({variant})" if variant else product_name
     approved_text = None
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"}:
         if not rfq or not req.quote_id or set(proposal) != {"price", "quantity", "delivery_days"}:
@@ -1241,7 +1244,7 @@ def review_commercial_action(
             elif validate_terms(rfq, q, proposal):
                 outcome, feedback = "RETRY", validate_terms(rfq, q, proposal)
             else:
-                approved_text = (f"Confirmed — AED {float(proposal['price']):g} per unit "
+                approved_text = (f"{item_name}: Confirmed — AED {float(proposal['price']):g} per unit "
                                  f"for {proposal['quantity']} pieces, delivery within "
                                  f"{proposal['delivery_days']} days. Thank you!")
     if outcome == "APPROVE":
@@ -1261,14 +1264,14 @@ def review_commercial_action(
                 outcome, feedback = "RETRY", "Invalid quantity or delivery_days."
             else:
                 approved_text = (
-                    f"Thank you for your quotation. Could you offer AED "
+                    f"{item_name}: Thank you for your quotation. Could you offer AED "
                     f"{float(proposal['price']):g} per unit for {proposal['quantity']} units "
                     f"with delivery within {proposal['delivery_days']} day(s)?"
                 )
         elif action in {"ask", "clarify", "request_info", "request_price"} and rfq and not proposal:
-            approved_text = "Thank you. Could you confirm your best unit price in AED and estimated delivery time?"
+            approved_text = f"{item_name}: Thank you. Could you confirm your best unit price in AED and estimated delivery time?"
         elif action in {"acknowledge", "acknowledgement"} and rfq and not proposal:
-            approved_text = "Thank you. We've received your quotation."
+            approved_text = f"{item_name}: Thank you. We've received your quotation."
         else:
             outcome, feedback = "REJECT", "Unsupported structured action or missing RFQ; no message authorized."
 

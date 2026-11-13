@@ -78,7 +78,7 @@ def format_supplier_bundle(items: Sequence[BundleItem], *, brand: str = "Everywa
 
     lines.append("We're requesting quotations for the following items:")
     for index, item in enumerate(items, 1):
-        row = f"{index}. {item.product_name.strip()} (Ref: {item.rfq_id[:8]}) | Qty: {item.quantity if item.quantity is not None else 'N/A'}"
+        row = f"{index}. {item.product_name.strip()} | Qty: {item.quantity if item.quantity is not None else 'N/A'}"
         if item.specs and item.specs.strip() not in {".", "-", "N/A"}:
             row += f" | Specs: {item.specs.strip()}"
         if item.deadline_hours is not None:

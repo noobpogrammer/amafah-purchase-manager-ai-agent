@@ -26,6 +26,7 @@ begin
  update public.quotes set quantity=10 where id=oldq;
  result=public.accept_resolved_quote(a,c,s,r,newq,offer,'verification');
  if result is null then raise exception 'Inherited offer rejected'; end if;
+ if not exists(select 1 from public.negotiation_sessions where rfq_id=r and latest_supplier_offer=11 and last_quote_id=newq) then raise exception 'Accepted summary price or quote is stale'; end if;
  if not exists(select 1 from public.negotiation_sessions where rfq_id=r and status='completed') then raise exception 'Session not completed atomically'; end if;
  if not exists(select 1 from public.commercial_action_intents where id=a and acceptance_consumed_at is not null and consumed_at is null) then raise exception 'Acceptance consumed send approval'; end if;
  select count(*) into n from public.claim_commercial_message_approval(c,s,'Confirmed verification offer EXTRA UNAPPROVED TERMS');

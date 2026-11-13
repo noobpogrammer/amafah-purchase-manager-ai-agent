@@ -140,3 +140,12 @@ def test_verified_anomaly_can_resume_negotiation_but_not_raise_cap(review_env):
         'category':'price_anomaly','status':'resolved','metadata':{'price_verified':True,'quote_id':'new','price':120}}]
     assert review(review_env,'counter',price=12)['outcome']=='APPROVE'
     assert review(review_env,'accept',price=120)['outcome']=='ESCALATE'
+
+
+@pytest.mark.parametrize('action',['counter','accept'])
+def test_approved_reply_names_the_product_and_variant(review_env,action):
+    review_env[1]['product_name']='20W LED lights'
+    result=review(review_env,action)
+    assert result['outcome']=='APPROVE'
+    assert result['approved_message'].startswith('20W LED lights (50W):')
+    assert 'Ref:' not in result['approved_message']
