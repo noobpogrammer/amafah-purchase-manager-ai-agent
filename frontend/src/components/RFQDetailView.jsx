@@ -262,7 +262,7 @@ export default function RFQDetailView({
         </div>
         <div className="flex-items gap-2">
           <button
-            className={`btn btn-sm ${autoRefresh ? 'btn-success' : 'btn-secondary'}`}
+            className={`btn btn-sm ${autoRefresh ? 'polling-enabled' : 'btn-secondary'}`}
             onClick={() => setAutoRefresh(!autoRefresh)}
           >
             <RefreshCw size={14} className={autoRefresh ? 'spin' : ''} />
