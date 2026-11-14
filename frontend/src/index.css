@@ -1838,3 +1838,19 @@ select:not([multiple]) { appearance: none; -webkit-appearance: none; background-
 .bulk-search input { padding-left: 12px; }
 .bulk-pagination { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding-top: 16px; color: var(--text-muted); font-size: 12px; }
 .bulk-pagination > div { flex-wrap: wrap; }
+
+/* Buyer quote decisions stay beside the offer, separate from Agent Attention. */
+.final-offer-review { margin: 16px 0 4px; padding: 16px; border: 1px solid var(--panel-border); border-left: 3px solid var(--primary); border-radius: var(--radius-md); background: var(--surface-subtle); color: var(--text-main); }
+.final-offer-heading, .final-offer-actions, .final-offer-counter-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.final-offer-heading { justify-content: space-between; margin-bottom: 8px; }
+.final-offer-review p { margin: 8px 0; font-size: 13px; }
+.final-offer-help, .final-offer-review small { color: var(--text-muted); }
+.final-offer-actions { margin-top: 14px; }
+.final-offer-actions .btn { min-height: 42px; }
+.final-offer-counter { display: grid; gap: 10px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--panel-border); }
+.final-offer-counter label { font-size: 13px; font-weight: 600; }
+.final-offer-counter input { width: 160px; max-width: 100%; min-height: 42px; padding: 10px 12px; border: 1px solid var(--input-border); border-radius: var(--radius-sm); background: var(--panel-bg); color: var(--text-main); }
+.final-offer-error { color: var(--danger); }
+@media (max-width: 600px) { .final-offer-counter-controls { align-items: stretch; flex-direction: column; } .final-offer-counter input { width: 100%; } }
+
+.quote-summary-card.quote-needs-buyer-review { grid-column: 1 / -1; }

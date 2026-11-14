@@ -6,6 +6,7 @@ FastAPI owns procurement state, policy, persistence, scheduling, and operator AP
 
 import operator_jobs
 import supplier_notices
+import buyer_quote_reviews
 import asyncio
 import csv
 import io
@@ -971,6 +972,9 @@ async def lifespan(app: FastAPI):
         args=[OPENCLAW_BASE_URL, OPENCLAW_TOOL_API_KEY],
         max_instances=1, coalesce=True, id="operator_instructions", replace_existing=True,
     )
+    scheduler.add_job(buyer_quote_reviews.sync_jobs, "interval", seconds=10,
+                      args=[OPENCLAW_BASE_URL, OPENCLAW_TOOL_API_KEY], max_instances=1,
+                      coalesce=True, id="buyer_quote_decisions", replace_existing=True)
     scheduler.start()
     yield
     print(f"[{datetime.now(timezone.utc).isoformat()}] [Lifespan] Shutting down RFQ scheduler...")
@@ -1977,7 +1981,39 @@ async def current_offers_endpoint(rfq_id: str, current_user=Depends(get_current_
     rfq = db.get_rfq_by_id(rfq_id)
     if not rfq or rfq.get("client_id") != current_user.get("client_id"):
         raise HTTPException(status_code=404, detail="RFQ not found")
-    return {"rfq_id": rfq_id, "offers": db.get_quotes_for_rfq(rfq_id), "price_policy": price_policy(apply_constraints(rfq, db.get_rfq_negotiation_constraints(current_user.get("client_id"), rfq_id)))}
+    return {"rfq_id": rfq_id, "buyer_reviews": buyer_quote_reviews.list_reviews(current_user.get("client_id"), rfq_id), "offers": db.get_quotes_for_rfq(rfq_id), "price_policy": price_policy(apply_constraints(rfq, db.get_rfq_negotiation_constraints(current_user.get("client_id"), rfq_id)))}
+
+
+class BuyerFinalOfferDecision(BaseModel):
+    decision: str
+    counter_price: Optional[float] = None
+
+
+@app.post("/rfq/{rfq_id}/buyer-reviews/{review_id}/decision")
+async def decide_final_offer(rfq_id: str, review_id: str, payload: BuyerFinalOfferDecision, current_user=Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Buyer administrator approval required")
+    client_id=current_user.get("client_id")
+    rows=buyer_quote_reviews.list_reviews(client_id,rfq_id)
+    review=next((r for r in rows if r["id"]==review_id),None)
+    if not review:raise HTTPException(status_code=404,detail="Review not found")
+    offer=openclaw_bridge._current_offer(rfq_id,review["supplier_id"],review["quote_id"])
+    rfq=db.get_rfq_by_id(rfq_id,client_id=client_id)
+    if not offer or not rfq or rfq.get("status")!='active' or buyer_quote_reviews.snapshot(offer)!=review['offer_snapshot']:
+        db.supabase.table('buyer_final_offer_reviews').update({'status':'stale'}).eq('id',review_id).eq('client_id',client_id).execute()
+        raise HTTPException(status_code=409,detail="Offer changed; review the current quotation")
+    if payload.decision not in {'accept','negotiate'} or (payload.decision=='accept' and payload.counter_price is not None):
+        raise HTTPException(status_code=422,detail="Choose accept or negotiate")
+    policy=price_policy(apply_constraints(rfq,db.get_rfq_negotiation_constraints(client_id,rfq_id)))
+    if payload.decision=='accept' and (policy['acceptable_max'] is None or offer['price']>policy['acceptable_max']):
+        raise HTTPException(status_code=409,detail="Offer exceeds current buying authority")
+    if payload.counter_price is not None and (not math.isfinite(payload.counter_price) or payload.counter_price<=0 or payload.counter_price>=offer['price'] or policy['acceptable_max'] is None or payload.counter_price>policy['acceptable_max']):
+        raise HTTPException(status_code=422,detail="Enter a lower counter price within the current buyer limit")
+    if review['status'] not in {'pending','authorized'} or (review['status']=='authorized' and (review['decision']!=payload.decision or review.get('counter_price')!=payload.counter_price)):
+        raise HTTPException(status_code=409,detail='This offer already has a buyer decision. Refresh the quote.')
+    result=db.supabase.rpc('decide_buyer_final_offer',{'p_client_id':client_id,'p_review_id':review_id,
+        'p_user_id':current_user['user_id'],'p_decision':payload.decision,'p_counter':payload.counter_price}).execute().data
+    return {'queued':True,'review':result,'message':'Buyer decision queued. Supplier reply and acceptance are not yet confirmed.'}
 
 
 @app.get("/rfq/{rfq_id}/constraints")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import buyer_quote_reviews
 import logging
 import math
 import os
@@ -597,6 +598,7 @@ class CommercialActionReviewRequest(BaseModel):
     proposed_message: Optional[str] = None
     message_facts: dict = Field(default_factory=dict)
     language: Optional[str] = None
+    supplier_final: bool = False
     client_id: str
     supplier_id: str
     rfq_id: Optional[str] = None
@@ -1157,9 +1159,19 @@ def review_commercial_action(
 
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and rfq.get("acceptable_price_max") is None:
         outcome, feedback = "ESCALATE", "Current RFQ has no authorized maximum; historical benchmarks cannot approve acceptance."
+    buyer_approved_final = False
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and effective_offer:
         target = price_policy(rfq).get("preferred_target")
-        if target is not None and target < float(effective_offer.get("price") or 0) <= float(rfq.get("acceptable_price_max") or 0) and not effective_offer.get("is_current_accepted"):
+        final = req.supplier_final or bool(req.assessment.get("supplier_final")) or _fallback_parse_commercial_message(effective_offer.get("raw_message") or "").supplier_final or buyer_quote_reviews.has_review(req.client_id, req.supplier_id, effective_offer["id"])
+        if target is not None and float(effective_offer.get("price") or 0)>target and final and not effective_offer.get("is_current_accepted"):
+            buyer_approved_final = buyer_quote_reviews.authorized_accept(req.client_id, req.supplier_id, effective_offer)
+            if not buyer_approved_final:
+                review = buyer_quote_reviews.queue(req.client_id, req.supplier_id, req.rfq_id, effective_offer)
+                return {"outcome":"BUYER_REVIEW", "approved_message":None, "approval_id":None,
+                        "buyer_review_id":review["id"], "feedback":"Final offer exceeds target. Wait for the buyer's decision in RFQ Recorded Quotes. Do not accept, send a confirmation, or create an Agent Attention flag. The buyer may accept the exact offer or request another negotiation."}
+    if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and effective_offer:
+        target = price_policy(rfq).get("preferred_target")
+        if target is not None and target < float(effective_offer.get("price") or 0) <= float(rfq.get("acceptable_price_max") or 0) and not effective_offer.get("is_current_accepted") and not buyer_approved_final:
             sent_counters = (db.supabase.table("commercial_action_intents").select("id,consumed_at")
                 .eq("client_id",req.client_id).eq("supplier_id",req.supplier_id).eq("rfq_id",req.rfq_id)
                 .eq("outcome","APPROVE").in_("action_type",["counter","counteroffer","negotiate"]).execute().data or [])
@@ -1363,6 +1375,7 @@ def review_commercial_action(
                 "message_facts": req.message_facts,
                 "language": req.language,
                 "ai_authored": True,
+                "supplier_final": req.supplier_final,
                 "assessment": req.assessment,
                 "current_offer": effective_offer,
                 "negotiation_mode": negotiation_mode,

@@ -1,3 +1,4 @@
+import FinalOfferReview from './FinalOfferReview';
 import React, { useState, useEffect, useRef } from 'react';
 import { fetchRFQs, fetchRFQDetail, triggerAIRanking, closeRFQ, fetchRFQActivity } from '../api';
 import { ensureProfile } from '../lib/ensureProfile';
@@ -473,8 +474,9 @@ export default function RFQDetailView({
                             ? bestQuoteId === q.id
                             : (detailData.ranking?.best_supplier_id === q.supplier_id && detailData.quotes.filter((x) => x.supplier_id === detailData.ranking.best_supplier_id).length === 1);
 
+                          const buyerReview = (detailData.buyerReviews || []).find(review => review.quote_id === q.id);
                           return (
-                            <div key={q.id} className={`quote-summary-card ${isBest ? 'row-highlight' : ''}`}>
+                            <div key={q.id} className={`quote-summary-card ${isBest ? 'row-highlight' : ''} ${buyerReview ? 'quote-needs-buyer-review' : ''}`}>
                               <div className="quote-header">
                                 <div>
                                   <strong>{q.suppliers?.name || 'Supplier'}</strong>
@@ -501,6 +503,7 @@ export default function RFQDetailView({
                                 </div>
                                 <span className="price-tag">AED {q.price}</span>
                               </div>
+                              <FinalOfferReview key={`${q.id}-review`} review={buyerReview} rfqId={selectedRfqId} target={detailData.rfq.negotiation_price_policy?.preferred_target} maxPrice={detailData.rfq.negotiation_price_policy?.acceptable_max} isAdmin={isAdmin} onUpdated={() => loadRFQDetail(selectedRfqId)} />
                               <div className="quote-body">
                                 <p><strong>Delivery:</strong> {q.delivery_time || '-'}</p>
                                 {(q.quality_notes || q.raw_message) && <details className="quote-extra">

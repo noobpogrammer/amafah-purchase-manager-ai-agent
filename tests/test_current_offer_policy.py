@@ -216,3 +216,27 @@ def test_above_target_opening_final_offer_needs_one_counter(review_env):
     assert review(review_env,'accept')['outcome']=='RETRY'
     review_env[3]['commercial_action_intents']=[{'id':'prior','client_id':'c','rfq_id':'r','supplier_id':'s','action_type':'counter','outcome':'APPROVE','consumed_at':'sent'}]
     assert review(review_env,'accept')['outcome']=='APPROVE'
+
+
+@pytest.mark.parametrize('price,target,needs_review',[(95,80,True),(80,80,False),(75,80,False)])
+def test_final_price_buyer_review_only_above_target(review_env,price,target,needs_review):
+    b=review_env[0]
+    review_env[1].update(last_quote=80,acceptable_price_min=target,acceptable_price_max=100)
+    review_env[2]['price']=price
+    with patch.object(b.buyer_quote_reviews,'authorized_accept',return_value=False),patch.object(b.buyer_quote_reviews,'queue',return_value={'id':'buyer-review'}) as queue:
+        result=review(review_env,'accept',price=price,supplier_final=True)
+    assert (result['outcome']=='BUYER_REVIEW') is needs_review
+    assert queue.called is needs_review
+    if needs_review:
+        assert result['approved_message'] is None
+        review_env[5].assert_not_called()
+    else: assert result['outcome']=='APPROVE'
+
+
+def test_buyer_exact_final_acceptance_bypasses_first_counter_only(review_env):
+    b=review_env[0];review_env[1].update(acceptable_price_min=8,acceptable_price_max=15)
+    with patch.object(b.buyer_quote_reviews,'authorized_accept',return_value=True):
+        assert review(review_env,'accept',supplier_final=True)['outcome']=='APPROVE'
+    review_env[2]['price']=20
+    with patch.object(b.buyer_quote_reviews,'authorized_accept',return_value=True):
+        assert review(review_env,'accept',price=20,supplier_final=True)['outcome']=='ESCALATE'

@@ -242,7 +242,7 @@ export async function fetchRFQDetail(rfqId) {
   const quoteHistory = quotesRes.data || [];
   const resolvedResponse = await authorizedFetch(`/rfq/${encodeURIComponent(rfqId)}/current-offers`);
   if (!resolvedResponse.ok) throw new Error('Could not load the current supplier offers.');
-  const { offers, price_policy: pricePolicy } = await resolvedResponse.json();
+  const { offers, price_policy: pricePolicy, buyer_reviews: buyerReviews } = await resolvedResponse.json();
   const supplierLifecycle = new Map(suppliers.map(supplier => [supplier.supplier_id, supplier]));
   const effectiveQuotes = (offers || []).map(offer => {
     const lifecycle = supplierLifecycle.get(offer.supplier_id);
@@ -256,6 +256,7 @@ export async function fetchRFQDetail(rfqId) {
     rfq: { ...rfqRes.data, negotiation_price_policy: pricePolicy },
     suppliers,
     quotes: effectiveQuotes,
+    buyerReviews: buyerReviews || [],
     quoteHistory,
     ranking: rankingRes.data?.[0] || null,
     constraints: constraintsRes.data || [],
@@ -621,4 +622,15 @@ export async function verifyPriceComparison(flagId) {
   const response = await authorizedFetch(`/flags/${encodeURIComponent(flagId)}/verify-price`, {method:'POST'});
   if (!response.ok) throw new Error((await response.json()).detail || 'Could not verify price comparison');
   return response.json();
+}
+
+
+export async function decideBuyerFinalOffer(rfqId, reviewId, decision, counterPrice = null) {
+  const response = await authorizedFetch(`/rfq/${encodeURIComponent(rfqId)}/buyer-reviews/${encodeURIComponent(reviewId)}/decision`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ decision, counter_price: counterPrice }),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.detail || 'Could not save buyer decision');
+  return result;
 }
