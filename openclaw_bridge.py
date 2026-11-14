@@ -984,6 +984,13 @@ def authorize_system_outbound(
         return {"authorized": False, "reason": "invalid_message"}
     if db.is_client_automation_paused(req.client_id):
         return {"authorized": False, "reason": "automation_paused"}
+    if req.message.strip() == "Could you please confirm which product your message refers to?":
+        supplier = _get_supplier_for_client(req.client_id, None, req.phone_number)
+        clarification = db.supabase.rpc("claim_rfq_clarification", {
+            "p_client_id": req.client_id, "p_supplier_id": supplier["id"], "p_body": req.message.strip(),
+        }).execute()
+        if clarification.data:
+            return {"authorized": True, "purpose": "rfq_clarification"}
     phone = re.sub(r"\D", "", req.phone_number or "")
     if not phone:
         return {"authorized": False, "reason": "invalid_recipient"}
@@ -1049,6 +1056,29 @@ def review_commercial_action(
     proposal = req.proposal or {}
     if not isinstance(proposal, dict):
         raise HTTPException(status_code=422, detail="proposal must be a JSON object")
+    # Tool-shape mistakes are recoverable; never interpret supplied prose as authority.
+    informational = {"acknowledge", "acknowledgement", "ask", "clarify", "request_info", "request_price", "clarify_rfq"}
+    if action in informational and proposal:
+        return {"outcome": "RETRY", "feedback": "Informational actions require an empty proposal {}. Remove message/terms fields and retry; use action_type=clarify_rfq without rfq_id when the product is unclear.",
+                "approved_message": None, "approval_id": None, "retryable": True}
+    if action == "clarify_rfq":
+        if req.rfq_id or req.quote_id:
+            return {"outcome": "RETRY", "feedback": "RFQ clarification must omit rfq_id and quote_id; do not guess a product to ask which product is meant.", "approved_message": None, "approval_id": None}
+        if db.is_client_automation_paused(req.client_id):
+            raise HTTPException(status_code=409, detail="Automation is paused")
+        candidates = sorted({str(x["rfqs"]["id"]) for x in db.get_open_rfqs_for_supplier(req.supplier_id)
+                             if (x.get("rfqs") or {}).get("client_id") == req.client_id})
+        if not candidates:
+            return {"outcome": "REJECT", "feedback": "No linked open RFQs to clarify.", "approved_message": None}
+        text = "Could you please confirm which product your message refers to?"
+        db.supabase.table("commercial_action_intents").insert({
+            "client_id": req.client_id, "supplier_id": req.supplier_id, "rfq_id": None,
+            "action_type": "clarify_rfq", "attempt_number": req.attempt_number,
+            "proposal": {}, "guard_snapshot": {"candidate_rfq_ids": candidates},
+            "outcome": "APPROVE", "approved_message": text,
+        }).execute()
+        return {"outcome": "APPROVE", "approved_message": text, "approval_id": None,
+                "rfq_id": None, "candidate_rfq_ids": candidates, "changes_commercial_records": False}
     # Reject malformed commercial JSON before evaluating numeric constraints.
     if action in {"counter", "counteroffer", "negotiate"}:
         required = {"price", "quantity", "delivery_days"}
@@ -1378,7 +1408,7 @@ def resolve_rfq_context(
 
         quote_res = (
             db.supabase.table("quotes")
-            .select("id,price,quantity,delivery_time,is_available,is_accepted,created_at")
+            .select("id,price,quantity,delivery_time,is_available,is_accepted,is_current_accepted,created_at")
             .eq("rfq_id", rfq["id"])
             .eq("supplier_id", req.supplier_id)
             .order("created_at", desc=True)
@@ -1410,6 +1440,7 @@ def resolve_rfq_context(
             "due_by": rfq.get("due_by"),
             "supplier_status": link.get("status"),
             "negotiation_attempts": link.get("negotiation_attempts") or 0,
+            "deal_state": "accepted" if any(q.get("is_current_accepted") for q in quote_rows) else "awaiting_or_negotiating_quote",
             "has_quote_history": bool(quote_rows),
             "latest_quote": latest_quote,
             "active_negotiation": bool(session),
@@ -1802,6 +1833,7 @@ def supplier_context(
         rfq = link.get("rfqs") or {}
         if rfq.get("client_id") != req.client_id:
             continue
+        accepted = db.supplier_has_accepted_quote(rfq["id"], supplier["id"])
         open_rfqs.append(
             {
                 "rfq_id": rfq.get("id"),
@@ -1814,6 +1846,7 @@ def supplier_context(
                 "acceptable_price_max": rfq.get("acceptable_price_max"),
                 "required_delivery_days": rfq.get("required_delivery_days"),
                 "due_by": rfq.get("due_by"),
+                "deal_state": "accepted" if accepted else "awaiting_or_negotiating_quote",
                 "supplier_status": link.get("status"),
                 "negotiation_attempts": link.get("negotiation_attempts") or 0,
             }

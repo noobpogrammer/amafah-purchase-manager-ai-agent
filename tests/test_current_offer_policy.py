@@ -149,3 +149,28 @@ def test_approved_reply_names_the_product_and_variant(review_env,action):
     assert result['outcome']=='APPROVE'
     assert result['approved_message'].startswith('20W LED lights (50W):')
     assert 'Ref:' not in result['approved_message']
+
+
+@pytest.mark.parametrize('action',['acknowledge','clarify','clarify_rfq'])
+def test_informational_prose_is_retryable_even_on_second_attempt(review_env,action):
+    b=review_env[0]
+    result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',action_type=action,attempt_number=2,proposal={'message':'Yes confirmed'}))
+    assert result['outcome']=='RETRY' and result['approved_message'] is None
+    assert 'empty proposal' in result['feedback']
+    assert 'commercial_action_intents' not in review_env[3]
+
+
+def test_unclear_product_can_ask_without_assigning_rfq(review_env):
+    b=review_env[0]
+    with patch.object(b.db,'is_client_automation_paused',return_value=False),patch.object(b.db,'get_open_rfqs_for_supplier',return_value=[{'rfqs':{'id':'r','client_id':'c'}},{'rfqs':{'id':'x','client_id':'other'}}]):
+        result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',action_type='clarify_rfq',proposal={}))
+    assert result['outcome']=='APPROVE' and result['rfq_id'] is None
+    row=review_env[3]['commercial_action_intents'][0]
+    assert row['rfq_id'] is None and row['guard_snapshot']['candidate_rfq_ids']==['r']
+    assert result['changes_commercial_records'] is False
+
+
+def test_clarification_cannot_smuggle_selected_quote(review_env):
+    b=review_env[0]
+    result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',rfq_id='r',action_type='clarify_rfq'))
+    assert result['outcome']=='RETRY'
