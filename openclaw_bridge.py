@@ -655,7 +655,8 @@ class ResolveCommercialDraftRequest(BaseModel):
     client_id: str
     supplier_id: str
     draft_id: str
-    rfq_id: str
+    rfq_id: Optional[str] = None
+    matched_quote_id: Optional[str] = None
 
 
 @router.post("/activation-gate")
@@ -1642,19 +1643,31 @@ def resolve_commercial_draft(
     """Resolve an existing commercial draft to one RFQ without losing extracted facts."""
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
-    _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+    current_offer = None
+    if req.matched_quote_id:
+        if not req.rfq_id:
+            raise HTTPException(status_code=422, detail="A matched quote requires its RFQ")
+        _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
+        current_offer = _current_offer(req.rfq_id, req.supplier_id, req.matched_quote_id)
+        if not current_offer:
+            raise HTTPException(status_code=409, detail="Quote does not match the supplier/RFQ or is no longer current")
 
     answer = _resolve_quote_source(req.client_id, req.supplier_id, req.answer_source_message_id, req.raw_answer)
     result = db.supabase.rpc("resolve_rfq_clarification", {
         "p_client_id": req.client_id, "p_supplier_id": req.supplier_id,
         "p_draft_id": req.draft_id, "p_rfq_id": req.rfq_id, "p_answer_id": answer,
     }).execute().data or {}
+    if result.get("needs_buyer_help"):
+        return {**result, "outcome":"BUYER_HELP", "instruction":"No active RFQ is linked to this supplier/product. Your team has been asked to check. Do not create an RFQ, revise a quote, or accept an offer."}
     if not result.get("resolved"):
         raise HTTPException(status_code=409, detail=result.get("reason", "Draft changed; reload context"))
     draft = result["draft"]
+    if current_offer is None:
+        current_offer = _current_offer(req.rfq_id, req.supplier_id, None)
     return {**result, "rfq_id": req.rfq_id, "extracted_facts": draft.get("extracted_facts", {}),
             "raw_message": draft.get("raw_message"),
-            "instruction": "Use preserved facts and the linked answer. Resolution identifies an RFQ only; saving or accepting still needs normal checks."}
+            "current_offer": current_offer,
+            "instruction": "Use preserved facts and the linked answer. The named RFQ may be outside the original suggestions but must belong to this supplier. Inspect current offers for that RFQ. Save changed terms as a new quote revision, preserving history; do not overwrite or move another product quote. An accepted offer revision still requires the normal revision workflow. No new acceptance is authorized by clarification."}
 
 
 class MultiItemSupplierQuoteRequest(BaseModel):

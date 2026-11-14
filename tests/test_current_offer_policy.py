@@ -240,3 +240,22 @@ def test_buyer_exact_final_acceptance_bypasses_first_counter_only(review_env):
     review_env[2]['price']=20
     with patch.object(b.buyer_quote_reviews,'authorized_accept',return_value=True):
         assert review(review_env,'accept',price=20,supplier_final=True)['outcome']=='ESCALATE'
+
+
+def test_unknown_clarification_requests_help_without_quote_mutation(review_env):
+    b=review_env[0]
+    review_env[4].rpc.return_value.execute.return_value.data={'needs_buyer_help':True,'draft':{'id':'draft'}}
+    with patch.object(b,'_resolve_quote_source',return_value='answer'):
+        result=b.resolve_commercial_draft(b.ResolveCommercialDraftRequest(client_id='c',supplier_id='s',draft_id='draft',answer_source_message_id='answer'))
+    assert result['outcome']=='BUYER_HELP'
+    assert review_env[4].rpc.call_args.args[1]['p_rfq_id'] is None
+
+
+def test_wrong_current_quote_cannot_resolve_correction(review_env):
+    b=review_env[0]
+    from fastapi import HTTPException
+    with patch.object(b,'_current_offer',return_value=None):
+        with pytest.raises(HTTPException) as exc:
+            b.resolve_commercial_draft(b.ResolveCommercialDraftRequest(client_id='c',supplier_id='s',draft_id='draft',rfq_id='r',matched_quote_id='wrong',answer_source_message_id='answer'))
+    assert exc.value.status_code==409
+    review_env[4].rpc.assert_not_called()
