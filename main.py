@@ -5,6 +5,7 @@ FastAPI owns procurement state, policy, persistence, scheduling, and operator AP
 """
 
 import operator_jobs
+import supplier_notices
 import asyncio
 import csv
 import io
@@ -612,7 +613,7 @@ async def finalize_rfq_job(rfq: dict):
     """
     Executes idempotent finalization steps for an RFQ (after atomic claim or during recovery):
     1. Generates and persists AI quote ranking if quotes exist and ranking is not yet saved.
-    2. Idempotently creates and enqueues closure notifications for participating suppliers using event_key.
+    2. Durably queues per-item closures for supplier-level batching; completion is not delivery.
     3. Marks RFQ finalization as 'completed' with finalized_at timestamp.
     """
     rfq_id = rfq.get("id")
@@ -644,12 +645,6 @@ async def finalize_rfq_job(rfq: dict):
         if not rfq_suppliers:
             rfq_suppliers = db.get_rfq_suppliers_for_rfq(rfq_id)
 
-        description = prod
-        if rfq.get("specs"):
-            description += f" ({rfq['specs']})"
-        if rfq.get("quantity") is not None:
-            description += f", {rfq['quantity']} units"
-        msg = f"The quotation window for '{description}' has ended. We are no longer requesting quotes for this item. Thank you!"
         all_notifications_confirmed = True
 
         for item in rfq_suppliers:
@@ -672,15 +667,13 @@ async def finalize_rfq_job(rfq: dict):
                 c_id = client_id or supplier.get("client_id")
                 event_key = f"rfq_closed:{rfq_id}:{supplier_id}"
                 existing_msg = db.get_message_by_event_key(event_key)
+                # Legacy single notices already attempted must not be replayed.
                 if not existing_msg:
-                    msg_log_id = db.log_message(c_id, supplier_id, "outbound", msg, related_rfq_id=rfq_id, event_key=event_key)
-                    if msg_log_id:
-                        await enqueue_message(phone, msg, rfq_id=rfq_id, supplier_id=supplier_id, message_log_id=msg_log_id)
-                    else:
-                        print(f"[{now_iso}] [Finalization ERROR] Failed to establish durable closure message for supplier {supplier_id} (event_key: {event_key}).")
+                    delivery = db.get_initial_rfq_delivery_status(rfq_id, supplier_id)
+                    if not delivery or delivery.get("status") != "sent":
+                        continue
+                    if not supplier_notices.queue_closure(c_id, supplier_id, rfq_id):
                         all_notifications_confirmed = False
-                else:
-                    print(f"[{now_iso}] [Finalization] Closure notification already logged for supplier {supplier_id} (event_key: {event_key}), skipping.")
 
         if not all_notifications_confirmed:
             print(f"[{now_iso}] [Finalization] Incomplete notification persistence for RFQ {rfq_id}. Leaving in 'processing' state.")
@@ -702,6 +695,10 @@ async def finalize_rfq_job(rfq: dict):
         tb = traceback.format_exc()
         print(f"[{now_iso}] [Finalization ERROR] Failed marking finalization completed for RFQ {rfq_id}: {comp_err}\n{tb}")
         db.log_webhook_error(str(comp_err), tb, {"job": "finalize_rfq_job", "stage": "mark_completed", "rfq_id": rfq_id})
+
+
+async def flush_supplier_closures():
+    await supplier_notices.flush_closures(enqueue_message)
 
 
 async def check_deadlines_and_reminders():
@@ -802,15 +799,12 @@ async def check_deadlines_and_reminders():
                 sent_at = sent_at.replace(tzinfo=timezone.utc)
             percentage = (now - sent_at).total_seconds() * 100 / (max(1, rfq.get("deadline_hours") or 24) * 3600)
             count = item.get("reminder_count") or 0
-            stage = "90%" if count == 2 and 90 <= percentage < 100 else (
-                "70%" if count == 1 and 70 <= percentage < 100 else (
-                    "50%" if count == 0 and 50 <= percentage < 100 else None
-                )
-            )
-            if stage is None:
+            due_stage = supplier_notices.due_reminder_stage(percentage, count)
+            if due_stage is None:
                 continue
+            stage, stage_number = due_stage
             grouped_reminders.setdefault((client_id, supplier_id), {"supplier": supplier, "items": []})["items"].append({
-                "link": item, "rfq": rfq, "stage": stage,
+                "link": item, "rfq": rfq, "stage": stage, "stage_number": stage_number,
                 "plan": BundleItem(rfq_id=str(rfq["id"]), product_name=rfq.get("product_name") or "RFQ Item", quantity=rfq.get("quantity")),
             })
         except Exception as item_err:
@@ -853,6 +847,9 @@ async def check_deadlines_and_reminders():
                 message_id = db.log_message(client_id, supplier_id, "outbound", msg, related_rfq_id=batch[0].rfq_id, event_key=event_key)
                 if not message_id:
                     raise RuntimeError("Could not persist idempotent reminder message")
+                claimed = db.supabase.table("supplier_message_bundle_items").update({"status": "processing"}).eq("bundle_id", bundle_id).eq("status", "pending").execute()
+                if len(claimed.data or []) != len(link_rows):
+                    raise RuntimeError("Incomplete reminder item claim")
                 db.supabase.table("supplier_message_bundles").update({"status": "processing"}).eq("id", bundle_id).execute()
                 if not await enqueue_message(group["supplier"]["phone_number"], msg, supplier_id=supplier_id, message_log_id=message_id):
                     db.supabase.table("supplier_message_bundles").update({
@@ -869,7 +866,7 @@ async def check_deadlines_and_reminders():
                 }).eq("id", bundle_id).execute()
                 db.supabase.table("supplier_message_bundle_items").update({"status": "sent"}).eq("bundle_id", bundle_id).execute()
                 for e in entries:
-                    db.update_rfq_supplier_reminder(e["link"]["id"], (e["link"].get("reminder_count") or 0) + 1)
+                    db.update_rfq_supplier_reminder(e["link"]["id"], e["stage_number"])
             except Exception as reminder_err:
                 logger.exception("Grouped reminder failed for supplier %s: %s", supplier_id, reminder_err)
                 db.log_webhook_error(str(reminder_err), traceback.format_exc(), {"job": "grouped_reminders", "supplier_id": supplier_id})
@@ -956,9 +953,15 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     scheduler.add_job(
+        flush_supplier_closures, "interval", seconds=30, max_instances=1, coalesce=True,
+        id="flush_supplier_closures", replace_existing=True,
+    )
+    scheduler.add_job(
         check_deadlines_and_reminders,
         "interval",
-        minutes=15,
+        minutes=1,
+        max_instances=1,
+        coalesce=True,
         next_run_time=datetime.now(timezone.utc),
         id="check_deadlines_and_reminders",
         replace_existing=True,

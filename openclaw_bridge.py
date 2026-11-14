@@ -1004,9 +1004,9 @@ def authorize_system_outbound(
         return {"authorized": False, "reason": "invalid_recipient"}
     matches = (
         db.supabase.table("supplier_message_bundles")
-        .select("id,supplier_id,client_id")
+        .select("id,supplier_id,client_id,kind")
         .eq("client_id", req.client_id)
-        .eq("kind", "initial_rfq")
+        .in_("kind", ["initial_rfq", "reminder"])
         .eq("status", "processing")
         .eq("message", req.message)
         .limit(5)
@@ -1039,11 +1039,20 @@ def authorize_system_outbound(
                 .execute()
             )
             rfq = rfq_rows.data[0] if rfq_rows.data else None
+            if bundle.get("kind") == "reminder":
+                live_link = (db.supabase.table("rfq_suppliers").select("status")
+                    .eq("rfq_id", item["rfq_id"]).eq("supplier_id", bundle["supplier_id"]).limit(1).execute().data or [])
+                if not live_link or live_link[0].get("status") != "sent":
+                    valid = False
+                    break
+            if bundle.get("kind") == "reminder" and (db.supplier_has_accepted_quote(item["rfq_id"], bundle["supplier_id"]) or db.get_active_negotiation_session(req.client_id, item["rfq_id"], bundle["supplier_id"])):
+                valid = False
+                break
             if not rfq or not db.is_rfq_open(rfq):
                 valid = False
                 break
         if valid:
-            return {"authorized": True, "purpose": "initial_rfq", "bundle_id": bundle["id"]}
+            return {"authorized": True, "purpose": bundle.get("kind", "initial_rfq"), "bundle_id": bundle["id"]}
     return {"authorized": False, "reason": "no_exact_inflight_authorization"}
 
 

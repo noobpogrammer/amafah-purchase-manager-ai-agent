@@ -16,17 +16,16 @@ async def test_deadline_notice_checks_each_supplier_and_keeps_other_rfqs_indepen
         stack.enter_context(patch.object(db,'get_quotes_for_rfq',return_value=[]))
         check=stack.enter_context(patch.object(db,'supplier_has_accepted_quote',side_effect=lambda r,s:accepted and s=='A'))
         stack.enter_context(patch.object(db,'get_message_by_event_key',return_value=None))
-        log=stack.enter_context(patch.object(db,'log_message',return_value='message'))
+        queue=stack.enter_context(patch.object(main.supplier_notices,'queue_closure',return_value=True))
+        stack.enter_context(patch.object(db,'get_initial_rfq_delivery_status',return_value={'status':'sent'}))
         send=stack.enter_context(patch.object(main,'enqueue_message',new_callable=AsyncMock))
         done=stack.enter_context(patch.object(db,'mark_rfq_finalization_completed',return_value=True))
         stack.enter_context(patch.object(db,'expire_negotiation_sessions_for_rfq'))
         await main.finalize_rfq_job(rfq)
-        assert send.await_count==(1 if accepted else 2)
+        send.assert_not_awaited()
+        assert queue.call_count==(1 if accepted else 2)
         assert check.call_args_list[0].args==('rfq','A')
-        text=send.call_args.args[1]
-        assert '20W' in text and '20 units' in text
-        assert 'quotation window' in text and 'closed as the deadline' not in text
-        if accepted:assert log.call_args.args[1]=='B'
+        if accepted: assert queue.call_args.args[1]=='B'
         done.assert_called_once()
 
 @pytest.mark.asyncio

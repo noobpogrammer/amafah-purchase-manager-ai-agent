@@ -22,6 +22,7 @@ class Query:
         self.values = None
     def select(self, *_): return self
     def eq(self, key, value): self.filters.append((key,value)); return self
+    def in_(self, key, values): return self
     def limit(self, *_): return self
     def insert(self, values): self.add = values; return self
     def update(self, values): self.values=values; return self
@@ -58,3 +59,13 @@ async def test_bulk_sender_claims_every_item_before_final_guard(partial):
         assert len(calls)==1
         assert store.rows['supplier_message_bundles'][0]['status']=='sent'
         assert store.rows['supplier_message_bundle_items'][0]['status']=='sent'
+
+@pytest.mark.parametrize('link_status,accepted,allowed',[('sent',False,True),('responded',False,False),('sent',True,False)])
+def test_grouped_reminder_authorization_rechecks_live_supplier_state(link_status,accepted,allowed):
+    store=Store()
+    store.rows['rfq_suppliers'][0]['status']=link_status
+    store.rows['supplier_message_bundles']=[{'id':'bundle','supplier_id':'supplier','client_id':'tenant','kind':'reminder','status':'processing','message':'Reminder for lights'}]
+    store.rows['supplier_message_bundle_items']=[{'bundle_id':'bundle','rfq_id':'rfq','status':'processing'}]
+    with patch.object(main.db,'supabase',store),patch.object(bridge,'_require_openclaw_key'),patch.object(main.db,'is_client_automation_paused',return_value=False),patch.object(main.db,'get_supplier_by_id',return_value={'phone_number':'+123'}),patch.object(main.db,'is_rfq_open',return_value=True),patch.object(main.db,'supplier_has_accepted_quote',return_value=accepted),patch.object(main.db,'get_active_negotiation_session',return_value=None):
+        result=bridge.authorize_system_outbound(bridge.SystemOutboundAuthorizationRequest(client_id='tenant',phone_number='+123',message='Reminder for lights'))
+    assert result['authorized'] is allowed
