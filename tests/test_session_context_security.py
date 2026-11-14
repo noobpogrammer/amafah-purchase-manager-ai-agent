@@ -78,7 +78,7 @@ def chain():
 
 @pytest.mark.parametrize('limit,expected',[(0,False),(3,True)])
 def test_supplier_history_is_explicit_recovery_only(limit,expected):
-    with patch.object(bridge,'_require_openclaw_key'),patch.object(bridge,'_get_supplier_for_client',return_value={'id':'s'}),patch.object(db,'get_open_rfqs_for_supplier',return_value=[]),patch.object(db,'get_supplier_conversation_history',return_value=[{'body':'old'}]) as history,patch.object(db,'get_active_negotiation_session_for_supplier',return_value=None),patch.object(db,'is_client_automation_paused',return_value=False):
+    with patch.object(bridge,'_require_openclaw_key'),patch.object(bridge,'_get_supplier_for_client',return_value={'id':'s'}),patch.object(db,'get_open_rfqs_for_supplier',return_value=[]),patch.object(db,'get_supplier_conversation_history',return_value=[{'body':'old'}]) as history,patch.object(db,'get_active_negotiation_session_for_supplier',return_value=None),patch.object(db,'is_client_automation_paused',return_value=False),patch.object(db.supabase,'table',side_effect=lambda _:chain()):
         result=bridge.supplier_context(bridge.SupplierContextRequest(client_id='tenant',supplier_id='s',history_limit=limit))
     assert history.called==expected
     assert result['conversation_history']==([{'body':'old'}] if expected else [])

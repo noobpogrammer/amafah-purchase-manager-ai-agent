@@ -591,6 +591,8 @@ class ActivationGateRequest(BaseModel):
 
 
 class CommercialActionReviewRequest(BaseModel):
+    source_message_id: Optional[str] = None
+    raw_message: Optional[str] = None
     proposed_message: Optional[str] = None
     client_id: str
     supplier_id: str
@@ -643,6 +645,8 @@ class PendingCommercialDraftRequest(BaseModel):
 
 
 class ResolveCommercialDraftRequest(BaseModel):
+    answer_source_message_id: str
+    raw_answer: Optional[str] = None
     client_id: str
     supplier_id: str
     draft_id: str
@@ -673,11 +677,15 @@ def activation_gate(
     )
     pending_flags = pending_flags_res.data or []
 
+    waiting_drafts = (db.supabase.table("pending_commercial_drafts").select("id")
+        .eq("client_id", req.client_id).eq("supplier_id", supplier["id"])
+        .eq("status", "awaiting_rfq_resolution").limit(1).execute().data or [])
     has_procurement_state = bool(
         open_links
         or active_session
         or pending_clarification
         or pending_flags
+        or waiting_drafts
     )
 
     # Explicit greetings/personal-only messages stay silent. Other replies with
@@ -1070,15 +1078,14 @@ def review_commercial_action(
                              if (x.get("rfqs") or {}).get("client_id") == req.client_id})
         if not candidates:
             return {"outcome": "REJECT", "feedback": "No linked open RFQs to clarify.", "approved_message": None}
-        text = "Could you please confirm which product your message refers to?"
-        db.supabase.table("commercial_action_intents").insert({
-            "client_id": req.client_id, "supplier_id": req.supplier_id, "rfq_id": None,
-            "action_type": "clarify_rfq", "attempt_number": req.attempt_number,
-            "proposal": {}, "guard_snapshot": {"candidate_rfq_ids": candidates},
-            "outcome": "APPROVE", "approved_message": text,
-        }).execute()
-        return {"outcome": "APPROVE", "approved_message": text, "approval_id": None,
-                "rfq_id": None, "candidate_rfq_ids": candidates, "changes_commercial_records": False}
+        source = _resolve_quote_source(req.client_id, req.supplier_id, req.source_message_id, req.raw_message)
+        if not source:
+            return {"outcome": "RETRY", "feedback": "Log the inbound message and supply source_message_id and raw_message. Clarification must be linked to its saved message.", "approved_message": None}
+        result = db.supabase.rpc("prepare_rfq_clarification", {
+            "p_client_id": req.client_id, "p_supplier_id": req.supplier_id, "p_source_id": source,
+            "p_candidates": candidates, "p_facts": req.assessment.get("extracted_facts", {}), "p_issue_question": True,
+        }).execute().data
+        return result
     # Reject malformed commercial JSON before evaluating numeric constraints.
     if action in {"counter", "counteroffer", "negotiate"}:
         required = {"price", "quantity", "delivery_days"}
@@ -1098,7 +1105,6 @@ def review_commercial_action(
     negotiation_mode = None
     if req.rfq_id:
         rfq = _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
-        _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id, req.reply_to_message_id)
         rfq = apply_constraints(rfq, db.get_rfq_negotiation_constraints(req.client_id, req.rfq_id))
         policy = price_policy(rfq)
         rfq["acceptable_price_max"] = policy["acceptable_max"]
@@ -1108,7 +1114,12 @@ def review_commercial_action(
             req.rfq_id,
             req.supplier_id,
         )
-        if rfq.get("status") != "active":
+        historical_ack = action in {"acknowledge", "acknowledgement"} and bool(effective_offer and effective_offer.get("is_current_accepted"))
+        if not historical_ack:
+            _require_current_bundle_rfq(req.client_id, req.supplier_id, req.rfq_id, req.reply_to_message_id)
+        if historical_ack:
+            outcome, feedback, adjusted = "APPROVE", "Acknowledgement of an existing accepted deal only.", None
+        elif rfq.get("status") != "active":
             outcome = "REJECT"
             feedback = f"RFQ is {rfq.get('status')}; no new commercial action is allowed."
             adjusted = None
@@ -1301,7 +1312,10 @@ def review_commercial_action(
         elif action in {"ask", "clarify", "request_info", "request_price"} and rfq and not proposal:
             approved_text = f"{item_name}: Thank you. Could you confirm your best unit price in AED and estimated delivery time?"
         elif action in {"acknowledge", "acknowledgement"} and rfq and not proposal:
-            approved_text = f"{item_name}: Thank you. We've received your quotation."
+            if effective_offer and effective_offer.get("is_current_accepted"):
+                approved_text = f"{item_name}: Your quotation at AED {float(effective_offer['price']):g} per unit is already accepted. Thank you."
+            else:
+                approved_text = f"{item_name}: Thank you. We've received your quotation."
         else:
             outcome, feedback = "REJECT", "Unsupported structured action or missing RFQ; no message authorized."
 
@@ -1575,51 +1589,13 @@ def save_pending_commercial_draft(
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
 
-    clean_ids = []
-    for rfq_id in req.candidate_rfq_ids[:8]:
-        rfq = db.get_rfq_by_id(rfq_id, client_id=req.client_id)
-        if rfq:
-            clean_ids.append(rfq_id)
-
-    payload = {
-        "client_id": req.client_id,
-        "supplier_id": req.supplier_id,
-        "source_message_id": req.source_message_id,
-        "reply_to_message_id": req.reply_to_message_id,
-        "reply_to_body": req.reply_to_body,
-        "raw_message": req.raw_message,
-        "message_kind": req.message_kind,
-        "candidate_rfq_ids": clean_ids,
-        "extracted_facts": req.extracted_facts or {},
-        "status": "awaiting_rfq_resolution",
-        "updated_at": db.datetime.now(db.timezone.utc).isoformat(),
-    }
-
-    if req.source_message_id:
-        existing = (
-            db.supabase.table("pending_commercial_drafts")
-            .select("*")
-            .eq("client_id", req.client_id)
-            .eq("supplier_id", req.supplier_id)
-            .eq("source_message_id", req.source_message_id)
-            .limit(1)
-            .execute()
-        )
-        if existing.data:
-            if existing.data[0].get("status") == "resolved":
-                return {"saved": True, "draft": existing.data[0], "already_resolved": True}
-            row = (
-                db.supabase.table("pending_commercial_drafts")
-                .update(payload)
-                .eq("id", existing.data[0]["id"])
-                .execute()
-            )
-            return {"saved": True, "draft": row.data[0] if row.data else existing.data[0]}
-
-    row = db.supabase.table("pending_commercial_drafts").insert(payload).execute()
-    if not row.data:
-        raise HTTPException(status_code=500, detail="Pending commercial draft could not be persisted.")
-    return {"saved": True, "draft": row.data[0]}
+    source = _resolve_quote_source(req.client_id, req.supplier_id, req.source_message_id, req.raw_message)
+    if not source:
+        raise HTTPException(status_code=422, detail="Saved inbound source_message_id is required")
+    return db.supabase.rpc("prepare_rfq_clarification", {
+        "p_client_id": req.client_id, "p_supplier_id": req.supplier_id, "p_source_id": source,
+        "p_candidates": req.candidate_rfq_ids, "p_facts": req.extracted_facts, "p_issue_question": False,
+    }).execute().data
 
 
 @router.post("/resolve-commercial-draft")
@@ -1632,49 +1608,17 @@ def resolve_commercial_draft(
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     _get_rfq_and_verify_link(req.client_id, req.supplier_id, req.rfq_id)
 
-    res = (
-        db.supabase.table("pending_commercial_drafts")
-        .select("*")
-        .eq("id", req.draft_id)
-        .eq("client_id", req.client_id)
-        .eq("supplier_id", req.supplier_id)
-        .eq("status", "awaiting_rfq_resolution")
-        .limit(1)
-        .execute()
-    )
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Pending commercial draft not found.")
-
-    draft = res.data[0]
-    candidates = draft.get("candidate_rfq_ids") or []
-    if candidates and req.rfq_id not in candidates:
-        raise HTTPException(status_code=409, detail="Selected RFQ was not one of the draft's remaining candidates.")
-
-    now_iso = db.datetime.now(db.timezone.utc).isoformat()
-    upd = (
-        db.supabase.table("pending_commercial_drafts")
-        .update({
-            "status": "resolved",
-            "resolved_rfq_id": req.rfq_id,
-            "resolved_at": now_iso,
-            "updated_at": now_iso,
-        })
-        .eq("id", req.draft_id)
-        .execute()
-    )
-    resolved = upd.data[0] if upd.data else {**draft, "status": "resolved", "resolved_rfq_id": req.rfq_id}
-    return {
-        "resolved": True,
-        "rfq_id": req.rfq_id,
-        "draft": resolved,
-        "extracted_facts": resolved.get("extracted_facts") or {},
-        "raw_message": resolved.get("raw_message"),
-        "instruction": (
-            "Continue from the preserved facts. Do not ask the supplier to repeat price, quantity, "
-            "delivery, or other terms already present in extracted_facts."
-        ),
-    }
-
+    answer = _resolve_quote_source(req.client_id, req.supplier_id, req.answer_source_message_id, req.raw_answer)
+    result = db.supabase.rpc("resolve_rfq_clarification", {
+        "p_client_id": req.client_id, "p_supplier_id": req.supplier_id,
+        "p_draft_id": req.draft_id, "p_rfq_id": req.rfq_id, "p_answer_id": answer,
+    }).execute().data or {}
+    if not result.get("resolved"):
+        raise HTTPException(status_code=409, detail=result.get("reason", "Draft changed; reload context"))
+    draft = result["draft"]
+    return {**result, "rfq_id": req.rfq_id, "extracted_facts": draft.get("extracted_facts", {}),
+            "raw_message": draft.get("raw_message"),
+            "instruction": "Use preserved facts and the linked answer. Resolution identifies an RFQ only; saving or accepting still needs normal checks."}
 
 
 class MultiItemSupplierQuoteRequest(BaseModel):
@@ -1872,6 +1816,9 @@ def supplier_context(
         },
         "automation_paused": db.is_client_automation_paused(req.client_id),
         "active_rfqs": open_rfqs,
+        "pending_rfq_clarifications": (db.supabase.table("pending_commercial_drafts").select("*")
+            .eq("client_id", req.client_id).eq("supplier_id", supplier["id"])
+            .eq("status", "awaiting_rfq_resolution").order("created_at").limit(30).execute().data or []),
         "conversation_history": history,
         "history_source": "database_recovery" if req.history_limit else "openclaw_session",
         "active_negotiation_session": active_session,

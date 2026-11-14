@@ -162,11 +162,12 @@ def test_informational_prose_is_retryable_even_on_second_attempt(review_env,acti
 
 def test_unclear_product_can_ask_without_assigning_rfq(review_env):
     b=review_env[0]
-    with patch.object(b.db,'is_client_automation_paused',return_value=False),patch.object(b.db,'get_open_rfqs_for_supplier',return_value=[{'rfqs':{'id':'r','client_id':'c'}},{'rfqs':{'id':'x','client_id':'other'}}]):
-        result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',action_type='clarify_rfq',proposal={}))
-    assert result['outcome']=='APPROVE' and result['rfq_id'] is None
-    row=review_env[3]['commercial_action_intents'][0]
-    assert row['rfq_id'] is None and row['guard_snapshot']['candidate_rfq_ids']==['r']
+    review_env[4].rpc.return_value.execute.return_value.data={'outcome':'APPROVE','draft':{'id':'draft'},'changes_commercial_records':False}
+    with patch.object(b.db,'is_client_automation_paused',return_value=False),patch.object(b,'_resolve_quote_source',return_value='source'),patch.object(b.db,'get_open_rfqs_for_supplier',return_value=[{'rfqs':{'id':'r','client_id':'c'}},{'rfqs':{'id':'x','client_id':'other'}}]):
+        result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',action_type='clarify_rfq',source_message_id='source',raw_message='95 final',proposal={}))
+    assert result['outcome']=='APPROVE'
+    args=review_env[4].rpc.call_args.args[1]
+    assert args['p_candidates']==['r'] and args['p_source_id']=='source'
     assert result['changes_commercial_records'] is False
 
 
@@ -174,3 +175,22 @@ def test_clarification_cannot_smuggle_selected_quote(review_env):
     b=review_env[0]
     result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',rfq_id='r',action_type='clarify_rfq'))
     assert result['outcome']=='RETRY'
+
+
+def test_acknowledgement_after_deadline_is_not_new_buying_authority(review_env):
+    b,rfq,offer,*_=review_env
+    rfq['status']='closed';offer['is_current_accepted']=True
+    with patch.object(b.db,'is_rfq_open',return_value=False):
+        result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',rfq_id='r',quote_id='new',action_type='acknowledge',proposal={}))
+        assert result['outcome']=='APPROVE' and 'already accepted' in result['approved_message']
+        assert review(review_env,'counter')['outcome']=='REJECT'
+
+
+def test_conflicting_draft_resolution_returns_conflict_not_success(review_env):
+    b=review_env[0]
+    review_env[4].rpc.return_value.execute.return_value.data={'conflict':True,'reason':'Draft already resolved differently'}
+    from fastapi import HTTPException
+    with patch.object(b,'_resolve_quote_source',return_value='answer'):
+        with pytest.raises(HTTPException) as exc:
+            b.resolve_commercial_draft(b.ResolveCommercialDraftRequest(client_id='c',supplier_id='s',draft_id='draft',rfq_id='r',answer_source_message_id='answer'))
+    assert exc.value.status_code==409
