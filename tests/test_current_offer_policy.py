@@ -96,7 +96,11 @@ def review_env():
 
 def review(env,action,price=11,**extra):
     b,*_=env
-    req=b.CommercialActionReviewRequest(client_id='c',supplier_id='s',rfq_id='r',quote_id='new',action_type=action,proposal={'price':price,'quantity':10,'delivery_days':2},**extra)
+    terms={'price':price,'quantity':10,'delivery_days':2}
+    name=env[1].get('product_name')
+    extra.setdefault('proposed_message',f'{name or "Item"} (50W): AI-authored reply')
+    extra.setdefault('message_facts',{'rfq_id':'r','product_name':name,**terms})
+    req=b.CommercialActionReviewRequest(client_id='c',supplier_id='s',rfq_id='r',quote_id='new',action_type=action,proposal=terms,**extra)
     return b.review_commercial_action(req)
 
 
@@ -164,7 +168,7 @@ def test_unclear_product_can_ask_without_assigning_rfq(review_env):
     b=review_env[0]
     review_env[4].rpc.return_value.execute.return_value.data={'outcome':'APPROVE','draft':{'id':'draft'},'changes_commercial_records':False}
     with patch.object(b.db,'is_client_automation_paused',return_value=False),patch.object(b,'_resolve_quote_source',return_value='source'),patch.object(b.db,'get_open_rfqs_for_supplier',return_value=[{'rfqs':{'id':'r','client_id':'c'}},{'rfqs':{'id':'x','client_id':'other'}}]):
-        result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',action_type='clarify_rfq',source_message_id='source',raw_message='95 final',proposal={}))
+        result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',action_type='clarify_rfq',proposed_message='20-inch hammer or 10-inch hammer?',source_message_id='source',raw_message='95 final',proposal={}))
     assert result['outcome']=='APPROVE'
     args=review_env[4].rpc.call_args.args[1]
     assert args['p_candidates']==['r'] and args['p_source_id']=='source'
@@ -181,7 +185,7 @@ def test_acknowledgement_after_deadline_is_not_new_buying_authority(review_env):
     b,rfq,offer,*_=review_env
     rfq['status']='closed';offer['is_current_accepted']=True
     with patch.object(b.db,'is_rfq_open',return_value=False):
-        result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',rfq_id='r',quote_id='new',action_type='acknowledge',proposal={}))
+        result=b.review_commercial_action(b.CommercialActionReviewRequest(client_id='c',supplier_id='s',rfq_id='r',quote_id='new',action_type='acknowledge',proposal={},proposed_message='Your offer is already accepted',message_facts={'rfq_id':'r','product_name':None,'price':11,'quantity':10,'delivery_days':2}))
         assert result['outcome']=='APPROVE' and 'already accepted' in result['approved_message']
         assert review(review_env,'counter')['outcome']=='REJECT'
 
@@ -194,3 +198,21 @@ def test_conflicting_draft_resolution_returns_conflict_not_success(review_env):
         with pytest.raises(HTTPException) as exc:
             b.resolve_commercial_draft(b.ResolveCommercialDraftRequest(client_id='c',supplier_id='s',draft_id='draft',rfq_id='r',answer_source_message_id='answer'))
     assert exc.value.status_code==409
+
+
+def test_ai_urdu_text_is_preserved_without_english_template(review_env):
+    text='کیا آپ دس عدد کے لیے گیارہ درہم فی عدد کر سکتے ہیں؟'
+    result=review(review_env,'counter',proposed_message=text,language='ur')
+    assert result['outcome']=='APPROVE' and result['approved_message']==text
+
+
+def test_wrong_json_price_cannot_pass_with_fluent_message(review_env):
+    result=review(review_env,'counter',message_facts={'rfq_id':'r','product_name':None,'price':99,'quantity':10,'delivery_days':2})
+    assert result['outcome']=='RETRY' and result['approved_message'] is None
+
+
+def test_above_target_opening_final_offer_needs_one_counter(review_env):
+    review_env[1].update(acceptable_price_min=8,acceptable_price_max=15)
+    assert review(review_env,'accept')['outcome']=='RETRY'
+    review_env[3]['commercial_action_intents']=[{'id':'prior','client_id':'c','rfq_id':'r','supplier_id':'s','action_type':'counter','outcome':'APPROVE','consumed_at':'sent'}]
+    assert review(review_env,'accept')['outcome']=='APPROVE'

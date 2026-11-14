@@ -9,6 +9,7 @@ state. It intentionally does not expose arbitrary SQL or direct WhatsApp send.
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import math
 import os
@@ -594,6 +595,8 @@ class CommercialActionReviewRequest(BaseModel):
     source_message_id: Optional[str] = None
     raw_message: Optional[str] = None
     proposed_message: Optional[str] = None
+    message_facts: dict = Field(default_factory=dict)
+    language: Optional[str] = None
     client_id: str
     supplier_id: str
     rfq_id: Optional[str] = None
@@ -992,13 +995,12 @@ def authorize_system_outbound(
         return {"authorized": False, "reason": "invalid_message"}
     if db.is_client_automation_paused(req.client_id):
         return {"authorized": False, "reason": "automation_paused"}
-    if req.message.strip() == "Could you please confirm which product your message refers to?":
-        supplier = _get_supplier_for_client(req.client_id, None, req.phone_number)
-        clarification = db.supabase.rpc("claim_rfq_clarification", {
-            "p_client_id": req.client_id, "p_supplier_id": supplier["id"], "p_body": req.message.strip(),
-        }).execute()
-        if clarification.data:
-            return {"authorized": True, "purpose": "rfq_clarification"}
+    supplier = _get_supplier_for_client(req.client_id, None, req.phone_number)
+    clarification = db.supabase.rpc("claim_rfq_clarification", {
+        "p_client_id": req.client_id, "p_supplier_id": supplier["id"], "p_body": req.message.strip(),
+    }).execute()
+    if clarification.data:
+        return {"authorized": True, "purpose": "rfq_clarification"}
     phone = re.sub(r"\D", "", req.phone_number or "")
     if not phone:
         return {"authorized": False, "reason": "invalid_recipient"}
@@ -1078,8 +1080,10 @@ def review_commercial_action(
     if action in informational and proposal:
         return {"outcome": "RETRY", "feedback": "Informational actions require an empty proposal {}. Remove message/terms fields and retry; use action_type=clarify_rfq without rfq_id when the product is unclear.",
                 "approved_message": None, "approval_id": None, "retryable": True}
+    if not req.proposed_message or not req.proposed_message.strip() or len(req.proposed_message)>4000:
+        return {"outcome":"RETRY", "feedback":"Supply proposed_message in the supplier's language, plus message_facts. The backend approves facts; it does not compose your reply.", "approved_message":None}
     if action == "clarify_rfq":
-        if req.rfq_id or req.quote_id:
+        if req.rfq_id or req.quote_id or req.message_facts:
             return {"outcome": "RETRY", "feedback": "RFQ clarification must omit rfq_id and quote_id; do not guess a product to ask which product is meant.", "approved_message": None, "approval_id": None}
         if db.is_client_automation_paused(req.client_id):
             raise HTTPException(status_code=409, detail="Automation is paused")
@@ -1092,7 +1096,7 @@ def review_commercial_action(
             return {"outcome": "RETRY", "feedback": "Log the inbound message and supply source_message_id and raw_message. Clarification must be linked to its saved message.", "approved_message": None}
         result = db.supabase.rpc("prepare_rfq_clarification", {
             "p_client_id": req.client_id, "p_supplier_id": req.supplier_id, "p_source_id": source,
-            "p_candidates": candidates, "p_facts": req.assessment.get("extracted_facts", {}), "p_issue_question": True,
+            "p_candidates": candidates, "p_facts": req.assessment.get("extracted_facts", {}), "p_issue_question": True, "p_message": req.proposed_message.strip(),
         }).execute().data
         return result
     # Reject malformed commercial JSON before evaluating numeric constraints.
@@ -1153,6 +1157,14 @@ def review_commercial_action(
 
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and rfq.get("acceptable_price_max") is None:
         outcome, feedback = "ESCALATE", "Current RFQ has no authorized maximum; historical benchmarks cannot approve acceptance."
+    if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and effective_offer:
+        target = price_policy(rfq).get("preferred_target")
+        if target is not None and target < float(effective_offer.get("price") or 0) <= float(rfq.get("acceptable_price_max") or 0) and not effective_offer.get("is_current_accepted"):
+            sent_counters = (db.supabase.table("commercial_action_intents").select("id,consumed_at")
+                .eq("client_id",req.client_id).eq("supplier_id",req.supplier_id).eq("rfq_id",req.rfq_id)
+                .eq("outcome","APPROVE").in_("action_type",["counter","counteroffer","negotiate"]).execute().data or [])
+            if not any(c.get("consumed_at") for c in sent_counters):
+                outcome, feedback = "RETRY", "Opening offer exceeds the preferred target. Make one counter toward the target before accepting, even if the supplier initially says final. The maximum is a ceiling, not the goal."
     # Acceptance must always reference a persisted quote.
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"}:
         if not req.quote_id:
@@ -1271,9 +1283,6 @@ def review_commercial_action(
 
     # Commercial evaluator checks typed action data only, never LLM prose.
     # Hard boundaries above remain authoritative.
-    product_name = " ".join(str((rfq or {}).get("product_name") or "requested item").split())
-    variant = " ".join(str((effective_offer or {}).get("variant_label") or "").split())
-    item_name = f"{product_name} ({variant})" if variant else product_name
     approved_text = None
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"}:
         if not rfq or not req.quote_id or set(proposal) != {"price", "quantity", "delivery_days"}:
@@ -1294,9 +1303,7 @@ def review_commercial_action(
             elif validate_terms(rfq, q, proposal):
                 outcome, feedback = "RETRY", validate_terms(rfq, q, proposal)
             else:
-                approved_text = (f"{item_name}: Confirmed — AED {float(proposal['price']):g} per unit "
-                                 f"for {proposal['quantity']} pieces, delivery within "
-                                 f"{proposal['delivery_days']} days. Thank you!")
+                approved_text = req.proposed_message
     if outcome == "APPROVE":
         if action in {"accept", "confirm", "award", "accept_quote"}:
             pass  # Acceptance checked against the exact persisted quote above.
@@ -1313,20 +1320,24 @@ def review_commercial_action(
             elif proposal["quantity"] <= 0 or proposal["delivery_days"] < 0:
                 outcome, feedback = "RETRY", "Invalid quantity or delivery_days."
             else:
-                approved_text = (
-                    f"{item_name}: Thank you for your quotation. Could you offer AED "
-                    f"{float(proposal['price']):g} per unit for {proposal['quantity']} units "
-                    f"with delivery within {proposal['delivery_days']} day(s)?"
-                )
-        elif action in {"ask", "clarify", "request_info", "request_price"} and rfq and not proposal:
-            approved_text = f"{item_name}: Thank you. Could you confirm your best unit price in AED and estimated delivery time?"
-        elif action in {"acknowledge", "acknowledgement"} and rfq and not proposal:
-            if effective_offer and effective_offer.get("is_current_accepted"):
-                approved_text = f"{item_name}: Your quotation at AED {float(effective_offer['price']):g} per unit is already accepted. Thank you."
-            else:
-                approved_text = f"{item_name}: Thank you. We've received your quotation."
+                approved_text = req.proposed_message
+        elif action in {"ask", "clarify", "request_info", "request_price", "acknowledge", "acknowledgement"} and rfq and not proposal:
+            approved_text = req.proposed_message
         else:
             outcome, feedback = "REJECT", "Unsupported structured action or missing RFQ; no message authorized."
+
+    if outcome == "APPROVE":
+        facts = req.message_facts
+        expected = {"rfq_id": req.rfq_id, "product_name": (rfq or {}).get("product_name")}
+        if action in {"counter", "counteroffer", "negotiate", "accept", "confirm", "award", "accept_quote"}:
+            expected.update(proposal)
+        elif action in {"acknowledge", "acknowledgement"} and effective_offer:
+            expected.update({"price":effective_offer.get("price"), "quantity":effective_offer.get("quantity"), "delivery_days":effective_offer.get("resolved_delivery_days")})
+        if facts != expected:
+            outcome, feedback = "RETRY", "message_facts must match the selected product and checked terms exactly. Use: " + json.dumps(expected,ensure_ascii=False)
+            approved_text = None
+        else:
+            approved_text = req.proposed_message.strip()
 
     # Two model correction attempts maximum. After that, fail safe to human review.
     if outcome in {"ADJUST", "RETRY"} and req.attempt_number >= 2:
@@ -1349,6 +1360,9 @@ def review_commercial_action(
             "attempt_number": req.attempt_number,
             "proposal": proposal,
             "guard_snapshot": {
+                "message_facts": req.message_facts,
+                "language": req.language,
+                "ai_authored": True,
                 "assessment": req.assessment,
                 "current_offer": effective_offer,
                 "negotiation_mode": negotiation_mode,
@@ -1603,7 +1617,7 @@ def save_pending_commercial_draft(
         raise HTTPException(status_code=422, detail="Saved inbound source_message_id is required")
     return db.supabase.rpc("prepare_rfq_clarification", {
         "p_client_id": req.client_id, "p_supplier_id": req.supplier_id, "p_source_id": source,
-        "p_candidates": req.candidate_rfq_ids, "p_facts": req.extracted_facts, "p_issue_question": False,
+        "p_candidates": req.candidate_rfq_ids, "p_facts": req.extracted_facts, "p_issue_question": False, "p_message": None,
     }).execute().data
 
 

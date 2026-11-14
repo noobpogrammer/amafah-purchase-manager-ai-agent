@@ -13,6 +13,8 @@ class Store:
                      'rfqs': [{'id':'rfq','client_id':'tenant','status':'active','due_by':'2099-01-01T00:00:00Z'}],
                      'message_log': [{'id':'log','sent_at':'2026-11-14T00:00:00Z','external_message_id':'wa-id'}]}
         self.partial = partial
+    def rpc(self, name, params):
+        return SimpleNamespace(execute=lambda:SimpleNamespace(data=None))
     def table(self, name):
         return Query(self, name)
 
@@ -50,7 +52,7 @@ async def test_bulk_sender_claims_every_item_before_final_guard(partial):
         calls.append(result)
         assert result['authorized'], result
         return True
-    with patch.object(main.db,'supabase',store),patch.object(main.db,'is_client_automation_paused',return_value=False),patch.object(main.db,'log_message',return_value='log'),patch.object(main.db,'update_rfq_supplier_sent_message_id'),patch.object(main,'enqueue_message',side_effect=send),patch.object(bridge,'_require_openclaw_key'),patch.object(main.db,'get_supplier_by_id',return_value={'id':'supplier','phone_number':'+123'}),patch.object(main.db,'is_rfq_open',return_value=True):
+    with patch.object(main.db,'supabase',store),patch.object(main.db,'is_client_automation_paused',return_value=False),patch.object(main.db,'log_message',return_value='log'),patch.object(main.db,'update_rfq_supplier_sent_message_id'),patch.object(main,'enqueue_message',side_effect=send),patch.object(bridge,'_require_openclaw_key'),patch.object(bridge,'_get_supplier_for_client',return_value={'id':'supplier'}),patch.object(main.db,'get_supplier_by_id',return_value={'id':'supplier','phone_number':'+123'}),patch.object(main.db,'is_rfq_open',return_value=True):
         result=await main.send_bulk_rfq_bundles('tenant',{'supplier':{'supplier':{'phone_number':'+123'},'items':[{'item':BundleItem(rfq_id='rfq',product_name='lights',quantity=20)}]}})
     if partial:
         assert not calls
@@ -66,6 +68,6 @@ def test_grouped_reminder_authorization_rechecks_live_supplier_state(link_status
     store.rows['rfq_suppliers'][0]['status']=link_status
     store.rows['supplier_message_bundles']=[{'id':'bundle','supplier_id':'supplier','client_id':'tenant','kind':'reminder','status':'processing','message':'Reminder for lights'}]
     store.rows['supplier_message_bundle_items']=[{'bundle_id':'bundle','rfq_id':'rfq','status':'processing'}]
-    with patch.object(main.db,'supabase',store),patch.object(bridge,'_require_openclaw_key'),patch.object(main.db,'is_client_automation_paused',return_value=False),patch.object(main.db,'get_supplier_by_id',return_value={'phone_number':'+123'}),patch.object(main.db,'is_rfq_open',return_value=True),patch.object(main.db,'supplier_has_accepted_quote',return_value=accepted),patch.object(main.db,'get_active_negotiation_session',return_value=None):
+    with patch.object(main.db,'supabase',store),patch.object(bridge,'_require_openclaw_key'),patch.object(bridge,'_get_supplier_for_client',return_value={'id':'supplier'}),patch.object(main.db,'is_client_automation_paused',return_value=False),patch.object(main.db,'get_supplier_by_id',return_value={'phone_number':'+123'}),patch.object(main.db,'is_rfq_open',return_value=True),patch.object(main.db,'supplier_has_accepted_quote',return_value=accepted),patch.object(main.db,'get_active_negotiation_session',return_value=None):
         result=bridge.authorize_system_outbound(bridge.SystemOutboundAuthorizationRequest(client_id='tenant',phone_number='+123',message='Reminder for lights'))
     assert result['authorized'] is allowed
