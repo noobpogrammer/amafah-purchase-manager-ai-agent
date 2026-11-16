@@ -259,3 +259,17 @@ def test_wrong_current_quote_cannot_resolve_correction(review_env):
             b.resolve_commercial_draft(b.ResolveCommercialDraftRequest(client_id='c',supplier_id='s',draft_id='draft',rfq_id='r',matched_quote_id='wrong',answer_source_message_id='answer'))
     assert exc.value.status_code==409
     review_env[4].rpc.assert_not_called()
+
+
+def test_price_only_counter_does_not_require_unknown_delivery_or_quantity(review_env):
+    b=review_env[0]
+    req=b.CommercialActionReviewRequest(client_id='c',supplier_id='s',rfq_id='r',quote_id='new',action_type='counter',proposal={'price':10},message_facts={'rfq_id':'r','product_name':None,'price':10},proposed_message='Could you offer AED 10 each?')
+    assert b.review_commercial_action(req)['outcome']=='APPROVE'
+    req.action_type='accept'
+    assert b.review_commercial_action(req)['outcome']!='APPROVE'
+
+
+def test_price_counter_does_not_authorize_partial_quantity(review_env):
+    b=review_env[0]
+    req=b.CommercialActionReviewRequest(client_id='c',supplier_id='s',rfq_id='r',quote_id='new',action_type='counter',proposal={'price':10,'quantity':2},message_facts={'rfq_id':'r','product_name':None,'price':10,'quantity':2},proposed_message='Could you offer two pieces at AED 10 each?')
+    assert b.review_commercial_action(req)['outcome']!='APPROVE'

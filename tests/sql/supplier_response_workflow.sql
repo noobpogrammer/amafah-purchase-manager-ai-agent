@@ -26,6 +26,10 @@ begin
  insert into public.commercial_action_intents(client_id,supplier_id,rfq_id,quote_id,action_type,proposal,guard_snapshot,outcome,approved_message)
  values(c,s,r3,q,'counter','{"price":75,"quantity":5,"delivery_days":4}',jsonb_build_object('current_offer',jsonb_build_object('id',q,'price',105,'quantity',2,'term_sources',jsonb_build_object('price',jsonb_build_object('quote_id',q,'value',105),'quantity',jsonb_build_object('quote_id',q,'value',2)))),'APPROVE','Declined quote must not counter');
  if exists(select 1 from public.claim_commercial_message_approval(c,s,'Declined quote must not counter')) then raise exception 'Declined offer still negotiated';end if;
+ select id into q from public.quotes where rfq_id=r2 and supplier_id=s;
+ insert into public.commercial_action_intents(client_id,supplier_id,rfq_id,quote_id,action_type,proposal,guard_snapshot,outcome,approved_message)
+ values(c,s,r2,q,'counter','{"price":25}',jsonb_build_object('current_offer',jsonb_build_object('id',q,'price',26,'term_sources',jsonb_build_object('price',jsonb_build_object('quote_id',q,'value',26)))),'APPROVE','Price-only negotiation allowed');
+ if (select count(*) from public.claim_commercial_message_approval(c,s,'Price-only negotiation allowed'))<>1 then raise exception 'Unknown delivery blocked price-only negotiation';end if;
  if (select count(*) from public.quotes where supplier_id=s)<>3 then raise exception 'Unexpected quote writes';end if;
 end $$;
 rollback;

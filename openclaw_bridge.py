@@ -1104,19 +1104,16 @@ def review_commercial_action(
             "p_candidates": candidates, "p_facts": req.assessment.get("extracted_facts", {}), "p_issue_question": True, "p_message": req.proposed_message.strip(),
         }).execute().data
         return result
-    # Reject malformed commercial JSON before evaluating numeric constraints.
+    # Counters request terms; unlike acceptance they need not settle every term.
+    # Omit unknown dimensions rather than inventing delivery or supplier quantity.
     if action in {"counter", "counteroffer", "negotiate"}:
-        required = {"price", "quantity", "delivery_days"}
-        if set(proposal) != required:
-            raise HTTPException(status_code=422, detail="Counter requires exactly price, quantity, delivery_days")
-        if (type(proposal["price"]) not in (int, float)
-            or type(proposal["quantity"]) is not int
-            or type(proposal["delivery_days"]) is not int):
-            raise HTTPException(status_code=422, detail="Invalid counter field types")
-        if (not __import__("math").isfinite(proposal["price"])
-            or proposal["price"] <= 0 or proposal["quantity"] <= 0
-            or proposal["delivery_days"] < 0):
-            raise HTTPException(status_code=422, detail="Invalid counter values")
+        if "price" not in proposal or not set(proposal) <= {"price", "quantity", "delivery_days"}:
+            raise HTTPException(status_code=422, detail="Counter requires price; quantity and delivery_days are optional. Omit unknown terms.")
+        if type(proposal["price"]) not in (int, float) or not math.isfinite(proposal["price"]) or proposal["price"] <= 0:
+            raise HTTPException(status_code=422, detail="Counter price must be a finite positive number")
+        for field, minimum in (("quantity", 1), ("delivery_days", 0)):
+            if field in proposal and (type(proposal[field]) is not int or proposal[field] < minimum):
+                raise HTTPException(status_code=422, detail=f"Counter {field} must be an integer when stated; omit it when unknown, not null.")
     rfq = None
     active_session = None
     effective_offer = None
@@ -1334,17 +1331,8 @@ def review_commercial_action(
         if action in {"accept", "confirm", "award", "accept_quote"}:
             pass  # Acceptance checked against the exact persisted quote above.
         elif action in {"counter", "counteroffer", "negotiate"}:
-            if not rfq or set(proposal) != {"price", "quantity", "delivery_days"}:
-                outcome, feedback = "RETRY", "Counter requires RFQ plus exactly price, quantity, delivery_days."
-            elif (isinstance(proposal["price"], bool)
-                  or not isinstance(proposal["price"], (int, float))
-                  or not isinstance(proposal["quantity"], int)
-                  or isinstance(proposal["quantity"], bool)
-                  or not isinstance(proposal["delivery_days"], int)
-                  or isinstance(proposal["delivery_days"], bool)):
-                outcome, feedback = "RETRY", "Counter fields must be numeric price and integer quantity/delivery_days."
-            elif proposal["quantity"] <= 0 or proposal["delivery_days"] < 0:
-                outcome, feedback = "RETRY", "Invalid quantity or delivery_days."
+            if not rfq:
+                outcome, feedback = "RETRY", "A counter requires the selected RFQ."
             else:
                 approved_text = req.proposed_message
         elif action in {"ask", "clarify", "request_info", "request_price", "acknowledge", "acknowledgement"} and rfq and not proposal:
