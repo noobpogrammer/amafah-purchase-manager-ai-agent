@@ -71,7 +71,7 @@ def sync_openclaw_allowlist(phone_number: str, action: str) -> dict:
                 "X-OpenClaw-Key": OPENCLAW_TOOL_API_KEY,
             },
             json={"action": action, "phone_number": phone_number},
-            timeout=12,
+            timeout=(5, 90),
         )
     except requests.RequestException as exc:
         logger.exception("OpenClaw allowlist sync failed")
@@ -82,7 +82,10 @@ def sync_openclaw_allowlist(phone_number: str, action: str) -> dict:
         raise HTTPException(status_code=502, detail="Could not synchronize supplier with WhatsApp")
 
     try:
-        return response.json()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise HTTPException(status_code=502, detail="WhatsApp did not confirm the supplier update")
+        return payload
     except ValueError as exc:
         raise HTTPException(status_code=502, detail="Invalid response from OpenClaw allowlist service") from exc
 
@@ -2120,7 +2123,7 @@ async def create_supplier_endpoint(
 
     try:
         if req.is_active:
-            sync_openclaw_allowlist(req.phone_number, "add")
+            await run_in_threadpool(sync_openclaw_allowlist, req.phone_number, "add")
         if req.is_active is False:
             supplier = db.update_supplier(
                 supplier["id"], client_id,
@@ -2160,14 +2163,14 @@ async def update_supplier_endpoint(
 
     # Reconcile WhatsApp access first. If this fails, Supabase stays unchanged.
     if old_active and (not new_active or old_phone != new_phone):
-        sync_openclaw_allowlist(old_phone, "remove")
+        await run_in_threadpool(sync_openclaw_allowlist, old_phone, "remove")
     try:
         if new_active and (not old_active or old_phone != new_phone):
-            sync_openclaw_allowlist(new_phone, "add")
+            await run_in_threadpool(sync_openclaw_allowlist, new_phone, "add")
     except HTTPException:
         if old_active and (not new_active or old_phone != new_phone):
             try:
-                sync_openclaw_allowlist(old_phone, "add")
+                await run_in_threadpool(sync_openclaw_allowlist, old_phone, "add")
             except Exception:
                 logger.exception("Failed restoring old supplier phone to OpenClaw allowlist")
         raise
@@ -2185,9 +2188,9 @@ async def update_supplier_endpoint(
         # Best-effort rollback of WhatsApp access if database update unexpectedly fails.
         try:
             if new_active and (not old_active or old_phone != new_phone):
-                sync_openclaw_allowlist(new_phone, "remove")
+                await run_in_threadpool(sync_openclaw_allowlist, new_phone, "remove")
             if old_active:
-                sync_openclaw_allowlist(old_phone, "add")
+                await run_in_threadpool(sync_openclaw_allowlist, old_phone, "add")
         except Exception:
             logger.exception("Failed rolling back OpenClaw allowlist after supplier DB update failure")
         raise HTTPException(status_code=500, detail="Could not update supplier")
@@ -2213,13 +2216,13 @@ async def delete_supplier_endpoint(
         raise HTTPException(status_code=404, detail="Supplier not found or already deleted")
 
     if existing.get("is_active") is not False and existing.get("phone_number"):
-        sync_openclaw_allowlist(existing["phone_number"], "remove")
+        await run_in_threadpool(sync_openclaw_allowlist, existing["phone_number"], "remove")
 
     deleted = db.soft_delete_supplier(supplier_id, client_id)
     if not deleted:
         try:
             if existing.get("is_active") is not False and existing.get("phone_number"):
-                sync_openclaw_allowlist(existing["phone_number"], "add")
+                await run_in_threadpool(sync_openclaw_allowlist, existing["phone_number"], "add")
         except Exception:
             logger.exception("Failed restoring supplier allowlist after delete rollback")
         raise HTTPException(status_code=500, detail="Could not delete supplier")
