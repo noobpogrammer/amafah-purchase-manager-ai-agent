@@ -49,3 +49,17 @@ def test_recorded_batch_creates_quantity_decisions_without_sending():
     assert result['inserted']==2 and ensure.call_count==2
     payload=database.rpc.call_args.args[1]['p_items']
     assert payload[0]['price'] is None and payload[0]['is_available'] is False
+
+
+def test_batch_clarification_uses_saved_subsequent_supplier_answer():
+    fake=MagicMock()
+    fake.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.in_.return_value.execute.return_value.data=[
+        {'id':'original','body':'Item 1 unavailable; item 2 AED26','created_at':'2026-11-16T12:00:00Z'},
+        {'id':'answer','body':'1 panel, 2 floodlight','created_at':'2026-11-16T12:01:00Z'}]
+    req=bridge.MultiItemSupplierQuoteRequest(client_id='c',supplier_id='s',message='Item 1 unavailable; item 2 AED26',source_message_id='original',clarification_source_message_id='answer')
+    with patch.object(bridge.db,'supabase',fake):
+        evidence=bridge._saved_clarification_evidence(req)
+        assert evidence['message']=='1 panel, 2 floodlight'
+        req.message='Item 2 AED99'
+        with pytest.raises(bridge.HTTPException):
+            bridge._saved_clarification_evidence(req)

@@ -290,7 +290,7 @@ def parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] =
         logger.warning("OpenClaw commercial parsing unavailable; using deterministic extraction")
         return _fallback_parse_commercial_message(message_text, candidate_rfqs).model_dump()
 
-def parse_multi_rfq_quotes(message_text: str, candidate_rfqs: Optional[list] = None, invitation_evidence: Optional[list] = None) -> Dict[str, Any]:
+def parse_multi_rfq_quotes(message_text: str, candidate_rfqs: Optional[list] = None, invitation_evidence: Optional[list] = None, clarification_evidence: Optional[dict] = None) -> Dict[str, Any]:
     candidates = []
     for entry in candidate_rfqs or []:
         rfq = entry.get("rfqs", entry) if isinstance(entry, dict) else None
@@ -303,7 +303,7 @@ def parse_multi_rfq_quotes(message_text: str, candidate_rfqs: Optional[list] = N
         return {"items": []}
     try:
         parsed = MultiRFQQuoteParseResult.model_validate(_request_openclaw_analysis("multi_rfq_quote_parser", {
-            "message": message_text, "candidate_rfqs": candidates, "invitation_evidence": invitation_evidence or [],
+            "message": message_text, "candidate_rfqs": candidates, "invitation_evidence": invitation_evidence or [], "clarification_evidence": clarification_evidence,
         }, MultiRFQQuoteParseResult.model_json_schema()))
         allowed_ids = {c["rfq_id"] for c in candidates}
         clean = []
@@ -1659,7 +1659,7 @@ def resolve_commercial_draft(
     if not req.rfq_id and not req.no_linked_rfq:
         return {"resolved": False, "outcome": "RETRY", "instruction":
                 "Missing RFQ selection is not evidence of an unknown product. For a multi-item answer, "
-                "reprocess the original saved message with its saved invitation evidence. Preserve every line; "
+                "call procurement_process_multi_item_message with the ORIGINAL source_message_id and raw message, plus clarification_source_message_id=answer_source_message_id. It will verify and read the saved answer, remap all original lines, and record them together. Preserve every line; "
                 "do not abandon the draft or create a no-linked-RFQ flag."}
     current_offer = None
     if req.matched_quote_id:
@@ -1694,6 +1694,7 @@ class MultiItemSupplierQuoteRequest(BaseModel):
     message: str
     source_message_id: Optional[str] = None
     reply_to_message_id: Optional[str] = None
+    clarification_source_message_id: Optional[str] = None
 
 
 def _invitation_evidence(client_id, supplier_id, source_message_id=None, reply_to_message_id=None):
@@ -1722,12 +1723,30 @@ def _invitation_evidence(client_id, supplier_id, source_message_id=None, reply_t
             for row in rows]
 
 
+def _saved_clarification_evidence(req):
+    if not req.clarification_source_message_id:
+        return None
+    if not req.source_message_id or req.source_message_id == req.clarification_source_message_id:
+        raise HTTPException(status_code=422, detail="Clarification needs a distinct original source and subsequent answer")
+    rows = (db.supabase.table("message_log").select("id,body,created_at")
+            .eq("client_id", req.client_id).eq("supplier_id", req.supplier_id).eq("direction", "inbound")
+            .in_("id", [req.source_message_id, req.clarification_source_message_id]).execute()).data or []
+    original = next((row for row in rows if row["id"] == req.source_message_id), None)
+    answer = next((row for row in rows if row["id"] == req.clarification_source_message_id), None)
+    if not original or not answer or answer["created_at"] < original["created_at"]:
+        raise HTTPException(status_code=422, detail="Both messages must belong to this supplier; clarification must follow the original")
+    if req.message.replace("\r\n", "\n").strip() != original["body"].replace("\r\n", "\n").strip():
+        raise HTTPException(status_code=422, detail="Reprocess the unchanged saved original message")
+    return {"source_message_id": answer["id"], "message": answer["body"]}
+
+
 @router.post("/parse-multi-item-quotes")
 def parse_multi_item_quotes(req: MultiItemSupplierQuoteRequest, x_openclaw_key: Optional[str] = Header(default=None)):
     """Safely map several prices to authorized RFQs; no automatic persistence."""
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     links = [x for x in db.get_open_rfqs_for_supplier(req.supplier_id) if (x.get("rfqs") or {}).get("client_id") == req.client_id]
+    clarification = _saved_clarification_evidence(req)
     evidence = _invitation_evidence(req.client_id, req.supplier_id, req.source_message_id, req.reply_to_message_id)
     bundle_id = evidence[0]["bundle_id"] if req.reply_to_message_id and len(evidence) == 1 else None
     if bundle_id:
@@ -1735,7 +1754,7 @@ def parse_multi_item_quotes(req: MultiItemSupplierQuoteRequest, x_openclaw_key: 
         links = [row for row in links if str(row["rfqs"]["id"]) in scoped_ids]
     if len(links) < 2:
         return {"status": "SINGLE_RFQ", "items": [], "bundle_id": bundle_id}
-    items = (parse_multi_rfq_quotes(req.message, links, evidence) or {}).get("items") or []
+    items = (parse_multi_rfq_quotes(req.message, links, evidence, clarification) or {}).get("items") or []
     if not items:
         return {"status": "NO_ITEMS", "items": [], "bundle_id": bundle_id}
     allowed_ids = [str(x["rfqs"]["id"]) for x in links]
@@ -1832,6 +1851,8 @@ def process_multi_item_message(
         ),
         x_openclaw_key,
     )
+    if req.clarification_source_message_id:
+        db.supabase.table("pending_commercial_drafts").update({"answer_source_message_id": req.clarification_source_message_id}).eq("client_id", req.client_id).eq("supplier_id", req.supplier_id).eq("source_message_id", req.source_message_id).eq("status", "resolved").execute()
     return {"status": "MULTI_RFQ_RECORDED", "bundle_id": parsed.get("bundle_id"), "recording": recorded}
 
 
