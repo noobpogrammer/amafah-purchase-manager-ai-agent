@@ -9,6 +9,7 @@ export default function FinalOfferReview({ review, rfqId, target, maxPrice, requ
   const [receipt, setReceipt] = useState('');
   if (!review) return null;
   const offer = review.offer_snapshot;
+  const statedDelivery = offer.delivery_term?.text || offer.delivery_time;
   const quantityReview = review.review_kind === 'quantity';
   const pending = review.status === 'pending' && !receipt;
   const decide = async (decision) => {
@@ -23,11 +24,13 @@ export default function FinalOfferReview({ review, rfqId, target, maxPrice, requ
   };
   return <section className="final-offer-review" aria-label="Buyer final offer review">
     <div className="final-offer-heading"><strong>{quantityReview ? "Supplier offers a different quantity" : "Supplier’s final offer"}</strong><span className="badge badge-warning">{pending ? 'Your decision needed' : review.status === 'completed' ? 'Offer accepted' : review.status === 'stale' ? 'Offer changed' : 'Decision recorded'}</span></div>
-    <p>AED {offer.price} per unit · {offer.quantity == null ? 'Quantity unconfirmed' : `${offer.quantity} units`} · {offer.resolved_delivery_days == null ? 'Delivery unconfirmed' : `${offer.resolved_delivery_days} days`}</p>
+    <p>AED {offer.price} per unit · {offer.quantity == null ? 'Quantity unconfirmed' : `${offer.quantity} units`} · {statedDelivery || (offer.resolved_delivery_days == null ? 'Delivery unconfirmed' : `${offer.resolved_delivery_days} days`)}</p>
     <p className="final-offer-help">{target != null ? `Your target is AED ${target}. ` : ''}{quantityReview ? `You requested ${requestedQuantity ?? 'more'} units. Should the agent consider the ${offer.quantity} available pieces? This does not accept the price or confirm a purchase.` : 'Should the agent accept this quote or negotiate again?'}</p>
     {pending && <>
+      {offer.delivery_term?.relation === 'after' && <p className="final-offer-help">Accepting approves “{statedDelivery}”. This gives no guaranteed latest arrival date.</p>}
+      {review.acceptance_blocker && <p role="note">{review.acceptance_blocker}</p>}
       <div className="final-offer-actions">
-        {quantityReview ? <button className="btn btn-primary" disabled={!isAdmin || busy} onClick={() => decide('partial')}>Consider {offer.quantity} pieces</button> : <button className="btn btn-primary" disabled={!isAdmin || busy || offer.quantity == null || offer.resolved_delivery_days == null || maxPrice == null || Number(offer.price) > Number(maxPrice)} onClick={() => decide('accept')}>{busy ? 'Saving…' : `Accept AED ${offer.price}`}</button>}
+        {quantityReview ? <button className="btn btn-primary" disabled={!isAdmin || busy} onClick={() => decide('partial')}>Consider {offer.quantity} pieces</button> : <button className="btn btn-primary" disabled={!isAdmin || busy || Boolean(review.acceptance_blocker) || offer.quantity == null || offer.resolved_delivery_days == null || maxPrice == null || Number(offer.price) > Number(maxPrice)} onClick={() => decide('accept')}>{busy ? 'Saving…' : `Accept AED ${offer.price}`}</button>}
         <button className="btn btn-secondary" disabled={!isAdmin || busy} onClick={() => setShowCounter(!showCounter)}>{quantityReview ? "Request full quantity / negotiate" : "Negotiate again"}</button>
         <button className="btn btn-secondary" disabled={!isAdmin || busy} onClick={() => decide('decline')}>Decline offer</button>
       </div>

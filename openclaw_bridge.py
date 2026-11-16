@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 import db
 import negotiation_engine
-from commercial_policy import price_policy, price_anomaly, validate_terms, apply_constraints
+from commercial_policy import price_policy, price_anomaly, validate_terms, apply_constraints, needs_delivery_approval
 import requests
 from supplier_message_planner import validate_multi_rfq_quotes, AmbiguousSupplierQuote
 
@@ -1170,6 +1170,12 @@ def review_commercial_action(
         decisions = buyer_quote_reviews.list_reviews(req.client_id, req.rfq_id)
         if any(row.get("quote_id") == effective_offer["id"] and row.get("decision") == "decline" and row.get("status") in {"authorized", "completed"} for row in decisions):
             outcome, feedback = "REJECT", "The buyer declined this exact offer. Do not accept or counter it."
+    if outcome == "APPROVE" and rfq and effective_offer and action in {"accept", "confirm", "award", "accept_quote"} and needs_delivery_approval(effective_offer):
+        rfq['delivery_term_approved'] = buyer_quote_reviews.authorized_accept(req.client_id, req.supplier_id, effective_offer)
+        if not rfq['delivery_term_approved']:
+            review = buyer_quote_reviews.queue(req.client_id, req.supplier_id, req.rfq_id, effective_offer)
+            return {"outcome":"BUYER_REVIEW", "approval_id":None, "approved_message":None, "buyer_review_id":review['id'],
+                    "feedback":"The supplier delivery term needs the buyer's explicit decision in Recorded Quotes. Preserve it exactly; do not promise an earlier or latest arrival date."}
     buyer_approved_final = False
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and effective_offer:
         target = price_policy(rfq).get("preferred_target")
@@ -1308,7 +1314,7 @@ def review_commercial_action(
     # Hard boundaries above remain authoritative.
     approved_text = None
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"}:
-        if not rfq or not req.quote_id or set(proposal) != {"price", "quantity", "delivery_days"}:
+        if not rfq or not req.quote_id or (not {"price", "quantity", "delivery_days"} <= set(proposal) or not set(proposal) <= {"price", "quantity", "delivery_days", "delivery_term"}):
             outcome, feedback = "RETRY", "Acceptance needs an RFQ, persisted quote_id, and exact price/quantity/delivery_days."
         elif (type(proposal["price"]) not in (int, float)
               or type(proposal["quantity"]) is not int

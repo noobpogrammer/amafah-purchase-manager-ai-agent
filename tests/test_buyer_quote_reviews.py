@@ -29,3 +29,20 @@ async def test_buyer_decision_validates_exact_offer_and_counter(changed,decision
             result=await main.decide_final_offer('rfq','review',req,{'client_id':'tenant','role':'admin','user_id':'buyer'})
             assert result['queued'] is True
             assert fake.rpc.call_args.args[1]['p_counter']==counter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('deadline,expected', [(None,None),(4,409)])
+async def test_buyer_can_approve_stated_after_term_only_without_a_finite_deadline(deadline,expected):
+    from commercial_policy import resolve_offers
+    offer=resolve_offers([{'id':'quote','rfq_id':'rfq','supplier_id':'supplier','price':25.5,'quantity':10,'delivery_time':'Delivery after 4 days'}])[0]
+    review={**REVIEW,'offer_snapshot':reviews.snapshot(offer)}
+    database=MagicMock();database.rpc.return_value.execute.return_value.data={**review,'status':'authorized'}
+    with patch.object(reviews,'list_reviews',return_value=[review]),patch.object(main.openclaw_bridge,'_current_offer',return_value=offer),patch.object(main.db,'get_rfq_by_id',return_value={'id':'rfq','status':'active','quantity':10,'required_delivery_days':deadline,'acceptable_price_min':25,'acceptable_price_max':30}),patch.object(main.db,'get_rfq_negotiation_constraints',return_value=[]),patch.object(main.db,'supabase',database):
+        args=('rfq','review',main.BuyerFinalOfferDecision(decision='accept'),{'client_id':'tenant','role':'admin','user_id':'buyer'})
+        if expected:
+            with pytest.raises(HTTPException) as error:await main.decide_final_offer(*args)
+            assert error.value.status_code==expected
+            database.rpc.assert_not_called()
+        else:
+            assert (await main.decide_final_offer(*args))['queued'] is True

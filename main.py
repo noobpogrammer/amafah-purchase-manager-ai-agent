@@ -1985,7 +1985,13 @@ async def current_offers_endpoint(rfq_id: str, current_user=Depends(get_current_
     if not rfq or rfq.get("client_id") != current_user.get("client_id"):
         raise HTTPException(status_code=404, detail="RFQ not found")
     buyer_quote_reviews.ensure_quantity_reviews(current_user.get("client_id"), rfq_id)
-    return {"rfq_id": rfq_id, "buyer_reviews": buyer_quote_reviews.list_reviews(current_user.get("client_id"), rfq_id), "offers": db.get_quotes_for_rfq(rfq_id, include_unavailable=True), "price_policy": price_policy(apply_constraints(rfq, db.get_rfq_negotiation_constraints(current_user.get("client_id"), rfq_id)))}
+    buyer_quote_reviews.refresh_pending_delivery_reviews(current_user.get("client_id"), rfq_id)
+    from commercial_policy import delivery_authority_issue
+    effective_rfq = apply_constraints(rfq, db.get_rfq_negotiation_constraints(current_user.get("client_id"), rfq_id))
+    reviews = buyer_quote_reviews.list_reviews(current_user.get("client_id"), rfq_id)
+    for review in reviews:
+        review['acceptance_blocker'] = delivery_authority_issue(effective_rfq, review['offer_snapshot'])
+    return {"rfq_id": rfq_id, "buyer_reviews": reviews, "offers": db.get_quotes_for_rfq(rfq_id, include_unavailable=True), "price_policy": price_policy(apply_constraints(rfq, db.get_rfq_negotiation_constraints(current_user.get("client_id"), rfq_id)))}
 
 
 class BuyerFinalOfferDecision(BaseModel):
@@ -2015,6 +2021,9 @@ async def decide_final_offer(rfq_id: str, review_id: str, payload: BuyerFinalOff
         raise HTTPException(status_code=422, detail='Decline cannot include a counter price')
     if payload.decision=='accept' and (offer.get('quantity') is None or offer.get('resolved_delivery_days') is None or (buyer_quote_reviews.quantity_issue(effective_rfq,offer) and not buyer_quote_reviews.partial_quantity_authorized(client_id,review['supplier_id'],rfq_id,offer))):
         raise HTTPException(status_code=409, detail='Resolve quantity permission and missing delivery before accepting')
+    from commercial_policy import delivery_authority_issue
+    if payload.decision=='accept' and (issue := delivery_authority_issue(effective_rfq, offer)):
+        raise HTTPException(status_code=409, detail=issue)
     policy=price_policy(effective_rfq)
     if payload.decision=='accept' and (policy['acceptable_max'] is None or offer['price']>policy['acceptable_max']):
         raise HTTPException(status_code=409,detail="Offer exceeds current buying authority")

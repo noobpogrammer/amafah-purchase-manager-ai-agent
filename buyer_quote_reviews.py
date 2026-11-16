@@ -4,7 +4,7 @@ import db
 
 
 def snapshot(offer):
-    return {k:offer.get(k) for k in ('id','price','quantity','resolved_delivery_days','quality_notes','variant_label','term_sources')}
+    return {k:offer.get(k) for k in ('id','price','quantity','resolved_delivery_days','delivery_time','delivery_term','quality_notes','variant_label','term_sources')}
 
 
 def queue(client_id,supplier_id,rfq_id,offer,kind="final_price"):
@@ -58,6 +58,24 @@ def list_reviews(client_id,rfq_id):
     return db.supabase.table('buyer_final_offer_reviews').select('*').eq('client_id',client_id).eq('rfq_id',rfq_id).order('created_at',desc=True).execute().data or []
 
 
+def refresh_pending_delivery_reviews(client_id, rfq_id):
+    """Refresh derived fields only when every saved commercial fact is unchanged.
+
+    Never rewrite an authorized decision or upgrade unknown raw supplier terms.
+    """
+    offers = {offer['id']:offer for offer in db.get_quotes_for_rfq(rfq_id)}
+    for review in list_reviews(client_id, rfq_id):
+        if review['status'] != 'pending' or review.get('job_state'):
+            continue
+        offer = offers.get(review['quote_id'])
+        if not offer or not offer.get('delivery_term'):
+            continue
+        old, new = review['offer_snapshot'], snapshot(offer)
+        facts = ('id','price','quantity','quality_notes','variant_label','term_sources')
+        if old != new and all(old.get(key) == new.get(key) for key in facts):
+            db.supabase.table('buyer_final_offer_reviews').update({'offer_snapshot':new}).eq('id',review['id']).eq('client_id',client_id).eq('status','pending').is_('job_state','null').execute()
+
+
 def has_review(client_id,supplier_id,quote_id):
     return bool(db.supabase.table('buyer_final_offer_reviews').select('id').eq('client_id',client_id).eq('supplier_id',supplier_id).eq('quote_id',quote_id).eq('review_kind','final_price').limit(1).execute().data)
 
@@ -81,8 +99,10 @@ def sync_jobs(base_url,key):
             if db.is_client_automation_paused(row['client_id']):continue
             headers={'X-OpenClaw-Key':key}
             if row['job_state']=='queued':
-                task=(f"Buyer declines this exact quotation. Do not accept or counter it. Send one polite decline through normal reviewed messaging. " if row['decision']=='decline' else f"Buyer agrees to CONSIDER only {offer['quantity']} available pieces, not the full RFQ quantity. Negotiate toward the target within the price ceiling; clarify missing delivery. This is quantity permission only, not purchase acceptance. " if row['decision']=='partial' else f"Buyer approved acceptance of exact quote {row['quote_id']} at AED {offer['price']}. " if row['decision']=='accept' else f"Buyer requests one more negotiation. Ask for AED {row['counter_price']} per unit. Do not accept the existing final offer. " if row['counter_price'] is not None else 'Buyer requests another negotiation toward the preferred target. Do not accept the existing final offer. ')
+                task=(f"Buyer declines this exact quotation. Do not accept or counter it. Send one polite decline through normal reviewed messaging. " if row['decision']=='decline' else f"Buyer agrees to CONSIDER only {offer['quantity']} available pieces, not the full RFQ quantity. Negotiate toward the target within the price ceiling; clarify missing delivery. This is quantity permission only, not purchase acceptance. " if row['decision']=='partial' else f"Buyer approved acceptance of exact quote {row['quote_id']} at AED {offer['price']}. Preserve the saved delivery text exactly in meaning: {offer.get('delivery_time')}. " if row['decision']=='accept' else f"Buyer requests one more negotiation. Ask for AED {row['counter_price']} per unit. Do not accept the existing final offer. " if row['counter_price'] is not None else 'Buyer requests another negotiation toward the preferred target. Do not accept the existing final offer. ')
                 task+=f"Buyer review ID {row['id']}. RFQ {row['rfq_id']}. Recheck the saved offer, use commercial review with supplier_final=true, then normal acceptance/send tools. This instruction does not override spending limits or terms. For a price-only negotiation, omit unknown quantity/delivery_days from proposal and message_facts; do not invent delivery or include null. Considering a partial quantity still needs buyer permission."
+                if offer.get('delivery_term') and (offer['delivery_term']['relation']=='after' or offer['delivery_term']['unit']=='business_days'):
+                    task+=f" For acceptance, proposal and message_facts must include delivery_term={offer['delivery_term']!r} alongside price, quantity and delivery_days={offer['resolved_delivery_days']}. Never turn 'after' into 'within' or business days into calendar days."
                 response=requests.post(base_url.rstrip('/')+'/internal/procurement/operator-instruction',headers=headers,json={'job_id':row['job_id'],'flag_id':row['id'],'rfq_id':row['rfq_id'],'phone_number':supplier['phone_number'],'reason':'Buyer decision from RFQ recorded quotes','instruction':task},timeout=15)
             else:response=requests.get(base_url.rstrip('/')+'/internal/procurement/operator-instruction/'+row['job_id'],headers=headers,timeout=15)
             if response.status_code in {404,409}:
