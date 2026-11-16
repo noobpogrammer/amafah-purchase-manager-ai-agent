@@ -501,11 +501,12 @@ export default function RFQDetailView({
                                     </span>
                                   )}
                                 </div>
-                                <span className="price-tag">AED {q.price}</span>
+                                <span className="price-tag">{q.is_available === false ? "Unavailable" : `AED ${q.price}`}</span>
                               </div>
-                              <FinalOfferReview key={`${q.id}-review`} review={buyerReview} rfqId={selectedRfqId} target={detailData.rfq.negotiation_price_policy?.preferred_target} maxPrice={detailData.rfq.negotiation_price_policy?.acceptable_max} isAdmin={isAdmin} onUpdated={() => loadRFQDetail(selectedRfqId)} />
+                              <FinalOfferReview key={`${q.id}-review`} review={buyerReview} rfqId={selectedRfqId} target={detailData.rfq.negotiation_price_policy?.preferred_target} maxPrice={detailData.rfq.negotiation_price_policy?.acceptable_max} requestedQuantity={detailData.rfq.quantity} isAdmin={isAdmin} onUpdated={() => loadRFQDetail(selectedRfqId)} />
                               <div className="quote-body">
-                                <p><strong>Delivery:</strong> {q.delivery_time || '-'}</p>
+                                <p><strong>Quantity:</strong> {q.quantity == null ? "Not confirmed" : `${q.quantity} available`} · Requested: {detailData.rfq.quantity ?? "—"}</p>
+                                <p><strong>Delivery:</strong> {q.delivery_time || "Not confirmed"}</p>
                                 {(q.quality_notes || q.raw_message) && <details className="quote-extra">
                                   <summary>Notes & supplier message</summary>
                                   {q.quality_notes && <p><strong>Notes:</strong> {q.quality_notes}</p>}

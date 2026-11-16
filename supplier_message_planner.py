@@ -24,10 +24,11 @@ class BundleItem:
 @dataclass(frozen=True)
 class ResolvedQuote:
     rfq_id: str
-    price: Decimal
+    price: Decimal | None
     quantity: int | None = None
     delivery_time: str | None = None
     variant_label: str | None = None
+    is_available: bool = True
 
 
 class AmbiguousSupplierQuote(ValueError):
@@ -111,10 +112,13 @@ def validate_multi_rfq_quotes(
             raise AmbiguousSupplierQuote("Quoted item does not map to an authorized supplier RFQ")
         try:
             confidence = float(item.get("confidence") or 0)
-            price = Decimal(str(item.get("price")))
+            available = item.get("is_available", True)
+            if type(available) is not bool:
+                raise ValueError("Availability must be boolean")
+            price = Decimal(str(item.get("price"))) if available else None
         except (ValueError, TypeError, InvalidOperation):
             raise AmbiguousSupplierQuote("Quote requires a valid confidence and price") from None
-        if not math.isfinite(confidence) or confidence < min_confidence or not price.is_finite() or price <= 0:
+        if not math.isfinite(confidence) or confidence < min_confidence or (price is not None and (not price.is_finite() or price <= 0)) or confidence > 1:
             raise AmbiguousSupplierQuote("Low-confidence, non-finite, or non-positive quote")
         qty = item.get("quantity")
         if qty is not None and (isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0):
@@ -125,5 +129,6 @@ def validate_multi_rfq_quotes(
             quantity=qty,
             delivery_time=item.get("delivery_time"),
             variant_label=item.get("variant_label"),
+            is_available=available,
         ))
     return resolved

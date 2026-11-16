@@ -259,6 +259,7 @@ class MultiRFQQuoteItem(BaseModel):
     delivery_time: Optional[str] = None
     quality_notes: Optional[str] = None
     supplier_final: bool = False
+    is_available: bool = True
     confidence: float = 0.0
 
 class MultiRFQQuoteParseResult(BaseModel):
@@ -289,7 +290,7 @@ def parse_commercial_message(message_text: str, candidate_rfqs: Optional[list] =
         logger.warning("OpenClaw commercial parsing unavailable; using deterministic extraction")
         return _fallback_parse_commercial_message(message_text, candidate_rfqs).model_dump()
 
-def parse_multi_rfq_quotes(message_text: str, candidate_rfqs: Optional[list] = None) -> Dict[str, Any]:
+def parse_multi_rfq_quotes(message_text: str, candidate_rfqs: Optional[list] = None, invitation_evidence: Optional[list] = None) -> Dict[str, Any]:
     candidates = []
     for entry in candidate_rfqs or []:
         rfq = entry.get("rfqs", entry) if isinstance(entry, dict) else None
@@ -302,7 +303,7 @@ def parse_multi_rfq_quotes(message_text: str, candidate_rfqs: Optional[list] = N
         return {"items": []}
     try:
         parsed = MultiRFQQuoteParseResult.model_validate(_request_openclaw_analysis("multi_rfq_quote_parser", {
-            "message": message_text, "candidate_rfqs": candidates,
+            "message": message_text, "candidate_rfqs": candidates, "invitation_evidence": invitation_evidence or [],
         }, MultiRFQQuoteParseResult.model_json_schema()))
         allowed_ids = {c["rfq_id"] for c in candidates}
         clean = []
@@ -657,6 +658,7 @@ class ResolveCommercialDraftRequest(BaseModel):
     draft_id: str
     rfq_id: Optional[str] = None
     matched_quote_id: Optional[str] = None
+    no_linked_rfq: bool = False
 
 
 @router.post("/activation-gate")
@@ -1125,6 +1127,8 @@ def review_commercial_action(
         policy = price_policy(rfq)
         rfq["acceptable_price_max"] = policy["acceptable_max"]
         effective_offer = _current_offer(req.rfq_id, req.supplier_id, req.quote_id)
+        if effective_offer and effective_offer.get("quantity") != rfq.get("quantity") and buyer_quote_reviews.partial_quantity_authorized(req.client_id, req.supplier_id, req.rfq_id, effective_offer):
+            rfq = {**rfq, "quantity_flexible": True, "quantity_min": effective_offer["quantity"], "quantity_max": effective_offer["quantity"]}
         active_session = db.get_active_negotiation_session(
             req.client_id,
             req.rfq_id,
@@ -1160,6 +1164,15 @@ def review_commercial_action(
 
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and rfq.get("acceptable_price_max") is None:
         outcome, feedback = "ESCALATE", "Current RFQ has no authorized maximum; historical benchmarks cannot approve acceptance."
+    if outcome == "APPROVE" and rfq and effective_offer and action in {"accept", "confirm", "award", "accept_quote"}:
+        if buyer_quote_reviews.quantity_issue(rfq, effective_offer) and not buyer_quote_reviews.partial_quantity_authorized(req.client_id, req.supplier_id, req.rfq_id, effective_offer):
+            review = buyer_quote_reviews.queue(req.client_id, req.supplier_id, req.rfq_id, effective_offer, kind="quantity")
+            return {"outcome":"BUYER_REVIEW", "approved_message":None, "approval_id":None, "buyer_review_id":review["id"],
+                    "feedback":"Quantity differs from buyer authority. Recorded Quotes contains the buyer's decision. Do not accept or silently assume the full requested quantity."}
+    if outcome == "APPROVE" and effective_offer and action in {"counter", "counteroffer", "negotiate", "accept", "confirm", "award", "accept_quote"}:
+        decisions = buyer_quote_reviews.list_reviews(req.client_id, req.rfq_id)
+        if any(row.get("quote_id") == effective_offer["id"] and row.get("decision") == "decline" and row.get("status") in {"authorized", "completed"} for row in decisions):
+            outcome, feedback = "REJECT", "The buyer declined this exact offer. Do not accept or counter it."
     buyer_approved_final = False
     if outcome == "APPROVE" and action in {"accept", "confirm", "award", "accept_quote"} and rfq and effective_offer:
         target = price_policy(rfq).get("preferred_target")
@@ -1643,6 +1656,11 @@ def resolve_commercial_draft(
     """Resolve an existing commercial draft to one RFQ without losing extracted facts."""
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
+    if not req.rfq_id and not req.no_linked_rfq:
+        return {"resolved": False, "outcome": "RETRY", "instruction":
+                "Missing RFQ selection is not evidence of an unknown product. For a multi-item answer, "
+                "reprocess the original saved message with its saved invitation evidence. Preserve every line; "
+                "do not abandon the draft or create a no-linked-RFQ flag."}
     current_offer = None
     if req.matched_quote_id:
         if not req.rfq_id:
@@ -1678,42 +1696,46 @@ class MultiItemSupplierQuoteRequest(BaseModel):
     reply_to_message_id: Optional[str] = None
 
 
+def _invitation_evidence(client_id, supplier_id, source_message_id=None, reply_to_message_id=None):
+    """Saved invitation numbering is evidence even without a native WhatsApp reply.
+
+    Keep every applicable ordering, not simply the newest invitation. The parser
+    must clarify conflicting orderings; the candidate array never defines numbering.
+    """
+    query = (db.supabase.table("supplier_message_bundles")
+             .select("id,external_message_id,created_at,supplier_message_bundle_items(rfq_id,item_position)")
+             .eq("client_id", client_id).eq("supplier_id", supplier_id).eq("status", "sent"))
+    if reply_to_message_id:
+        query = query.eq("external_message_id", reply_to_message_id)
+    if source_message_id:
+        source = (db.supabase.table("message_log").select("created_at").eq("id", source_message_id)
+                  .eq("client_id", client_id).eq("supplier_id", supplier_id).eq("direction", "inbound").limit(1).execute()).data or []
+        if not source:
+            raise HTTPException(status_code=422, detail="Saved inbound source is required for invitation evidence")
+        query = query.lte("created_at", source[0]["created_at"])
+    rows = query.order("created_at", desc=True).limit(50).execute().data or []
+    # A truncated unquoted history must not accidentally manufacture a unique match.
+    if len(rows) == 50 and not reply_to_message_id:
+        return []
+    return [{"bundle_id": row["id"], "native_reply": bool(reply_to_message_id),
+             "items": sorted(row.get("supplier_message_bundle_items") or [], key=lambda item: item["item_position"])}
+            for row in rows]
+
+
 @router.post("/parse-multi-item-quotes")
 def parse_multi_item_quotes(req: MultiItemSupplierQuoteRequest, x_openclaw_key: Optional[str] = Header(default=None)):
     """Safely map several prices to authorized RFQs; no automatic persistence."""
     _require_openclaw_key(x_openclaw_key)
     _get_supplier_for_client(req.client_id, req.supplier_id, None)
     links = [x for x in db.get_open_rfqs_for_supplier(req.supplier_id) if (x.get("rfqs") or {}).get("client_id") == req.client_id]
-    bundle_id = None
-    if req.reply_to_message_id:
-        found = (
-            db.supabase.table("supplier_message_bundles").select("id")
-            .eq("client_id", req.client_id).eq("supplier_id", req.supplier_id)
-            .eq("external_message_id", req.reply_to_message_id)
-            .eq("status", "sent").limit(1).execute()
-        )
-        if found.data:
-            bundle_id = found.data[0]["id"]
-            number_rows = (
-                db.supabase.table("supplier_message_bundle_items")
-                .select("rfq_id,item_position")
-                .eq("bundle_id", bundle_id)
-                .eq("client_id", req.client_id)
-                .eq("supplier_id", req.supplier_id)
-                .order("item_position").execute()
-            )
-            item_numbers = {str(row["rfq_id"]): row.get("item_position") for row in (number_rows.data or [])}
-            links = [
-                {**entry, "rfqs": {
-                    **entry["rfqs"],
-                    "item_number": item_numbers[str(entry["rfqs"]["id"])],
-                    "reference": str(entry["rfqs"]["id"])[:8],
-                }}
-                for entry in links if str(entry["rfqs"]["id"]) in item_numbers
-            ]
+    evidence = _invitation_evidence(req.client_id, req.supplier_id, req.source_message_id, req.reply_to_message_id)
+    bundle_id = evidence[0]["bundle_id"] if req.reply_to_message_id and len(evidence) == 1 else None
+    if bundle_id:
+        scoped_ids = {str(item["rfq_id"]) for item in evidence[0]["items"]}
+        links = [row for row in links if str(row["rfqs"]["id"]) in scoped_ids]
     if len(links) < 2:
         return {"status": "SINGLE_RFQ", "items": [], "bundle_id": bundle_id}
-    items = (parse_multi_rfq_quotes(req.message, links) or {}).get("items") or []
+    items = (parse_multi_rfq_quotes(req.message, links, evidence) or {}).get("items") or []
     if not items:
         return {"status": "NO_ITEMS", "items": [], "bundle_id": bundle_id}
     allowed_ids = [str(x["rfqs"]["id"]) for x in links]
@@ -1725,7 +1747,8 @@ def parse_multi_item_quotes(req: MultiItemSupplierQuoteRequest, x_openclaw_key: 
             item = valid[0]
             safe_items.append({
                 **raw, "candidate_rfq_id": item.rfq_id,
-                "price": float(item.price),
+                "price": float(item.price) if item.price is not None else None,
+                "is_available": item.is_available,
             })
         except (AmbiguousSupplierQuote, ValueError, TypeError) as exc:
             unresolved_items.append({
@@ -1907,11 +1930,11 @@ def record_multi_item_quotes(req: RecordMultiItemQuotesRequest, x_openclaw_key: 
     for original, item in zip(req.items, mapped):
         grouped.setdefault(item.rfq_id, []).append({
             "variant_label": item.variant_label,
-            "price": float(item.price),
+            "price": float(item.price) if item.price is not None else None,
             "delivery_time": item.delivery_time,
             "quantity": item.quantity,
             "quality_notes": original.get("quality_notes"),
-            "is_available": True,
+            "is_available": item.is_available,
         })
     if len(grouped) < 2:
         raise HTTPException(status_code=422, detail="At least two distinct mapped RFQs are required.")
@@ -1937,7 +1960,8 @@ def record_multi_item_quotes(req: RecordMultiItemQuotesRequest, x_openclaw_key: 
             {
                 "candidate_rfq_id": item.rfq_id,
                 "confidence": float(raw["confidence"]),
-                "price": float(item.price),
+                "price": float(item.price) if item.price is not None else None,
+                "is_available": item.is_available,
                 "quantity": item.quantity,
                 "variant_label": item.variant_label,
                 "delivery_time": item.delivery_time,
@@ -1952,6 +1976,9 @@ def record_multi_item_quotes(req: RecordMultiItemQuotesRequest, x_openclaw_key: 
         raise HTTPException(status_code=409, detail="Atomic multi-RFQ quote recording failed.") from exc
     if not saved.data:
         raise HTTPException(status_code=409, detail="No quote records persisted.")
+    # Recoverable/idempotent: quote persistence is complete before any decision is queued.
+    for rfq_id in grouped:
+        buyer_quote_reviews.ensure_quantity_reviews(req.client_id, rfq_id, req.supplier_id)
     return saved.data
 
 
@@ -2022,6 +2049,7 @@ def record_quote(req: RecordQuoteRequest, x_openclaw_key: Optional[str] = Header
     if not rows:
         raise HTTPException(status_code=409, detail="Quote was not recorded.")
     flagged = any(_flag_price_anomaly(req.client_id, req.supplier_id, linked, row) for row in rows)
+    buyer_quote_reviews.ensure_quantity_reviews(req.client_id, req.rfq_id, req.supplier_id)
     return {"recorded": True, "quotes": rows, "price_anomaly": flagged, "workflow": {
         "next_action": "evaluate_negotiation",
         "guidance": "Saving is not the end of handling. Compare each saved offer with current RFQ terms. "

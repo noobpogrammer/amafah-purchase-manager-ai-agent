@@ -24,3 +24,22 @@ for (const action of ['accept', 'negotiate']) {
     expect(decision).toEqual({decision:action,counter_price:action==='accept'?null:42});
   });
 }
+
+for (const action of ['partial', 'decline']) {
+  test(`partial supplier quantity ${action} is a buyer decision, not purchase acceptance`, async ({ page }) => {
+    await setupAuthenticatedSession(page, 'admin');
+    let decision;
+    await page.route('**/rfq/*/current-offers', route => route.fulfill({json:{offers:[{...mockQuotes[0],price:105,quantity:2,delivery_time:null}],price_policy:{preferred_target:75,acceptable_max:90},buyer_reviews:[{id:'partial-review',quote_id:mockQuotes[0].id,status:'pending',review_kind:'quantity',offer_snapshot:{price:105,quantity:2,resolved_delivery_days:null}}]}}));
+    await page.route('**/rfq/*/buyer-reviews/*/decision', route => {
+      decision=route.request().postDataJSON();return route.fulfill({json:{queued:true}});
+    });
+    await page.goto('/');
+    await page.getByRole('button',{name:'Requests & tracking'}).click();
+    const card=page.getByRole('region',{name:'Buyer final offer review'});
+    await expect(card).toContainText('Delivery unconfirmed');
+    await expect(card.getByRole('button',{name:'Accept AED 105'})).toHaveCount(0);
+    await card.getByRole('button',{name:action==='partial'?'Consider 2 pieces':'Decline offer'}).click();
+    expect(decision).toEqual({decision:action,counter_price:null});
+    await expect(card.getByRole('status')).toContainText(action==='partial'?'Price and delivery':'queued');
+  });
+}

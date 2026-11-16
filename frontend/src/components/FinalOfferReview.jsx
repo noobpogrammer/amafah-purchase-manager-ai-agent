@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { decideBuyerFinalOffer } from '../api';
 
-export default function FinalOfferReview({ review, rfqId, target, maxPrice, isAdmin, onUpdated }) {
+export default function FinalOfferReview({ review, rfqId, target, maxPrice, requestedQuantity, isAdmin, onUpdated }) {
   const [counter, setCounter] = useState(target ?? '');
   const [showCounter, setShowCounter] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -9,25 +9,27 @@ export default function FinalOfferReview({ review, rfqId, target, maxPrice, isAd
   const [receipt, setReceipt] = useState('');
   if (!review) return null;
   const offer = review.offer_snapshot;
+  const quantityReview = review.review_kind === 'quantity';
   const pending = review.status === 'pending' && !receipt;
   const decide = async (decision) => {
     if (busy) return;
     setBusy(true); setError('');
     try {
       await decideBuyerFinalOffer(rfqId, review.id, decision, decision === 'negotiate' && counter !== '' ? Number(counter) : null);
-      setReceipt(decision === 'accept' ? 'Acceptance instruction queued. Confirmation is not sent yet.' : 'Negotiation instruction queued. Your current offer has not been accepted.');
+      setReceipt(decision === 'accept' ? 'Acceptance instruction queued. Confirmation is not sent yet.' : decision === 'partial' ? 'Partial quantity approved for discussion. Price and delivery still need to meet your limits.' : decision === 'decline' ? 'Decline instruction queued.' : 'Negotiation instruction queued. Your current offer has not been accepted.');
       onUpdated?.();
     } catch (err) { setError(err.message || 'Could not save your decision.'); }
     finally { setBusy(false); }
   };
   return <section className="final-offer-review" aria-label="Buyer final offer review">
-    <div className="final-offer-heading"><strong>Supplier’s final offer</strong><span className="badge badge-warning">{pending ? 'Your decision needed' : review.status === 'completed' ? 'Offer accepted' : review.status === 'stale' ? 'Offer changed' : 'Decision recorded'}</span></div>
+    <div className="final-offer-heading"><strong>{quantityReview ? "Supplier offers a different quantity" : "Supplier’s final offer"}</strong><span className="badge badge-warning">{pending ? 'Your decision needed' : review.status === 'completed' ? 'Offer accepted' : review.status === 'stale' ? 'Offer changed' : 'Decision recorded'}</span></div>
     <p>AED {offer.price} per unit · {offer.quantity == null ? 'Quantity unconfirmed' : `${offer.quantity} units`} · {offer.resolved_delivery_days == null ? 'Delivery unconfirmed' : `${offer.resolved_delivery_days} days`}</p>
-    <p className="final-offer-help">{target != null ? `Your target is AED ${target}. ` : ''}Should the agent accept this quote or negotiate again?</p>
+    <p className="final-offer-help">{target != null ? `Your target is AED ${target}. ` : ''}{quantityReview ? `You requested ${requestedQuantity ?? 'more'} units. Should the agent consider the ${offer.quantity} available pieces? This does not accept the price or confirm a purchase.` : 'Should the agent accept this quote or negotiate again?'}</p>
     {pending && <>
       <div className="final-offer-actions">
-        <button className="btn btn-primary" disabled={!isAdmin || busy || maxPrice == null || Number(offer.price) > Number(maxPrice)} onClick={() => decide('accept')}>{busy ? 'Saving…' : `Accept AED ${offer.price}`}</button>
-        <button className="btn btn-secondary" disabled={!isAdmin || busy} onClick={() => setShowCounter(!showCounter)}>Negotiate again</button>
+        {quantityReview ? <button className="btn btn-primary" disabled={!isAdmin || busy} onClick={() => decide('partial')}>Consider {offer.quantity} pieces</button> : <button className="btn btn-primary" disabled={!isAdmin || busy || offer.quantity == null || offer.resolved_delivery_days == null || maxPrice == null || Number(offer.price) > Number(maxPrice)} onClick={() => decide('accept')}>{busy ? 'Saving…' : `Accept AED ${offer.price}`}</button>}
+        <button className="btn btn-secondary" disabled={!isAdmin || busy} onClick={() => setShowCounter(!showCounter)}>{quantityReview ? "Request full quantity / negotiate" : "Negotiate again"}</button>
+        <button className="btn btn-secondary" disabled={!isAdmin || busy} onClick={() => decide('decline')}>Decline offer</button>
       </div>
       {showCounter && <form className="final-offer-counter" onSubmit={(event) => { event.preventDefault(); decide('negotiate'); }}>
         <label htmlFor={`counter-${review.id}`}>Ask for a unit price (AED)</label>
@@ -39,7 +41,7 @@ export default function FinalOfferReview({ review, rfqId, target, maxPrice, isAd
       {!isAdmin && <small>A buyer administrator must approve this decision.</small>}
     </>}
     {(receipt || review.job_error) && <p role="status">{receipt || review.job_error}</p>}
-    {!pending && !receipt && <p role="status">{review.status === 'completed' ? 'Acceptance saved. Check conversation tracking for supplier confirmation.' : review.status === 'stale' ? 'The offer changed. Review the latest quotation.' : `${review.decision === 'accept' ? 'Acceptance' : 'Negotiation'} instruction: ${review.job_state || 'queued'}.`}</p>}
+    {!pending && !receipt && <p role="status">{review.status === 'completed' ? 'Acceptance saved. Check conversation tracking for supplier confirmation.' : review.status === 'stale' ? 'The offer changed. Review the latest quotation.' : `${review.decision === 'accept' ? 'Acceptance' : review.decision === 'partial' ? 'Partial supply discussion' : review.decision === 'decline' ? 'Decline' : 'Negotiation'} instruction: ${review.job_state || 'queued'}.`}</p>}
     {error && <p role="alert" className="final-offer-error">{error}</p>}
   </section>;
 }

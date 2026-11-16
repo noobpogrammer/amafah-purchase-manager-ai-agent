@@ -1984,7 +1984,8 @@ async def current_offers_endpoint(rfq_id: str, current_user=Depends(get_current_
     rfq = db.get_rfq_by_id(rfq_id)
     if not rfq or rfq.get("client_id") != current_user.get("client_id"):
         raise HTTPException(status_code=404, detail="RFQ not found")
-    return {"rfq_id": rfq_id, "buyer_reviews": buyer_quote_reviews.list_reviews(current_user.get("client_id"), rfq_id), "offers": db.get_quotes_for_rfq(rfq_id), "price_policy": price_policy(apply_constraints(rfq, db.get_rfq_negotiation_constraints(current_user.get("client_id"), rfq_id)))}
+    buyer_quote_reviews.ensure_quantity_reviews(current_user.get("client_id"), rfq_id)
+    return {"rfq_id": rfq_id, "buyer_reviews": buyer_quote_reviews.list_reviews(current_user.get("client_id"), rfq_id), "offers": db.get_quotes_for_rfq(rfq_id, include_unavailable=True), "price_policy": price_policy(apply_constraints(rfq, db.get_rfq_negotiation_constraints(current_user.get("client_id"), rfq_id)))}
 
 
 class BuyerFinalOfferDecision(BaseModel):
@@ -2005,9 +2006,16 @@ async def decide_final_offer(rfq_id: str, review_id: str, payload: BuyerFinalOff
     if not offer or not rfq or rfq.get("status")!='active' or buyer_quote_reviews.snapshot(offer)!=review['offer_snapshot']:
         db.supabase.table('buyer_final_offer_reviews').update({'status':'stale'}).eq('id',review_id).eq('client_id',client_id).execute()
         raise HTTPException(status_code=409,detail="Offer changed; review the current quotation")
-    if payload.decision not in {'accept','negotiate'} or (payload.decision=='accept' and payload.counter_price is not None):
-        raise HTTPException(status_code=422,detail="Choose accept or negotiate")
-    policy=price_policy(apply_constraints(rfq,db.get_rfq_negotiation_constraints(client_id,rfq_id)))
+    if payload.decision not in {'accept','negotiate','partial','decline'} or (payload.decision=='accept' and payload.counter_price is not None):
+        raise HTTPException(status_code=422,detail="Choose accept, negotiate, partial, or decline")
+    effective_rfq=apply_constraints(rfq,db.get_rfq_negotiation_constraints(client_id,rfq_id))
+    if payload.decision=='partial' and (review.get('review_kind')!='quantity' or not buyer_quote_reviews.quantity_issue(effective_rfq,offer) or payload.counter_price is not None):
+        raise HTTPException(status_code=422, detail='Partial supply decision requires a quantity review')
+    if payload.decision=='decline' and payload.counter_price is not None:
+        raise HTTPException(status_code=422, detail='Decline cannot include a counter price')
+    if payload.decision=='accept' and (offer.get('quantity') is None or offer.get('resolved_delivery_days') is None or (buyer_quote_reviews.quantity_issue(effective_rfq,offer) and not buyer_quote_reviews.partial_quantity_authorized(client_id,review['supplier_id'],rfq_id,offer))):
+        raise HTTPException(status_code=409, detail='Resolve quantity permission and missing delivery before accepting')
+    policy=price_policy(effective_rfq)
     if payload.decision=='accept' and (policy['acceptable_max'] is None or offer['price']>policy['acceptable_max']):
         raise HTTPException(status_code=409,detail="Offer exceeds current buying authority")
     if payload.counter_price is not None and (not math.isfinite(payload.counter_price) or payload.counter_price<=0 or payload.counter_price>=offer['price'] or policy['acceptable_max'] is None or payload.counter_price>policy['acceptable_max']):
